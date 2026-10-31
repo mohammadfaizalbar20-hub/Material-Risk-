@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState } from 'react';
 import { usePpic } from '../../context/PpicContext';
 import * as XLSX from 'xlsx';
 import {
@@ -14,10 +14,10 @@ import {
   Hash,
   Tag,
   Link as LinkIcon,
-  HelpCircle,
-  PlusCircle,
+  Sparkles,
+  Info,
 } from 'lucide-react';
-import { Material, MaterialItemRequirement } from '../../types/ppic';
+import { parseExcelRowsToMaterials } from '../../utils/excelMaterialParser';
 
 export const UploadExcelView: React.FC = () => {
   const {
@@ -28,11 +28,12 @@ export const UploadExcelView: React.FC = () => {
     saveOrStyleRelation,
     getStyleForOr,
     getOrsForStyle,
-    importPpicData,
+    autoSaveExcelMaterials,
     setActiveMenu,
+    lastImportedInfo,
   } = usePpic();
 
-  // Two new inputs: Nomor OR and Style
+  // Two inputs: Nomor OR and Style (with 2-way relation intelligence)
   const [orNumber, setOrNumber] = useState<string>('');
   const [style, setStyle] = useState<string>('');
   const [multipleOrOptions, setMultipleOrOptions] = useState<string[]>([]);
@@ -41,11 +42,7 @@ export const UploadExcelView: React.FC = () => {
   // File upload state
   const [dragActive, setDragActive] = useState(false);
   const [fileName, setFileName] = useState<string | null>(null);
-  const [parsedData, setParsedData] = useState<{
-    materials?: Material[];
-    materialRequirements?: MaterialItemRequirement[];
-    rawRows?: any[];
-  } | null>(null);
+  const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
   // Handle changes to OR Number with auto-fill for Style
@@ -97,10 +94,11 @@ export const UploadExcelView: React.FC = () => {
     setOrInputFeedback(`Nomor OR "${selectedOr}" dipilih untuk style "${style}".`);
   };
 
-  // Handle real file upload & parsing
+  // Immediate, fully automated Excel parsing & auto-storage into Master Data Material
   const handleFileUpload = (file: File) => {
     setFileName(file.name);
-    setStatusMessage('Membaca berkas Excel...');
+    setIsProcessing(true);
+    setStatusMessage('Membaca berkas Excel dan memproses kolom material...');
 
     const reader = new FileReader();
     reader.onload = (e) => {
@@ -108,257 +106,128 @@ export const UploadExcelView: React.FC = () => {
         const buffer = e.target?.result;
         const workbook = XLSX.read(buffer, { type: 'binary' });
 
-        // Parse sheets
         const sheetName = workbook.SheetNames[0];
-        const rawJson = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName]);
+        const rawJson: any[] = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName]);
 
-        const mappedMaterials: Material[] = [];
-        const mappedRequirements: MaterialItemRequirement[] = [];
+        if (!rawJson || rawJson.length === 0) {
+          setStatusMessage('Berkas Excel kosong atau tidak memiliki baris data.');
+          setIsProcessing(false);
+          return;
+        }
 
-        const activeOr = orNumber.trim().toUpperCase() || 'OR-2026-UPLOAD';
-        const activeStyle = style.trim() || 'Custom Excel Import';
+        // Automatic parsing with full support for:
+        // - Order Lines/Product/Display Name
+        // - Order Lines/Quantity
+        // - Order Lines/Received Qty
+        // - Order Lines/Product Unit of Measure/Display Name
+        // - Master Data Material reference matching
+        const result = parseExcelRowsToMaterials(rawJson, materials, orNumber, style);
 
-        rawJson.forEach((row: any, idx: number) => {
-          const code = String(row['Kode Material'] || row['Material Code'] || row['code'] || `RM-IMP-${idx + 1}`).trim();
-          const name = String(row['Nama Material'] || row['Material Name'] || row['name'] || `Material Impor ${idx + 1}`).trim();
-          const category = (row['Kategori'] || row['Category'] || 'Raw Material') as any;
-          const unit = (row['Satuan'] || row['Unit'] || 'Kg') as any;
-          const totalStock = parseFloat(row['Total Stok'] || row['Total Stock'] || row['stok'] || 1000);
-          const allocatedStock = parseFloat(row['Alokasi SPK'] || row['Allocated'] || row['Kebutuhan'] || 0);
-          const receivedStock = parseFloat(row['Diterima'] || row['Stok Diterima'] || row['Received'] || totalStock);
-          const safetyStock = parseFloat(row['Safety Stock'] || row['Min Stock'] || 200);
-          const leadTimeDays = parseInt(row['Lead Time (Hari)'] || row['Lead Time'] || 7, 10);
-          const supplierName = row['Supplier'] || row['Vendor'] || 'PT Supplier Nasional';
-          const defaultWarehouse = row['Gudang Utama'] || row['WH'] || 'WH-01';
-          const unitPrice = parseFloat(row['Harga Satuan (IDR)'] || row['Price'] || 25000);
-
-          mappedMaterials.push({
-            id: `mat-imp-${idx}-${Date.now()}`,
-            code,
-            name,
-            category,
-            unit,
-            totalStock,
-            allocatedStock,
-            safetyStock,
-            leadTimeDays,
-            supplierName,
-            defaultWarehouse,
-            unitPrice,
-            minOrderQty: 500,
-          });
-
-          // Also map as requirement linked to the specified OR and Style
-          mappedRequirements.push({
-            id: `req-imp-${idx}-${Date.now()}`,
-            orNumber: activeOr,
-            style: activeStyle,
-            materialCode: code,
-            materialName: name,
-            category,
-            unit,
-            requiredQty: allocatedStock > 0 ? allocatedStock : 1000,
-            receivedQty: receivedStock,
-            unitPrice,
-            supplierName,
-          });
+        // Immediate automatic storage into Master Data Material
+        // No manual confirmation or revision required!
+        autoSaveExcelMaterials({
+          newRequirements: result.requirements,
+          newMasterMaterials: result.newMasterMaterials,
+          newRelations: result.relations,
         });
 
-        setParsedData({
-          materials: mappedMaterials,
-          materialRequirements: mappedRequirements,
-          rawRows: rawJson,
-        });
-
+        setIsProcessing(false);
         setStatusMessage(
-          `Berhasil membaca ${rawJson.length} baris dari lembar kerja "${sheetName}". Terhubung ke OR: ${activeOr} (${activeStyle}).`
+          `Sukses! ${result.summary.validRows} baris material berhasil dibaca dan otomatis disimpan ke Master Data Material. Mengarahkan...`
         );
       } catch (err: any) {
         console.error(err);
+        setIsProcessing(false);
         setStatusMessage(`Gagal membaca file Excel: ${err.message || 'Format tidak valid'}`);
       }
     };
     reader.readAsBinaryString(file);
   };
 
-  // 1-Click Load Realistic Sample Excel Data
+  // 1-Click Load Realistic Sample Excel Data directly into Master Data Material
   const loadRealisticSampleExcel = () => {
-    // Pick or default an OR and Style
     const targetOr = orNumber.trim().toUpperCase() || 'OR-2026-088';
     const targetStyle = style.trim() || getStyleForOr(targetOr) || 'Casual Daily Bomber Jacket Navy';
     setOrNumber(targetOr);
     setStyle(targetStyle);
+    setFileName('PPIC_Order_Lines_Odoo_ERP.xlsx');
+    setIsProcessing(true);
+    setStatusMessage('Memuat dataset Excel realistis ERP (Order Lines)...');
 
-    setFileName('PPIC_BOM_Material_Kebutuhan_Q4.xlsx');
-    const demoMaterials: Material[] = [
+    // Create realistic rows with exact column headers specified by user
+    const sampleRows = [
       {
-        id: 'mat-demo-1',
-        code: 'RM-RESIN-01',
-        name: 'Polypropylene Copolymer (PP Blow Grade)',
-        category: 'Raw Material',
-        unit: 'Kg',
-        totalStock: 3500,
-        allocatedStock: 2500,
-        safetyStock: 1200,
-        leadTimeDays: 7,
-        supplierName: 'PT Chandra Asri Petrochemical Tbk',
-        defaultWarehouse: 'WH-01',
-        unitPrice: 28500,
-        minOrderQty: 2000,
+        'Order Reference': targetOr,
+        'Style': targetStyle,
+        'Order Lines/Product/Display Name': '[FAB-TASLAN-NVY] Fabric Taslan Waterproof Navy 210T',
+        'Order Lines/Quantity': 2500,
+        'Order Lines/Received Qty': 1200,
+        'Order Lines/Product Unit of Measure/Display Name': 'Yard',
+        'Supplier': 'PT Kahatex Textile',
+        'Harga Satuan (IDR)': 42000,
       },
       {
-        id: 'mat-demo-2',
-        code: 'RM-SLS-02',
-        name: 'Sodium Lauryl Sulfate (SLS 70% Paste)',
-        category: 'Raw Material',
-        unit: 'Kg',
-        totalStock: 1800,
-        allocatedStock: 2400,
-        safetyStock: 800,
-        leadTimeDays: 5,
-        supplierName: 'PT BASF Indonesia',
-        defaultWarehouse: 'WH-01',
-        unitPrice: 34000,
-        minOrderQty: 1000,
+        'Order Reference': targetOr,
+        'Style': targetStyle,
+        'Order Lines/Product/Display Name': '[ZIP-YKK-MET5] Zipper Metal Antique Silver YKK #5 65cm',
+        'Order Lines/Quantity': 1000,
+        'Order Lines/Received Qty': 450,
+        'Order Lines/Product Unit of Measure/Display Name': 'Pcs',
+        'Supplier': 'PT YKK Zipper Indonesia',
+        'Harga Satuan (IDR)': 18500,
       },
       {
-        id: 'mat-demo-3',
-        code: 'PKG-BOT-250',
-        name: 'Botol HDPE 250ml White Pearl (Neck 24/410)',
-        category: 'Packaging',
-        unit: 'Pcs',
-        totalStock: 12500,
-        allocatedStock: 18000,
-        safetyStock: 5000,
-        leadTimeDays: 6,
-        supplierName: 'PT Sanpak Unggul',
-        defaultWarehouse: 'WH-02',
-        unitPrice: 1450,
-        minOrderQty: 10000,
+        'Order Reference': targetOr,
+        'Style': targetStyle,
+        'Order Lines/Product/Display Name': '[RIB-POLY-NVY] Rib Spun Polyester 2x2 Navy',
+        'Order Lines/Quantity': 300,
+        'Order Lines/Received Qty': 300,
+        'Order Lines/Product Unit of Measure/Display Name': 'Kg',
+        'Supplier': 'PT Tri Bintang Rib',
+        'Harga Satuan (IDR)': 65000,
       },
       {
-        id: 'mat-demo-4',
-        code: 'PKG-CAP-FLIP',
-        name: 'Flip Top Cap 24/410 Deep Blue Glossy',
-        category: 'Packaging',
-        unit: 'Pcs',
-        totalStock: 24000,
-        allocatedStock: 18000,
-        safetyStock: 4000,
-        leadTimeDays: 4,
-        supplierName: 'PT Dynaplast',
-        defaultWarehouse: 'WH-02',
-        unitPrice: 480,
-        minOrderQty: 5000,
+        'Order Reference': targetOr,
+        'Style': targetStyle,
+        'Order Lines/Product/Display Name': '[LIN-QUILT-BLK] Lining Quilting Dacron 4oz Black Diamond',
+        'Order Lines/Quantity': 1800,
+        'Order Lines/Received Qty': 1600,
+        'Order Lines/Product Unit of Measure/Display Name': 'Yard',
+        'Supplier': 'PT Sinar Mulia Lining',
+        'Harga Satuan (IDR)': 28000,
       },
       {
-        id: 'mat-demo-5',
-        code: 'CHM-FRAG-OCEAN',
-        name: 'Fragrance Oil Oceanic Fresh Grade AA',
-        category: 'Chemical',
-        unit: 'Kg',
-        totalStock: 320,
-        allocatedStock: 200,
-        safetyStock: 80,
-        leadTimeDays: 14,
-        supplierName: 'PT Givaudan Indonesia',
-        defaultWarehouse: 'WH-03',
-        unitPrice: 420000,
-        minOrderQty: 50,
+        'Order Reference': targetOr,
+        'Style': targetStyle,
+        'Order Lines/Product/Display Name': '[PKG-POLY-A3] Polybag Self-Adhesive Seal 35x45cm Clear',
+        'Order Lines/Quantity': 1000,
+        'Order Lines/Received Qty': 1000,
+        'Order Lines/Product Unit of Measure/Display Name': 'Pcs',
+        'Supplier': 'PT Poly Unggul Perkasa',
+        'Harga Satuan (IDR)': 850,
       },
       {
-        id: 'mat-demo-6',
-        code: 'CHM-PRSV-PHENO',
-        name: 'Preservative Phenoxyethanol + Ethylhexylglycerin',
-        category: 'Chemical',
-        unit: 'Kg',
-        totalStock: 150,
-        allocatedStock: 135,
-        safetyStock: 60,
-        leadTimeDays: 10,
-        supplierName: 'PT Clariant Indonesia',
-        defaultWarehouse: 'WH-03',
-        unitPrice: 195000,
-        minOrderQty: 50,
-      },
-      {
-        id: 'mat-demo-7',
-        code: 'PKG-BOX-MSTR',
-        name: 'Master Corrugated Carton Box K150 (Isi 48)',
-        category: 'Packaging',
-        unit: 'Box',
-        totalStock: 900,
-        allocatedStock: 450,
-        safetyStock: 300,
-        leadTimeDays: 3,
-        supplierName: 'PT Fajar Surya Wisesa',
-        defaultWarehouse: 'WH-02',
-        unitPrice: 12500,
-        minOrderQty: 500,
+        'Order Reference': targetOr,
+        'Style': targetStyle,
+        'Order Lines/Product/Display Name': '[PKG-BOX-MSTR] Master Carton Box K150 Double Wall 60x40x40cm',
+        'Order Lines/Quantity': 40,
+        'Order Lines/Received Qty': 40,
+        'Order Lines/Product Unit of Measure/Display Name': 'Box',
+        'Supplier': 'PT Fajar Surya Wisesa',
+        'Harga Satuan (IDR)': 22000,
       },
     ];
 
-    const demoRequirements: MaterialItemRequirement[] = demoMaterials.map((m, idx) => ({
-      id: `req-demo-upload-${idx}`,
-      orNumber: targetOr,
-      style: targetStyle,
-      materialCode: m.code,
-      materialName: m.name,
-      category: m.category,
-      unit: m.unit,
-      requiredQty: m.allocatedStock,
-      receivedQty: m.totalStock >= m.allocatedStock ? m.allocatedStock : m.totalStock,
-      unitPrice: m.unitPrice,
-      supplierName: m.supplierName,
-    }));
-
-    setParsedData({
-      materials: demoMaterials,
-      materialRequirements: demoRequirements,
-      rawRows: demoMaterials.map((m) => ({
-        'Nomor OR': targetOr,
-        Style: targetStyle,
-        'Kode Material': m.code,
-        'Nama Material': m.name,
-        Kategori: m.category,
-        Satuan: m.unit,
-        'Total Stok': m.totalStock,
-        'Kebutuhan (Allocated)': m.allocatedStock,
-        'Diterima': m.totalStock >= m.allocatedStock ? m.allocatedStock : m.totalStock,
-        'Safety Stock': m.safetyStock,
-        'Lead Time (Hari)': m.leadTimeDays,
-        Supplier: m.supplierName,
-        'Gudang Utama': m.defaultWarehouse,
-      })),
-    });
-
-    setStatusMessage(
-      `Data BOM PPIC untuk OR: ${targetOr} (${targetStyle}) berhasil disimulasikan. Klik "Terapkan ke Sistem" untuk sinkronisasi.`
-    );
-  };
-
-  // Commit to system state
-  const handleCommitData = () => {
-    if (!parsedData) return;
-
-    // 1. Save OR and Style relation if present
-    if (orNumber.trim() && style.trim()) {
-      saveOrStyleRelation(orNumber.trim().toUpperCase(), style.trim());
-    }
-
-    // 2. Import into PPIC Context
-    importPpicData({
-      materials: parsedData.materials,
-      materialRequirements: parsedData.materialRequirements,
-    });
-
-    setStatusMessage(
-      `Data berhasil diterapkan! Relasi ${orNumber || 'OR'} ↔ ${style || 'Style'} dan kebutuhan material telah tersimpan.`
-    );
-
     setTimeout(() => {
-      setActiveMenu('Rekap Material');
-    }, 1200);
+      const result = parseExcelRowsToMaterials(sampleRows, materials, targetOr, targetStyle);
+      autoSaveExcelMaterials({
+        newRequirements: result.requirements,
+        newMasterMaterials: result.newMasterMaterials,
+        newRelations: result.relations,
+      });
+      setIsProcessing(false);
+      setStatusMessage(`Berhasil memuat ${result.summary.validRows} baris material contoh ke Master Data Material.`);
+    }, 400);
   };
 
   // Save relation only button
@@ -376,7 +245,7 @@ export const UploadExcelView: React.FC = () => {
   const handleExportCurrentToExcel = () => {
     const wb = XLSX.utils.book_new();
 
-    // Sheet 1: Rekap Material
+    // Sheet 1: Master Data Material (Kebutuhan & Status)
     const matSheetData = materials.map((m) => ({
       'Kode Material': m.code,
       'Nama Material': m.name,
@@ -384,7 +253,6 @@ export const UploadExcelView: React.FC = () => {
       Satuan: m.unit,
       'Total Stok': m.totalStock,
       'Alokasi SPK': m.allocatedStock,
-      'Stok Bebas': Math.max(0, m.totalStock - m.allocatedStock),
       'Safety Stock': m.safetyStock,
       'Lead Time (Hari)': m.leadTimeDays,
       Supplier: m.supplierName,
@@ -394,22 +262,7 @@ export const UploadExcelView: React.FC = () => {
     const wsMaterials = XLSX.utils.json_to_sheet(matSheetData);
     XLSX.utils.book_append_sheet(wb, wsMaterials, 'Master_Material');
 
-    // Sheet 2: Stok Per Gudang
-    const stockSheetData = warehouseStock.map((s) => ({
-      'Kode Material': s.materialCode,
-      'Nama Material': s.materialName,
-      'Kode Gudang': s.warehouseCode,
-      'Batch / Lot': s.batchLot,
-      Kuantitas: s.qty,
-      Satuan: s.unit,
-      'Bin Location': s.binLocation,
-      'Status QC': s.qcStatus,
-      'Tgl Kedaluwarsa': s.expiryDate,
-    }));
-    const wsStock = XLSX.utils.json_to_sheet(stockSheetData);
-    XLSX.utils.book_append_sheet(wb, wsStock, 'Stok_Gudang');
-
-    // Sheet 3: Jadwal Produksi
+    // Sheet 2: Jadwal Produksi
     const woSheetData = productionSchedules.map((w) => ({
       'Nomor OR': w.orNumber,
       Style: w.style,
@@ -425,58 +278,54 @@ export const UploadExcelView: React.FC = () => {
     XLSX.writeFile(wb, `PPIC_Export_Data_${new Date().toISOString().slice(0, 10)}.xlsx`);
   };
 
-  // Download official template file (.xlsx)
+  // Download official template file (.xlsx) with exact required column names
   const handleDownloadBlankTemplate = () => {
     const wb = XLSX.utils.book_new();
     const templateData = [
       {
-        'Nomor OR': 'OR-2026-001',
-        Style: 'Casual Cotton Shirt Men Navy',
-        'Kode Material': 'RM-RESIN-01',
-        'Nama Material': 'Polypropylene Copolymer',
-        Kategori: 'Raw Material',
-        Satuan: 'Kg',
-        'Total Stok': 5000,
-        Kebutuhan: 1500,
-        Diterima: 1200,
-        'Safety Stock': 1000,
-        'Lead Time (Hari)': 7,
-        Supplier: 'PT Petrokimia Jaya',
-        'Gudang Utama': 'WH-01',
-        'Harga Satuan (IDR)': 28000,
+        'Order Reference': 'OR-2026-001',
+        'Style': 'Bomber Jacket Taslan Navy (BJ-01)',
+        'Order Lines/Product/Display Name': '[FAB-TASLAN-NVY] Fabric Taslan Waterproof Navy 210T',
+        'Order Lines/Quantity': 2500,
+        'Order Lines/Received Qty': 1200,
+        'Order Lines/Product Unit of Measure/Display Name': 'Yard',
       },
       {
-        'Nomor OR': 'OR-2026-002',
-        Style: 'Dry-Fit Training Polo Black',
-        'Kode Material': 'PKG-BOT-250',
-        'Nama Material': 'Botol HDPE 250ml',
-        Kategori: 'Packaging',
-        Satuan: 'Pcs',
-        'Total Stok': 20000,
-        Kebutuhan: 5000,
-        Diterima: 5000,
-        'Safety Stock': 4000,
-        'Lead Time (Hari)': 5,
-        Supplier: 'PT Kemasan Mulia',
-        'Gudang Utama': 'WH-02',
-        'Harga Satuan (IDR)': 1500,
+        'Order Reference': 'OR-2026-001',
+        'Style': 'Bomber Jacket Taslan Navy (BJ-01)',
+        'Order Lines/Product/Display Name': '[ZIP-YKK-MET5] Zipper Metal Antique Silver YKK #5 65cm',
+        'Order Lines/Quantity': 1000,
+        'Order Lines/Received Qty': 450,
+        'Order Lines/Product Unit of Measure/Display Name': 'Pcs',
+      },
+      {
+        'Order Reference': 'OR-2026-002',
+        'Style': 'Polo Shirt DryFit Performance White (PS-02)',
+        'Order Lines/Product/Display Name': '[FAB-DRYFIT-WHT] Fabric Micro DryFit Pique UV-Shield White',
+        'Order Lines/Quantity': 1200,
+        'Order Lines/Received Qty': 400,
+        'Order Lines/Product Unit of Measure/Display Name': 'Kg',
       },
     ];
     const ws = XLSX.utils.json_to_sheet(templateData);
-    XLSX.utils.book_append_sheet(wb, ws, 'Template_PPIC');
-    XLSX.writeFile(wb, 'PPIC_Template_Import_Material.xlsx');
+    XLSX.utils.book_append_sheet(wb, ws, 'Order_Lines');
+    XLSX.writeFile(wb, 'PPIC_Template_Order_Lines.xlsx');
   };
 
   return (
     <div className="space-y-6">
-      {/* Top Description Card */}
+      {/* Top Header Card */}
       <div className="p-5 bg-white rounded-lg border border-slate-200 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
+          <div className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 mb-1.5">
+            <Sparkles className="w-3.5 h-3.5" />
+            Otomatisasi Pembacaan Excel Langsung ke Master Data Material
+          </div>
           <h2 className="text-base md:text-lg font-bold text-slate-900">
-            Unggah Berkas Excel & Pemetaan OR - Style
+            Unggah Berkas Excel Kebutuhan Material (Order Lines)
           </h2>
           <p className="text-xs text-slate-500 mt-0.5 max-w-2xl">
-            Masukkan Nomor OR dan Style untuk menghubungkan kebutuhan material. Sistem secara otomatis mengingat dan mengisi relasi Nomor OR dan Style yang pernah tersimpan.
+            Sistem secara otomatis membaca kolom <code>Order Lines/Product/Display Name</code>, <code>Quantity</code>, <code>Received Qty</code>, dan <code>UoM</code> lalu langsung menyimpannya ke <strong>Master Data Material</strong> tanpa revisi manual.
           </p>
         </div>
 
@@ -486,19 +335,33 @@ export const UploadExcelView: React.FC = () => {
             className="px-3 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors flex items-center gap-1.5"
           >
             <Download className="w-4 h-4 text-slate-500" />
-            Unduh Template Excel
+            Unduh Template Excel ERP
           </button>
           <button
-            onClick={handleExportCurrentToExcel}
-            className="px-3 py-2 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-md transition-colors flex items-center gap-1.5"
+            onClick={() => setActiveMenu('Rekap Material')}
+            className="px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-md transition-colors flex items-center gap-1.5 shadow-xs"
           >
-            <FileSpreadsheet className="w-4 h-4 text-blue-600" />
-            Ekspor Data Sistem (.xlsx)
+            Buka Master Data Material
+            <ArrowRight className="w-3.5 h-3.5" />
           </button>
         </div>
       </div>
 
-      {/* NEW SECTION: Nomor OR & Style 2-Way Mapping Card */}
+      {/* Information Banner on Auto-Save Behavior */}
+      <div className="p-3.5 bg-blue-50 border border-blue-200 rounded-lg flex items-start gap-3 text-xs text-blue-900">
+        <Info className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
+        <div className="space-y-1">
+          <div className="font-semibold">Mekanisme Pembacaan Otomatis (Tanpa Revisi Manual):</div>
+          <div className="text-blue-800 text-[11px] leading-relaxed">
+            1. Seluruh baris material dibaca langsung dari file Excel sesuai struktur kolom ERP Odoo/SAP.<br />
+            2. Master Data Material digunakan sebagai referensi untuk mengenali kode, nama, dan satuan jika penulisan tidak konsisten.<br />
+            3. Data langsung tersimpan dan otomatis terhubung ke Nomor OR serta Style terkait per baris transaksi.<br />
+            4. Setelah pembacaan, tampilan langsung berpindah ke Master Data Material untuk pengecekan cepat.
+          </div>
+        </div>
+      </div>
+
+      {/* SECTION: Nomor OR & Style 2-Way Mapping Card */}
       <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-xs">
         <div className="flex items-center justify-between pb-3 mb-4 border-b border-slate-100">
           <div className="flex items-center gap-2">
@@ -507,10 +370,10 @@ export const UploadExcelView: React.FC = () => {
             </div>
             <div>
               <h3 className="text-sm font-bold text-slate-900">
-                1. Hubungan Nomor OR & Style
+                Hubungan Nomor OR & Style
               </h3>
               <p className="text-[11px] text-slate-500">
-                Ketik Nomor OR untuk mengisi Style otomatis, atau ketik Style untuk menemukan Nomor OR terkait.
+                Digunakan sebagai fallback jika kolom OR/Style di file Excel kosong. Nilai otomatis terisi dua arah berdasarkan riwayat.
               </p>
             </div>
           </div>
@@ -537,7 +400,7 @@ export const UploadExcelView: React.FC = () => {
                 />
               </div>
               <p className="text-[11px] text-slate-400 mt-1">
-                Jika nomor OR pernah ada, Style akan terisi otomatis.
+                Ketik nomor OR untuk melengkapi Style secara otomatis.
               </p>
             </div>
 
@@ -552,12 +415,12 @@ export const UploadExcelView: React.FC = () => {
                   type="text"
                   value={style}
                   onChange={(e) => handleStyleChange(e.target.value)}
-                  placeholder="Contoh: Regular Fit Oxford Shirt Navy"
+                  placeholder="Contoh: Bomber Jacket Taslan Navy"
                   className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-blue-500 bg-white"
                 />
               </div>
               <p className="text-[11px] text-slate-400 mt-1">
-                Jika Style cocok dengan satu OR, OR terisi otomatis.
+                Ketik Style untuk mencari nomor OR yang cocok.
               </p>
             </div>
           </div>
@@ -625,7 +488,7 @@ export const UploadExcelView: React.FC = () => {
         </form>
       </div>
 
-      {/* Upload Drop Zone & Fast Action */}
+      {/* Upload Drop Zone & Fast Demo */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Dropzone Column */}
         <div className="lg:col-span-2">
@@ -642,7 +505,7 @@ export const UploadExcelView: React.FC = () => {
                 handleFileUpload(e.dataTransfer.files[0]);
               }
             }}
-            className={`border-2 border-dashed rounded-xl p-8 text-center transition-all bg-white ${
+            className={`border-2 border-dashed rounded-xl p-8 text-center transition-all bg-white relative ${
               dragActive
                 ? 'border-blue-500 bg-blue-50/50'
                 : 'border-slate-300 hover:border-slate-400'
@@ -653,20 +516,21 @@ export const UploadExcelView: React.FC = () => {
                 <Upload className="w-6 h-6" />
               </div>
               <h3 className="text-sm font-bold text-slate-900">
-                2. Tarik & Lepas File Excel di Sini
+                Tarik & Lepas File Excel di Sini
               </h3>
               <p className="text-xs text-slate-500 leading-relaxed">
-                Mendukung format .XLSX, .XLS, atau .CSV. Pastikan kolom memuat Kode Material, Nama, Total Stok, dan Kebutuhan.
+                Mendukung file .xlsx, .xls, atau .csv hasil ekspor ERP. Hasil pembacaan akan <strong>langsung disimpan dan ditampilkan ke Master Data Material</strong> tanpa perlu revisi atau konfirmasi manual.
               </p>
 
               <div className="pt-2 flex items-center justify-center gap-3">
-                <label className="px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white font-medium text-xs rounded-md shadow-xs cursor-pointer transition-colors inline-flex items-center gap-2">
+                <label className="px-4 py-2.5 bg-blue-600 hover:bg-blue-700 text-white font-semibold text-xs rounded-md shadow-xs cursor-pointer transition-colors inline-flex items-center gap-2">
                   <FileSpreadsheet className="w-4 h-4" />
-                  Pilih File dari Komputer
+                  {isProcessing ? 'Memproses Berkas...' : 'Pilih File Excel dari Komputer'}
                   <input
                     type="file"
                     accept=".xlsx, .xls, .csv"
                     className="hidden"
+                    disabled={isProcessing}
                     onChange={(e) => {
                       if (e.target.files && e.target.files[0]) {
                         handleFileUpload(e.target.files[0]);
@@ -679,7 +543,7 @@ export const UploadExcelView: React.FC = () => {
               {fileName && (
                 <div className="mt-3 p-2 bg-blue-50 border border-blue-200 rounded text-xs text-blue-800 font-medium inline-flex items-center gap-1.5">
                   <FileCheck className="w-4 h-4 text-blue-600" />
-                  Berkas Terpilih: <strong>{fileName}</strong>
+                  Berkas Terakhir: <strong>{fileName}</strong>
                 </div>
               )}
             </div>
@@ -691,27 +555,30 @@ export const UploadExcelView: React.FC = () => {
           <div>
             <div className="flex items-center gap-2 text-slate-900 font-bold text-sm mb-2">
               <Database className="w-4 h-4 text-blue-600" />
-              Demo Data Excel PPIC
+              Simulasi Data Excel ERP (1-Klik)
             </div>
             <p className="text-xs text-slate-600 leading-relaxed">
-              Jika Anda belum memiliki file Excel lokal saat ini, klik tombol di bawah untuk menyimulasikan pembacaan berkas Excel laporan mingguan PPIC secara instan.
+              Uji langsung alur pembacaan dan penyimpanan otomatis menggunakan sampel riil struktur kolom <code>Order Lines</code> Odoo ERP.
             </p>
 
             <div className="mt-4 p-3 bg-slate-50 rounded border border-slate-100 text-[11px] text-slate-600 space-y-1.5">
-              <div className="font-semibold text-slate-800">Termasuk dalam dataset:</div>
-              <div>• 7 Item Material Manufaktur Utama</div>
-              <div>• Data Alokasi SPK Aktual & Safety Stock</div>
-              <div>• Nilai Unit Price & Lead Time Supplier</div>
+              <div className="font-semibold text-slate-800">Kolom Teruji:</div>
+              <div>• <code>Order Lines/Product/Display Name</code></div>
+              <div>• <code>Order Lines/Quantity</code> (Kebutuhan)</div>
+              <div>• <code>Order Lines/Received Qty</code> (Diterima)</div>
+              <div>• <code>Order Lines/Product Unit of Measure</code></div>
+              <div>• Otomatis menghitung <code>Kekurangan & Status READY</code></div>
             </div>
           </div>
 
           <div className="mt-4 pt-3 border-t border-slate-100">
             <button
               onClick={loadRealisticSampleExcel}
-              className="w-full py-2.5 px-3 bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs rounded-md shadow-xs transition-colors flex items-center justify-center gap-2"
+              disabled={isProcessing}
+              className="w-full py-2.5 px-3 bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs rounded-md shadow-xs transition-colors flex items-center justify-center gap-2 cursor-pointer"
             >
-              <RefreshCw className="w-3.5 h-3.5 text-blue-400" />
-              Muat Contoh Data Excel PPIC (Demo)
+              <RefreshCw className={`w-3.5 h-3.5 text-blue-400 ${isProcessing ? 'animate-spin' : ''}`} />
+              Muat & Simpan Otomatis Sampel ERP
             </button>
           </div>
         </div>
@@ -721,65 +588,40 @@ export const UploadExcelView: React.FC = () => {
       {statusMessage && (
         <div className="p-3.5 rounded-lg bg-blue-50 border border-blue-200 text-blue-900 text-xs flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <CheckCircle className="w-4 h-4 text-blue-600 shrink-0" />
-            <span>{statusMessage}</span>
+            <CheckCircle className="w-4 h-4 text-emerald-600 shrink-0" />
+            <span className="font-medium">{statusMessage}</span>
           </div>
-          {parsedData?.materials && (
-            <button
-              onClick={handleCommitData}
-              className="px-3 py-1.5 bg-blue-700 hover:bg-blue-800 text-white font-semibold text-xs rounded shadow-xs transition-colors shrink-0 flex items-center gap-1.5"
-            >
-              Terapkan ke Sistem Sekarang <ArrowRight className="w-3.5 h-3.5" />
-            </button>
-          )}
+          <button
+            onClick={() => setActiveMenu('Rekap Material')}
+            className="px-3 py-1.5 bg-blue-700 hover:bg-blue-800 text-white font-semibold text-xs rounded shadow-xs transition-colors shrink-0 flex items-center gap-1.5"
+          >
+            Buka Master Data Material <ArrowRight className="w-3.5 h-3.5" />
+          </button>
         </div>
       )}
 
-      {/* Parsed Preview Table */}
-      {parsedData?.rawRows && parsedData.rawRows.length > 0 && (
-        <div className="bg-white rounded-lg border border-slate-200 shadow-xs overflow-hidden">
-          <div className="px-5 py-3.5 bg-slate-50 border-b border-slate-200 flex items-center justify-between">
-            <div className="flex items-center gap-2">
-              <FileCheck className="w-4 h-4 text-emerald-600" />
-              <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wide">
-                Pratinjau Data Excel ({parsedData.rawRows.length} Baris Teridentifikasi)
-              </h3>
+      {/* Info card for previous upload */}
+      {lastImportedInfo && (
+        <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-lg flex items-center justify-between">
+          <div className="flex items-center gap-3">
+            <div className="w-8 h-8 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
+              <CheckCircle className="w-4 h-4" />
             </div>
-            <button
-              onClick={handleCommitData}
-              className="px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs rounded shadow-xs transition-colors flex items-center gap-1.5"
-            >
-              <CheckCircle className="w-3.5 h-3.5" />
-              Simpan & Sinkronkan ke Sistem
-            </button>
+            <div>
+              <div className="text-xs font-bold text-emerald-950">
+                Penyimpanan Terakhir: {lastImportedInfo.count} Baris Material Tersimpan
+              </div>
+              <div className="text-[11px] text-emerald-800">
+                Nomor OR: <strong className="font-mono">{lastImportedInfo.orNumber}</strong> {lastImportedInfo.style && `(${lastImportedInfo.style})`} · Tersimpan di Master Data Material tanpa revisi manual.
+              </div>
+            </div>
           </div>
-
-          <div className="overflow-x-auto max-h-96">
-            <table className="w-full text-left text-xs border-collapse">
-              <thead>
-                <tr className="bg-slate-100 text-slate-700 font-semibold border-b border-slate-200">
-                  <th className="py-2 px-3">#</th>
-                  {Object.keys(parsedData.rawRows[0]).slice(0, 8).map((colKey) => (
-                    <th key={colKey} className="py-2 px-3 whitespace-nowrap">
-                      {colKey}
-                    </th>
-                  ))}
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {parsedData.rawRows.map((row, idx) => (
-                  <tr key={idx} className="hover:bg-slate-50">
-                    <td className="py-2 px-3 text-slate-400 font-mono text-[11px]">{idx + 1}</td>
-                    {Object.keys(parsedData.rawRows![0]).slice(0, 8).map((colKey) => (
-                      <td key={colKey} className="py-2 px-3 font-medium text-slate-800 whitespace-nowrap">
-                        {String(row[colKey] ?? '-')}
-                      </td>
-                    ))}
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
+          <button
+            onClick={() => setActiveMenu('Rekap Material')}
+            className="px-3 py-1.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-md transition-colors"
+          >
+            Lihat Hasil di Master Data
+          </button>
         </div>
       )}
     </div>

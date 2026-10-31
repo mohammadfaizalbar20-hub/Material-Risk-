@@ -112,6 +112,15 @@ interface PpicContextType {
   setSelectedScheduleId: (id: string | null) => void;
   selectedWorkOrderId: string | null;
   setSelectedWorkOrderId: (id: string | null) => void;
+
+  // Realtime Excel auto-save and highlight tracking
+  lastImportedInfo: { orNumber: string; style?: string; count: number; timestamp: number } | null;
+  setLastImportedInfo: (info: { orNumber: string; style?: string; count: number; timestamp: number } | null) => void;
+  autoSaveExcelMaterials: (params: {
+    newRequirements: MaterialItemRequirement[];
+    newMasterMaterials?: Material[];
+    newRelations?: OrStyleRelation[];
+  }) => void;
 }
 
 const PpicContext = createContext<PpicContextType | undefined>(undefined);
@@ -127,6 +136,13 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const [activeSearchQuery, setActiveSearchQuery] = useState<string>('');
   const [selectedScheduleId, setSelectedScheduleId] = useState<string | null>(null);
+
+  const [lastImportedInfo, setLastImportedInfo] = useState<{
+    orNumber: string;
+    style?: string;
+    count: number;
+    timestamp: number;
+  } | null>(null);
 
   // OR & Style Relations
   const [orStyleRelations, setOrStyleRelations] = useState<OrStyleRelation[]>(() => {
@@ -414,12 +430,96 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     ]);
   };
 
+  // Direct Automatic Save from Excel Reader into Master Data Material
+  const autoSaveExcelMaterials = ({
+    newRequirements,
+    newMasterMaterials = [],
+    newRelations = [],
+  }: {
+    newRequirements: MaterialItemRequirement[];
+    newMasterMaterials?: Material[];
+    newRelations?: OrStyleRelation[];
+  }) => {
+    if (newRequirements.length === 0) return;
+
+    // 1. Master Data Material Catalog (Prevent duplicate codes)
+    if (newMasterMaterials.length > 0) {
+      setMaterials((prev) => {
+        const existingCodes = new Set(prev.map((m) => m.code.trim().toUpperCase()));
+        const toAdd = newMasterMaterials.filter(
+          (m) => !existingCodes.has(m.code.trim().toUpperCase())
+        );
+        return [...prev, ...toAdd];
+      });
+    }
+
+    // 2. Transaction Lines (Preserve distinct transaction per OR)
+    const orSet = new Set(newRequirements.map((r) => r.orNumber.trim().toUpperCase()));
+    setMaterialRequirements((prev) => {
+      // Remove previous lines for these specific ORs being replaced/updated to avoid duplicate re-imports
+      const otherOrLines = prev
+        .filter((r) => !orSet.has(r.orNumber.trim().toUpperCase()))
+        .map((r) => ({ ...r, isRecentlyImported: false }));
+
+      const taggedNewReqs = newRequirements.map((r) => ({
+        ...r,
+        isRecentlyImported: true,
+        importedAt: r.importedAt || new Date().toISOString(),
+      }));
+
+      return [...taggedNewReqs, ...otherOrLines];
+    });
+
+    // 3. Save OR <-> Style relations
+    if (newRelations.length > 0) {
+      setOrStyleRelations((prev) => {
+        const map = new Map(
+          prev.map((r) => [`${r.orNumber.trim().toUpperCase()}__${r.style.trim().toLowerCase()}`, r])
+        );
+        for (const item of newRelations) {
+          map.set(
+            `${item.orNumber.trim().toUpperCase()}__${item.style.trim().toLowerCase()}`,
+            item
+          );
+        }
+        return Array.from(map.values());
+      });
+    }
+
+    // 4. Record recently imported batch info
+    const primaryOr = newRequirements[0]?.orNumber || '';
+    const primaryStyle = newRequirements[0]?.style || '';
+    setLastImportedInfo({
+      orNumber: primaryOr,
+      style: primaryStyle,
+      count: newRequirements.length,
+      timestamp: Date.now(),
+    });
+
+    // 5. Add system notification
+    setNotifications((prev) => [
+      {
+        id: `notif-${Date.now()}`,
+        type: 'info',
+        title: 'Hasil Pembacaan Excel Otomatis Tersimpan',
+        message: `${newRequirements.length} baris material langsung dimasukkan ke Master Data Material (OR: ${primaryOr}).`,
+        timestamp: 'Baru saja',
+        read: false,
+      },
+      ...prev,
+    ]);
+
+    // 6. Direct automatic navigation to Master Data Material
+    setActiveMenu('Rekap Material');
+  };
+
   const resetToInitialData = () => {
     setOrStyleRelations(INITIAL_OR_STYLE_RELATIONS);
     setMaterialRequirements(INITIAL_MATERIAL_REQUIREMENTS);
     setProductionSchedules(INITIAL_PRODUCTION_SCHEDULES);
     setMaterials(INITIAL_MATERIALS);
     setWarehouseStock(INITIAL_WAREHOUSE_STOCK);
+    setLastImportedInfo(null);
     localStorage.removeItem(`${LOCAL_STORAGE_KEY}_or_style`);
     localStorage.removeItem(`${LOCAL_STORAGE_KEY}_requirements`);
     localStorage.removeItem(`${LOCAL_STORAGE_KEY}_schedules`);
@@ -477,6 +577,9 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setActiveSearchQuery,
         resetToInitialData,
         importPpicData,
+        lastImportedInfo,
+        setLastImportedInfo,
+        autoSaveExcelMaterials,
 
         selectedScheduleId,
         setSelectedScheduleId,

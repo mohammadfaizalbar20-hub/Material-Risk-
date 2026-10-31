@@ -59,6 +59,8 @@ export interface MaterialItemRequirement {
   receivedQty: number; // Diterima
   unitPrice: number;
   supplierName?: string;
+  isRecentlyImported?: boolean;
+  importedAt?: string;
 }
 
 export interface ScheduleConflict {

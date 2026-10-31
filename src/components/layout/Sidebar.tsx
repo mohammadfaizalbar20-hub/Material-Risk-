@@ -35,7 +35,7 @@ export const Sidebar: React.FC = () => {
   }> = [
     { id: 'Dashboard', label: 'Dashboard', icon: LayoutDashboard },
     { id: 'Upload Excel', label: 'Upload Excel', icon: FileSpreadsheet },
-    { id: 'Rekap Material', label: 'Rekap Material', icon: Boxes },
+    { id: 'Rekap Material', label: 'Master Data Material', icon: Boxes },
     {
       id: 'Penjadwalan Produksi',
       label: 'Penjadwalan Produksi',

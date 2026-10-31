@@ -67,10 +67,12 @@ export const Header: React.FC = () => {
           <div className="flex items-center gap-2 text-[11px] text-slate-500">
             <span>PPIC Material System</span>
             <span>/</span>
-            <span className="font-semibold text-blue-700">{activeMenu}</span>
+            <span className="font-semibold text-blue-700">
+              {activeMenu === 'Rekap Material' ? 'Master Data Material' : activeMenu}
+            </span>
           </div>
           <h1 className="text-sm md:text-base font-bold text-slate-900 leading-tight">
-            {activeMenu}
+            {activeMenu === 'Rekap Material' ? 'Master Data Material' : activeMenu}
           </h1>
         </div>
       </div>

@@ -1,395 +1,857 @@
 import React, { useState, useMemo } from 'react';
 import { usePpic } from '../../context/PpicContext';
-import { Material, MaterialCategory, MaterialUnit } from '../../types/ppic';
-import { RiskBadge } from '../common/RiskBadge';
+import { MaterialItemRequirement, Material, MaterialCategory, MaterialUnit } from '../../types/ppic';
+import * as XLSX from 'xlsx';
 import {
   Boxes,
   Plus,
   Search,
   Filter,
-  Edit2,
-  Trash2,
-  AlertTriangle,
-  ArrowUpDown,
   Download,
+  Upload,
+  CheckCircle2,
+  AlertTriangle,
   X,
-  Check,
-  Building2,
-  Clock,
+  FileCheck,
+  Tag,
+  Hash,
+  Sparkles,
   Layers,
+  ArrowUpDown,
+  Trash2,
+  Edit2,
+  Info,
 } from 'lucide-react';
 
 export const MaterialSummaryView: React.FC = () => {
   const {
     materials,
+    materialRequirements,
+    addMaterialRequirement,
+    updateMaterialRequirement,
+    deleteMaterialRequirement,
     addMaterial,
     updateMaterial,
     deleteMaterial,
-    materialRiskAssessments,
+    setActiveMenu,
+    lastImportedInfo,
+    setLastImportedInfo,
     activeSearchQuery,
     setActiveSearchQuery,
   } = usePpic();
 
-  const [selectedCategory, setSelectedCategory] = useState<string>('ALL');
-  const [stockHealthFilter, setStockHealthFilter] = useState<string>('ALL');
-  const [modalOpen, setModalOpen] = useState<boolean>(false);
-  const [editingMaterial, setEditingMaterial] = useState<Material | null>(null);
+  // Active view tab: 'REQUIREMENTS' (Default Master Data Material) vs 'CATALOG' (Katalog Bahan Baku)
+  const [activeTab, setActiveTab] = useState<'REQUIREMENTS' | 'CATALOG'>('REQUIREMENTS');
 
-  // Form state
-  const [formData, setFormData] = useState<{
-    code: string;
-    name: string;
+  // Filters for Master Data Material Requirements Table
+  const [selectedOrFilter, setSelectedOrFilter] = useState<string>('ALL');
+  const [statusFilter, setStatusFilter] = useState<'ALL' | 'READY' | 'BELUM_READY'>('ALL');
+  const [onlyRecentFilter, setOnlyRecentFilter] = useState<boolean>(false);
+
+  // Modal states
+  const [addReqModalOpen, setAddReqModalOpen] = useState<boolean>(false);
+  const [editingReq, setEditingReq] = useState<MaterialItemRequirement | null>(null);
+
+  // Form data for Requirement modal
+  const [reqFormData, setReqFormData] = useState<{
+    orNumber: string;
+    style: string;
+    materialCode: string;
+    materialName: string;
     category: MaterialCategory;
     unit: MaterialUnit;
-    totalStock: number;
-    safetyStock: number;
-    leadTimeDays: number;
-    supplierName: string;
-    defaultWarehouse: string;
+    requiredQty: number;
+    receivedQty: number;
     unitPrice: number;
-    minOrderQty: number;
+    supplierName: string;
   }>({
-    code: '',
-    name: '',
+    orNumber: 'OR-2026-001',
+    style: '',
+    materialCode: '',
+    materialName: '',
     category: 'Raw Material',
     unit: 'Kg',
-    totalStock: 1000,
-    safetyStock: 300,
-    leadTimeDays: 7,
-    supplierName: '',
-    defaultWarehouse: 'WH-01',
+    requiredQty: 1000,
+    receivedQty: 1000,
     unitPrice: 25000,
-    minOrderQty: 500,
+    supplierName: '',
   });
 
-  // Material risk lookup map by material code
-  const riskMap = useMemo(() => {
-    return new Map(materialRiskAssessments.map((r) => [r.materialCode, r]));
-  }, [materialRiskAssessments]);
+  // Extract unique OR list
+  const uniqueOrList = useMemo(() => {
+    const set = new Set(materialRequirements.map((r) => r.orNumber.trim().toUpperCase()).filter(Boolean));
+    return Array.from(set);
+  }, [materialRequirements]);
 
-  // Filtering materials
-  const filteredMaterials = useMemo(() => {
-    return materials.filter((m) => {
-      // Search
+  // Master Data Material Rows with calculated Kekurangan & Status
+  // Rumus wajib:
+  // Kekurangan = Diterima - Kebutuhan
+  // READY jika Kekurangan >= 0
+  // BELUM READY jika Kekurangan < 0
+  const processedRequirements = useMemo(() => {
+    return materialRequirements.map((req) => {
+      const shortage = req.receivedQty - req.requiredQty; // Kekurangan = Diterima - Kebutuhan
+      const isReady = shortage >= 0;
+      return {
+        ...req,
+        shortage,
+        isReady,
+        statusLabel: isReady ? 'READY' : 'BELUM READY',
+      };
+    });
+  }, [materialRequirements]);
+
+  // Filtered requirements
+  const filteredRequirements = useMemo(() => {
+    return processedRequirements.filter((r) => {
+      // 1. Search Query
       const q = activeSearchQuery.toLowerCase();
-      const matchSearch =
-        m.code.toLowerCase().includes(q) ||
-        m.name.toLowerCase().includes(q) ||
-        m.supplierName.toLowerCase().includes(q);
+      if (q) {
+        const matchCode = r.materialCode.toLowerCase().includes(q);
+        const matchName = r.materialName.toLowerCase().includes(q);
+        const matchOr = r.orNumber.toLowerCase().includes(q);
+        const matchStyle = r.style.toLowerCase().includes(q);
+        const matchSupplier = (r.supplierName || '').toLowerCase().includes(q);
+        if (!matchCode && !matchName && !matchOr && !matchStyle && !matchSupplier) {
+          return false;
+        }
+      }
 
-      if (!matchSearch) return false;
-
-      // Category filter
-      if (selectedCategory !== 'ALL' && m.category !== selectedCategory) {
+      // 2. OR Filter
+      if (selectedOrFilter !== 'ALL' && r.orNumber.toUpperCase() !== selectedOrFilter.toUpperCase()) {
         return false;
       }
 
-      // Health filter
-      const free = m.totalStock - m.allocatedStock;
-      const risk = riskMap.get(m.code)?.riskCategory || (free < 0 ? 'CRITICAL' : 'LOW');
+      // 3. Status Filter
+      if (statusFilter === 'READY' && !r.isReady) return false;
+      if (statusFilter === 'BELUM_READY' && r.isReady) return false;
 
-      if (stockHealthFilter === 'CRITICAL' && risk !== 'CRITICAL') return false;
-      if (stockHealthFilter === 'SHORTAGE' && free >= 0) return false;
-      if (stockHealthFilter === 'LOW_SAFETY' && free >= m.safetyStock) return false;
-      if (stockHealthFilter === 'READY' && risk !== 'LOW') return false;
+      // 4. Only recent filter
+      if (onlyRecentFilter && !r.isRecentlyImported) return false;
 
       return true;
     });
-  }, [materials, activeSearchQuery, selectedCategory, stockHealthFilter, riskMap]);
+  }, [processedRequirements, activeSearchQuery, selectedOrFilter, statusFilter, onlyRecentFilter]);
 
+  // KPI Metrics
+  const metrics = useMemo(() => {
+    const total = processedRequirements.length;
+    const ready = processedRequirements.filter((r) => r.isReady).length;
+    const notReady = total - ready;
+    const totalRequired = processedRequirements.reduce((sum, r) => sum + r.requiredQty, 0);
+    const totalReceived = processedRequirements.reduce((sum, r) => sum + r.receivedQty, 0);
+    const recentlyImportedCount = processedRequirements.filter((r) => r.isRecentlyImported).length;
+
+    return {
+      total,
+      ready,
+      notReady,
+      readyPercent: total > 0 ? Math.round((ready / total) * 100) : 0,
+      notReadyPercent: total > 0 ? Math.round((notReady / total) * 100) : 0,
+      totalRequired,
+      totalReceived,
+      recentlyImportedCount,
+    };
+  }, [processedRequirements]);
+
+  // Handlers for modal
   const handleOpenAddModal = () => {
-    setEditingMaterial(null);
-    setFormData({
-      code: `RM-NEW-${Math.floor(100 + Math.random() * 900)}`,
-      name: '',
+    setEditingReq(null);
+    setReqFormData({
+      orNumber: selectedOrFilter !== 'ALL' ? selectedOrFilter : 'OR-2026-001',
+      style: '',
+      materialCode: '',
+      materialName: '',
       category: 'Raw Material',
       unit: 'Kg',
-      totalStock: 1000,
-      safetyStock: 300,
-      leadTimeDays: 7,
-      supplierName: '',
-      defaultWarehouse: 'WH-01',
+      requiredQty: 1000,
+      receivedQty: 500,
       unitPrice: 25000,
-      minOrderQty: 500,
+      supplierName: '',
     });
-    setModalOpen(true);
+    setAddReqModalOpen(true);
   };
 
-  const handleOpenEditModal = (mat: Material) => {
-    setEditingMaterial(mat);
-    setFormData({
-      code: mat.code,
-      name: mat.name,
-      category: mat.category,
-      unit: mat.unit,
-      totalStock: mat.totalStock,
-      safetyStock: mat.safetyStock,
-      leadTimeDays: mat.leadTimeDays,
-      supplierName: mat.supplierName,
-      defaultWarehouse: mat.defaultWarehouse,
-      unitPrice: mat.unitPrice,
-      minOrderQty: mat.minOrderQty,
+  const handleOpenEditModal = (req: MaterialItemRequirement) => {
+    setEditingReq(req);
+    setReqFormData({
+      orNumber: req.orNumber,
+      style: req.style,
+      materialCode: req.materialCode,
+      materialName: req.materialName,
+      category: req.category,
+      unit: req.unit,
+      requiredQty: req.requiredQty,
+      receivedQty: req.receivedQty,
+      unitPrice: req.unitPrice,
+      supplierName: req.supplierName || '',
     });
-    setModalOpen(true);
+    setAddReqModalOpen(true);
   };
 
-  const handleSubmitForm = (e: React.FormEvent) => {
+  const handleSubmitReqForm = (e: React.FormEvent) => {
     e.preventDefault();
-    if (!formData.code || !formData.name) return;
+    if (!reqFormData.materialCode || !reqFormData.materialName || !reqFormData.orNumber) return;
 
-    if (editingMaterial) {
-      updateMaterial(editingMaterial.id, {
-        ...formData,
-      });
+    if (editingReq) {
+      updateMaterialRequirement(editingReq.id, reqFormData);
     } else {
-      addMaterial({
-        ...formData,
-        allocatedStock: 0,
-      });
+      addMaterialRequirement(reqFormData);
     }
-    setModalOpen(false);
+    setAddReqModalOpen(false);
   };
 
-  const formatIdr = (val: number) => {
-    return new Intl.NumberFormat('id-ID', {
-      style: 'currency',
-      currency: 'IDR',
-      maximumFractionDigits: 0,
-    }).format(val);
+  // Export exact Master Data Material table to Excel
+  const handleExportMasterDataExcel = () => {
+    const wb = XLSX.utils.book_new();
+    const exportData = filteredRequirements.map((r) => ({
+      'Kode Material': r.materialCode,
+      'Nama Material': r.materialName,
+      'Satuan': r.unit,
+      'Nomor OR Terkait': r.orNumber,
+      'Style Terkait': r.style,
+      'Kebutuhan': r.requiredQty,
+      'Diterima': r.receivedQty,
+      'Kekurangan': r.shortage,
+      'Status': r.statusLabel,
+      'Kategori': r.category,
+      'Supplier': r.supplierName || '-',
+    }));
+    const ws = XLSX.utils.json_to_sheet(exportData);
+    XLSX.utils.book_append_sheet(wb, ws, 'Master_Data_Material');
+    XLSX.writeFile(wb, `Master_Data_Material_${new Date().toISOString().slice(0, 10)}.xlsx`);
   };
 
   return (
     <div className="space-y-6">
-      {/* Header bar */}
-      <div className="p-5 bg-white rounded-lg border border-slate-200 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+      {/* Top Banner: Master Data Material Header */}
+      <div className="p-5 bg-white rounded-lg border border-slate-200 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
+          <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded text-[11px] font-semibold bg-blue-50 text-blue-700 border border-blue-200 mb-1.5">
+            <Boxes className="w-3.5 h-3.5" />
+            Master Data Material PPIC
+          </div>
           <h2 className="text-base md:text-lg font-bold text-slate-900">
-            Rekap Master Material & Saldo Stok
+            Master Data Material & Kesiapan Produksi
           </h2>
-          <p className="text-xs text-slate-500 mt-0.5">
-            Database seluruh komponen Raw Material, Kemasan, dan Bahan Kimia dengan status alokasi produksi SPK.
+          <p className="text-xs text-slate-500 mt-0.5 max-w-2xl">
+            Hasil pembacaan Excel otomatis: Kebutuhan, Diterima, Kekurangan (<code>Diterima - Kebutuhan</code>), serta status <strong>READY</strong> atau <strong>BELUM READY</strong> per baris transaksi OR.
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          <button
+            onClick={() => setActiveMenu('Upload Excel')}
+            className="px-3.5 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded-md shadow-xs transition-colors flex items-center gap-1.5 cursor-pointer"
+          >
+            <Upload className="w-4 h-4" />
+            Unggah File Excel
+          </button>
+          <button
+            onClick={handleExportMasterDataExcel}
+            className="px-3 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors flex items-center gap-1.5 cursor-pointer"
+          >
+            <Download className="w-4 h-4 text-slate-500" />
+            Ekspor Excel (.xlsx)
+          </button>
           <button
             onClick={handleOpenAddModal}
-            className="px-3.5 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded-md shadow-xs transition-colors flex items-center gap-1.5"
+            className="px-3 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-100 border border-slate-300 rounded-md transition-colors flex items-center gap-1.5 cursor-pointer"
           >
             <Plus className="w-4 h-4" />
-            Tambah Material Baru
+            Tambah Baris Manual
           </button>
         </div>
       </div>
 
-      {/* Filter Toolbar */}
-      <div className="p-4 bg-white rounded-lg border border-slate-200 shadow-xs space-y-3">
-        {/* Category Tabs */}
-        <div className="flex flex-wrap items-center gap-1.5">
-          <span className="text-xs font-semibold text-slate-500 mr-2">Kategori:</span>
-          {['ALL', 'Raw Material', 'Packaging', 'Chemical', 'Auxiliary'].map((cat) => (
-            <button
-              key={cat}
-              onClick={() => setSelectedCategory(cat)}
-              className={`px-3 py-1.5 text-xs font-medium rounded-md transition-colors ${
-                selectedCategory === cat
-                  ? 'bg-slate-900 text-white shadow-xs'
-                  : 'bg-slate-100 text-slate-600 hover:bg-slate-200 hover:text-slate-900'
-              }`}
-            >
-              {cat === 'ALL' ? 'Semua Kategori' : cat}
-            </button>
-          ))}
-        </div>
-
-        {/* Health status filter & live search */}
-        <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 pt-2 border-t border-slate-100">
-          <div className="flex flex-wrap items-center gap-1.5">
-            <span className="text-xs font-semibold text-slate-500 mr-2">Status Stok:</span>
-            {[
-              { id: 'ALL', label: 'Semua Status' },
-              { id: 'CRITICAL', label: 'Kritis Shortage' },
-              { id: 'LOW_SAFETY', label: 'Di Bawah Safety Stock' },
-              { id: 'READY', label: 'Ready / Aman' },
-            ].map((f) => (
-              <button
-                key={f.id}
-                onClick={() => setStockHealthFilter(f.id)}
-                className={`px-2.5 py-1 text-xs rounded border transition-colors ${
-                  stockHealthFilter === f.id
-                    ? 'border-blue-500 bg-blue-50 text-blue-700 font-semibold'
-                    : 'border-slate-200 bg-white text-slate-600 hover:bg-slate-50'
-                }`}
-              >
-                {f.label}
-              </button>
-            ))}
+      {/* Prominent Banner for Newly Read/Saved Excel Data */}
+      {lastImportedInfo && (
+        <div className="p-4 bg-emerald-50 border border-emerald-300 rounded-xl shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-3 animate-in fade-in duration-200">
+          <div className="flex items-start gap-3">
+            <div className="w-9 h-9 rounded-lg bg-emerald-600 text-white flex items-center justify-center shrink-0 mt-0.5">
+              <Sparkles className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="text-xs font-bold text-emerald-950 flex items-center gap-2">
+                <span>Data Excel Berhasil Dibaca & Disimpan Otomatis ke Master Data Material</span>
+                <span className="px-2 py-0.5 text-[10px] font-mono font-bold bg-emerald-200 text-emerald-900 rounded-full">
+                  {lastImportedInfo.count} Baris Transaksi
+                </span>
+              </div>
+              <p className="text-xs text-emerald-800 mt-0.5">
+                Nomor OR: <strong className="font-mono">{lastImportedInfo.orNumber}</strong> {lastImportedInfo.style && `· Style: ${lastImportedInfo.style}`}. Data langsung aktif tanpa perlu konfirmasi manual.
+              </p>
+            </div>
           </div>
 
-          <div className="text-xs text-slate-500">
-            Menampilkan <strong className="text-slate-900">{filteredMaterials.length}</strong> dari {materials.length} material
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              onClick={() => {
+                setSelectedOrFilter(lastImportedInfo.orNumber);
+                setOnlyRecentFilter(true);
+              }}
+              className="px-3 py-1.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-md shadow-2xs transition-colors cursor-pointer"
+            >
+              Filter Hanya Data Baru
+            </button>
+            <button
+              onClick={() => {
+                setSelectedOrFilter('ALL');
+                setOnlyRecentFilter(false);
+              }}
+              className="px-2.5 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-100 rounded transition-colors cursor-pointer"
+            >
+              Tampilkan Semua
+            </button>
+            <button
+              onClick={() => setLastImportedInfo(null)}
+              className="p-1 text-emerald-600 hover:text-emerald-900 rounded cursor-pointer"
+              title="Tutup pemberitahuan"
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* KPI Summary Cards */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <div className="p-4 bg-white rounded-xl border border-slate-200 shadow-xs">
+          <div className="text-xs font-medium text-slate-500">Total Baris Transaksi</div>
+          <div className="text-xl md:text-2xl font-bold font-mono text-slate-900 mt-1">
+            {metrics.total.toLocaleString('id-ID')}
+          </div>
+          <div className="text-[11px] text-slate-400 mt-1">
+            {uniqueOrList.length} Nomor OR terhubung
+          </div>
+        </div>
+
+        <div className="p-4 bg-white rounded-xl border border-slate-200 shadow-xs">
+          <div className="text-xs font-medium text-emerald-700 flex items-center gap-1.5">
+            <CheckCircle2 className="w-3.5 h-3.5" />
+            Status READY (Kekurangan ≥ 0)
+          </div>
+          <div className="text-xl md:text-2xl font-bold font-mono text-emerald-700 mt-1">
+            {metrics.ready.toLocaleString('id-ID')}
+            <span className="text-xs font-normal text-emerald-600 ml-1.5">({metrics.readyPercent}%)</span>
+          </div>
+          <div className="text-[11px] text-slate-400 mt-1">
+            Material siap untuk proses produksi
+          </div>
+        </div>
+
+        <div className="p-4 bg-white rounded-xl border border-slate-200 shadow-xs">
+          <div className="text-xs font-medium text-red-700 flex items-center gap-1.5">
+            <AlertTriangle className="w-3.5 h-3.5" />
+            Status BELUM READY (Kekurangan &lt; 0)
+          </div>
+          <div className="text-xl md:text-2xl font-bold font-mono text-red-700 mt-1">
+            {metrics.notReady.toLocaleString('id-ID')}
+            <span className="text-xs font-normal text-red-600 ml-1.5">({metrics.notReadyPercent}%)</span>
+          </div>
+          <div className="text-[11px] text-slate-400 mt-1">
+            Perlu pemenuhan penerimaan material
+          </div>
+        </div>
+
+        <div className="p-4 bg-white rounded-xl border border-slate-200 shadow-xs">
+          <div className="text-xs font-medium text-blue-700 flex items-center gap-1.5">
+            <Sparkles className="w-3.5 h-3.5" />
+            Baru Dibaca / Diimpor
+          </div>
+          <div className="text-xl md:text-2xl font-bold font-mono text-blue-700 mt-1">
+            {metrics.recentlyImportedCount.toLocaleString('id-ID')}
+          </div>
+          <div className="text-[11px] text-slate-400 mt-1">
+            {onlyRecentFilter ? 'Sedang difilter' : 'Tersimpan otomatis ke sistem'}
           </div>
         </div>
       </div>
 
-      {/* Main Material Master Table */}
-      <div className="bg-white rounded-lg border border-slate-200 shadow-xs overflow-hidden">
-        <div className="overflow-x-auto">
-          <table className="w-full text-left border-collapse text-xs">
-            <thead>
-              <tr className="bg-slate-50 text-slate-700 font-semibold border-b border-slate-200">
-                <th className="py-3 px-3.5">Kode Material</th>
-                <th className="py-3 px-3.5">Deskripsi Material</th>
-                <th className="py-3 px-3">Kategori</th>
-                <th className="py-3 px-3 text-right">Total Stok</th>
-                <th className="py-3 px-3 text-right">Alokasi SPK</th>
-                <th className="py-3 px-3 text-right">Free Stock</th>
-                <th className="py-3 px-3 text-right">Safety Stock</th>
-                <th className="py-3 px-3 text-center">Lead Time</th>
-                <th className="py-3 px-3">Default WH</th>
-                <th className="py-3 px-3.5">Status Risiko</th>
-                <th className="py-3 px-3.5 text-center">Aksi</th>
-              </tr>
-            </thead>
-            <tbody className="divide-y divide-slate-100">
-              {filteredMaterials.length === 0 ? (
-                <tr>
-                  <td colSpan={11} className="py-8 text-center text-slate-400 text-xs">
-                    Tidak ada material yang sesuai dengan kriteria filter atau pencarian.
-                  </td>
-                </tr>
-              ) : (
-                filteredMaterials.map((mat) => {
-                  const free = mat.totalStock - mat.allocatedStock;
-                  const assessment = riskMap.get(mat.code);
-                  const riskLevel = assessment?.riskCategory || (free < 0 ? 'CRITICAL' : 'LOW');
+      {/* View Tabs */}
+      <div className="flex items-center gap-2 border-b border-slate-200">
+        <button
+          onClick={() => setActiveTab('REQUIREMENTS')}
+          className={`pb-3 px-3 text-xs font-bold border-b-2 transition-colors cursor-pointer flex items-center gap-2 ${
+            activeTab === 'REQUIREMENTS'
+              ? 'border-blue-600 text-blue-600'
+              : 'border-transparent text-slate-500 hover:text-slate-900'
+          }`}
+        >
+          <Boxes className="w-4 h-4" />
+          Master Data Material (Kebutuhan & Status Kesiapan OR)
+          <span className="ml-1 px-1.5 py-0.2 rounded-full text-[10px] bg-blue-100 text-blue-800 font-mono">
+            {materialRequirements.length}
+          </span>
+        </button>
 
-                  return (
-                    <tr key={mat.id} className="hover:bg-slate-50/70 transition-colors">
-                      <td className="py-3 px-3.5 font-mono font-bold text-slate-900">
-                        {mat.code}
-                      </td>
-                      <td className="py-3 px-3.5">
-                        <div className="font-medium text-slate-900">{mat.name}</div>
-                        <div className="text-[11px] text-slate-400">
-                          Supplier: {mat.supplierName}
-                        </div>
-                      </td>
-                      <td className="py-3 px-3">
-                        <span className="text-[11px] text-slate-600 bg-slate-100 px-2 py-0.5 rounded">
-                          {mat.category}
-                        </span>
-                      </td>
-                      <td className="py-3 px-3 text-right font-mono font-semibold text-slate-900">
-                        {mat.totalStock.toLocaleString('id-ID')} {mat.unit}
-                      </td>
-                      <td className="py-3 px-3 text-right font-mono text-slate-600">
-                        {mat.allocatedStock.toLocaleString('id-ID')} {mat.unit}
-                      </td>
-                      <td
-                        className={`py-3 px-3 text-right font-mono font-bold ${
-                          free < 0
-                            ? 'text-red-600 bg-red-50/50'
-                            : free < mat.safetyStock
-                            ? 'text-amber-600'
-                            : 'text-emerald-700'
-                        }`}
-                      >
-                        {free.toLocaleString('id-ID')} {mat.unit}
-                      </td>
-                      <td className="py-3 px-3 text-right font-mono text-slate-500">
-                        {mat.safetyStock.toLocaleString('id-ID')} {mat.unit}
-                      </td>
-                      <td className="py-3 px-3 text-center font-mono text-slate-600">
-                        {mat.leadTimeDays} Hari
-                      </td>
-                      <td className="py-3 px-3 font-mono font-medium text-slate-700">
-                        {mat.defaultWarehouse}
-                      </td>
-                      <td className="py-3 px-3.5">
-                        <RiskBadge level={riskLevel} size="sm" />
-                      </td>
-                      <td className="py-3 px-3.5 text-center">
-                        <div className="flex items-center justify-center gap-1">
-                          <button
-                            onClick={() => handleOpenEditModal(mat)}
-                            className="p-1 text-slate-500 hover:text-blue-600 hover:bg-slate-100 rounded"
-                            title="Edit Material"
-                          >
-                            <Edit2 className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            onClick={() => {
-                              if (confirm(`Hapus material ${mat.code} (${mat.name})?`)) {
-                                deleteMaterial(mat.id);
-                              }
-                            }}
-                            className="p-1 text-slate-400 hover:text-red-600 hover:bg-slate-100 rounded"
-                            title="Hapus Material"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+        <button
+          onClick={() => setActiveTab('CATALOG')}
+          className={`pb-3 px-3 text-xs font-bold border-b-2 transition-colors cursor-pointer flex items-center gap-2 ${
+            activeTab === 'CATALOG'
+              ? 'border-blue-600 text-blue-600'
+              : 'border-transparent text-slate-500 hover:text-slate-900'
+          }`}
+        >
+          <Layers className="w-4 h-4" />
+          Katalog Master Material (Database Bahan Baku & Stok Fisik)
+          <span className="ml-1 px-1.5 py-0.2 rounded-full text-[10px] bg-slate-100 text-slate-700 font-mono">
+            {materials.length}
+          </span>
+        </button>
+      </div>
+
+      {/* TAB 1: MASTER DATA MATERIAL TRANSACTION TABLE (The exact requested view) */}
+      {activeTab === 'REQUIREMENTS' && (
+        <div className="space-y-4">
+          {/* Filter Toolbar */}
+          <div className="p-4 bg-white rounded-lg border border-slate-200 shadow-xs space-y-3">
+            <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
+              {/* Filter 1: Nomor OR */}
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="text-xs font-semibold text-slate-600 flex items-center gap-1">
+                  <Hash className="w-3.5 h-3.5 text-blue-600" />
+                  Nomor OR:
+                </span>
+                <select
+                  value={selectedOrFilter}
+                  onChange={(e) => setSelectedOrFilter(e.target.value)}
+                  className="px-2.5 py-1.5 text-xs font-mono border border-slate-300 rounded-md bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                >
+                  <option value="ALL">Semua Nomor OR ({uniqueOrList.length})</option>
+                  {uniqueOrList.map((or) => (
+                    <option key={or} value={or}>
+                      {or}
+                    </option>
+                  ))}
+                </select>
+
+                {/* Filter 2: Status READY / BELUM READY */}
+                <span className="text-xs font-semibold text-slate-600 ml-2">Status:</span>
+                <div className="flex items-center gap-1">
+                  {[
+                    { id: 'ALL', label: 'Semua Status' },
+                    { id: 'READY', label: 'READY (≥ 0)' },
+                    { id: 'BELUM_READY', label: 'BELUM READY (< 0)' },
+                  ].map((f) => (
+                    <button
+                      key={f.id}
+                      onClick={() => setStatusFilter(f.id as any)}
+                      className={`px-2.5 py-1 text-xs rounded border transition-colors cursor-pointer ${
+                        statusFilter === f.id
+                          ? f.id === 'READY'
+                            ? 'bg-emerald-50 text-emerald-800 border-emerald-300 font-semibold'
+                            : f.id === 'BELUM_READY'
+                            ? 'bg-red-50 text-red-800 border-red-300 font-semibold'
+                            : 'bg-slate-900 text-white border-slate-900 font-semibold'
+                          : 'bg-white text-slate-600 border-slate-200 hover:bg-slate-50'
+                      }`}
+                    >
+                      {f.label}
+                    </button>
+                  ))}
+                </div>
+
+                {/* Filter 3: Data Baru Dibaca Toggle */}
+                {metrics.recentlyImportedCount > 0 && (
+                  <button
+                    onClick={() => setOnlyRecentFilter(!onlyRecentFilter)}
+                    className={`ml-2 px-2.5 py-1 text-xs rounded border transition-colors cursor-pointer flex items-center gap-1.5 ${
+                      onlyRecentFilter
+                        ? 'bg-blue-600 text-white border-blue-600 font-semibold'
+                        : 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100 font-medium'
+                    }`}
+                  >
+                    <Sparkles className="w-3.5 h-3.5" />
+                    Hanya Baru Dibaca ({metrics.recentlyImportedCount})
+                  </button>
+                )}
+              </div>
+
+              {/* Live search input */}
+              <div className="relative min-w-[240px]">
+                <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-2.5" />
+                <input
+                  type="text"
+                  value={activeSearchQuery}
+                  onChange={(e) => setActiveSearchQuery(e.target.value)}
+                  placeholder="Cari kode, nama, OR, style..."
+                  className="w-full pl-9 pr-3 py-1.5 text-xs border border-slate-300 rounded-md focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                />
+              </div>
+            </div>
+
+            <div className="flex items-center justify-between text-xs text-slate-500 pt-2 border-t border-slate-100">
+              <div>
+                Menampilkan <strong className="text-slate-900">{filteredRequirements.length}</strong> dari {materialRequirements.length} baris transaksi material
+                {selectedOrFilter !== 'ALL' && (
+                  <span className="ml-2 font-mono text-blue-700 font-semibold">
+                    [Filter OR: {selectedOrFilter}]
+                  </span>
+                )}
+              </div>
+
+              {(selectedOrFilter !== 'ALL' || statusFilter !== 'ALL' || onlyRecentFilter || activeSearchQuery) && (
+                <button
+                  onClick={() => {
+                    setSelectedOrFilter('ALL');
+                    setStatusFilter('ALL');
+                    setOnlyRecentFilter(false);
+                    setActiveSearchQuery('');
+                  }}
+                  className="text-xs text-blue-600 hover:text-blue-800 font-medium underline cursor-pointer"
+                >
+                  Reset Semua Filter
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* MAIN MASTER DATA MATERIAL TABLE */}
+          <div className="bg-white rounded-lg border border-slate-200 shadow-xs overflow-hidden">
+            <div className="overflow-x-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead>
+                  <tr className="bg-slate-50 text-slate-700 font-semibold border-b border-slate-200">
+                    <th className="py-3 px-3 w-10 text-center">#</th>
+                    <th className="py-3 px-3.5 whitespace-nowrap">Kode Material</th>
+                    <th className="py-3 px-3.5">Nama Material</th>
+                    <th className="py-3 px-3 text-center whitespace-nowrap">Satuan</th>
+                    <th className="py-3 px-3.5 whitespace-nowrap">Nomor OR Terkait</th>
+                    <th className="py-3 px-3.5">Style Terkait</th>
+                    <th className="py-3 px-3.5 text-right whitespace-nowrap">Kebutuhan</th>
+                    <th className="py-3 px-3.5 text-right whitespace-nowrap">Diterima</th>
+                    <th className="py-3 px-3.5 text-right whitespace-nowrap bg-slate-100/60 font-bold">
+                      Kekurangan
+                      <span className="block text-[10px] font-normal text-slate-500">
+                        (Diterima - Kebutuhan)
+                      </span>
+                    </th>
+                    <th className="py-3 px-3.5 text-center whitespace-nowrap">Status Kesiapan</th>
+                    <th className="py-3 px-3 text-center">Aksi</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {filteredRequirements.length === 0 ? (
+                    <tr>
+                      <td colSpan={11} className="py-12 text-center text-slate-400 text-xs">
+                        <div className="flex flex-col items-center justify-center gap-2">
+                          <Boxes className="w-8 h-8 text-slate-300" />
+                          <span className="font-medium text-slate-600">
+                            Tidak ada data material yang sesuai kriteria filter.
+                          </span>
+                          <span className="text-[11px] text-slate-400">
+                            Unggah berkas Excel atau klik reset filter untuk melihat seluruh data.
+                          </span>
                         </div>
                       </td>
                     </tr>
-                  );
-                })
-              )}
-            </tbody>
-          </table>
-        </div>
-      </div>
+                  ) : (
+                    filteredRequirements.map((row, idx) => {
+                      const isShortage = row.shortage < 0;
+                      return (
+                        <tr
+                          key={row.id}
+                          className={`hover:bg-slate-50/80 transition-colors ${
+                            row.isRecentlyImported
+                              ? 'bg-blue-50/30 border-l-4 border-l-blue-500'
+                              : ''
+                          }`}
+                        >
+                          {/* Row Index */}
+                          <td className="py-3 px-3 text-center text-slate-400 font-mono text-[11px]">
+                            {idx + 1}
+                          </td>
 
-      {/* Add / Edit Material Modal */}
-      {modalOpen && (
+                          {/* 1. Kode Material */}
+                          <td className="py-3 px-3.5 font-mono font-bold text-slate-900 whitespace-nowrap">
+                            <div className="flex items-center gap-1.5">
+                              <span>{row.materialCode}</span>
+                              {row.isRecentlyImported && (
+                                <span className="px-1.5 py-0.5 text-[9px] font-sans font-bold bg-blue-100 text-blue-700 rounded-full">
+                                  Baru Dibaca
+                                </span>
+                              )}
+                            </div>
+                          </td>
+
+                          {/* 2. Nama Material */}
+                          <td className="py-3 px-3.5 font-medium text-slate-900 min-w-[200px]">
+                            <div>{row.materialName}</div>
+                            {row.supplierName && (
+                              <div className="text-[11px] text-slate-400 mt-0.5">
+                                {row.supplierName}
+                              </div>
+                            )}
+                          </td>
+
+                          {/* 3. Satuan */}
+                          <td className="py-3 px-3 text-center font-mono font-medium text-slate-700 whitespace-nowrap">
+                            <span className="px-2 py-0.5 bg-slate-100 rounded text-slate-700">
+                              {row.unit}
+                            </span>
+                          </td>
+
+                          {/* 4. Nomor OR terkait */}
+                          <td className="py-3 px-3.5 font-mono font-semibold text-blue-700 whitespace-nowrap">
+                            <button
+                              onClick={() => setSelectedOrFilter(row.orNumber)}
+                              className="px-2 py-0.5 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded border border-blue-200 transition-colors cursor-pointer"
+                              title="Klik untuk filter nomor OR ini"
+                            >
+                              {row.orNumber}
+                            </button>
+                          </td>
+
+                          {/* 5. Style terkait */}
+                          <td className="py-3 px-3.5 text-slate-700 min-w-[180px]">
+                            {row.style || '-'}
+                          </td>
+
+                          {/* 6. Kebutuhan */}
+                          <td className="py-3 px-3.5 text-right font-mono font-semibold text-slate-900 whitespace-nowrap">
+                            {row.requiredQty.toLocaleString('id-ID')}
+                          </td>
+
+                          {/* 7. Diterima */}
+                          <td className="py-3 px-3.5 text-right font-mono font-semibold text-slate-900 whitespace-nowrap">
+                            {row.receivedQty.toLocaleString('id-ID')}
+                          </td>
+
+                          {/* 8. Kekurangan (Rumus: Diterima - Kebutuhan) */}
+                          <td
+                            className={`py-3 px-3.5 text-right font-mono font-bold whitespace-nowrap ${
+                              isShortage
+                                ? 'text-red-700 bg-red-50/70'
+                                : row.shortage === 0
+                                ? 'text-slate-800 bg-slate-50'
+                                : 'text-emerald-700 bg-emerald-50/70'
+                            }`}
+                          >
+                            {row.shortage > 0 ? `+${row.shortage.toLocaleString('id-ID')}` : row.shortage.toLocaleString('id-ID')} {row.unit}
+                          </td>
+
+                          {/* 9. Status READY / BELUM READY */}
+                          <td className="py-3 px-3.5 text-center whitespace-nowrap">
+                            {row.isReady ? (
+                              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-emerald-100 text-emerald-800 border border-emerald-300 shadow-2xs">
+                                <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                                READY
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-xs font-bold bg-red-100 text-red-800 border border-red-300 shadow-2xs">
+                                <AlertTriangle className="w-3.5 h-3.5 text-red-600" />
+                                BELUM READY
+                              </span>
+                            )}
+                          </td>
+
+                          {/* Action Menu */}
+                          <td className="py-3 px-3 text-center">
+                            <div className="flex items-center justify-center gap-1">
+                              <button
+                                onClick={() => handleOpenEditModal(row)}
+                                className="p-1 text-slate-400 hover:text-blue-600 hover:bg-slate-100 rounded cursor-pointer"
+                                title="Edit baris kebutuhan"
+                              >
+                                <Edit2 className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                onClick={() => {
+                                  if (confirm(`Hapus baris kebutuhan ${row.materialCode} (${row.orNumber})?`)) {
+                                    deleteMaterialRequirement(row.id);
+                                  }
+                                }}
+                                className="p-1 text-slate-400 hover:text-red-600 hover:bg-slate-100 rounded cursor-pointer"
+                                title="Hapus baris kebutuhan"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })
+                  )}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* TAB 2: MASTER MATERIAL CATALOG (Master Parameters, Safety Stock, Lead Time) */}
+      {activeTab === 'CATALOG' && (
+        <div className="bg-white rounded-lg border border-slate-200 shadow-xs overflow-hidden">
+          <div className="p-4 bg-slate-50 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div>
+              <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wide">
+                Katalog Master Material ({materials.length} Item Terdaftar)
+              </h3>
+              <p className="text-[11px] text-slate-500">
+                Data master bahan baku dan saldo stok fisik (bebas duplikasi kode material).
+              </p>
+            </div>
+            <button
+              onClick={() => {
+                const code = `RM-${Math.floor(100 + Math.random() * 900)}`;
+                addMaterial({
+                  code,
+                  name: 'Material Baru',
+                  category: 'Raw Material',
+                  unit: 'Kg',
+                  totalStock: 1000,
+                  allocatedStock: 0,
+                  safetyStock: 300,
+                  leadTimeDays: 7,
+                  supplierName: 'PT Mitra Material Baru',
+                  defaultWarehouse: 'WH-01',
+                  unitPrice: 25000,
+                  minOrderQty: 100,
+                });
+              }}
+              className="px-3 py-1.5 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded shadow-xs cursor-pointer"
+            >
+              + Tambah Master Material
+            </button>
+          </div>
+
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse text-xs">
+              <thead>
+                <tr className="bg-slate-100/70 text-slate-700 font-semibold border-b border-slate-200">
+                  <th className="py-2.5 px-3.5">Kode Material</th>
+                  <th className="py-2.5 px-3.5">Deskripsi Material</th>
+                  <th className="py-2.5 px-3">Kategori</th>
+                  <th className="py-2.5 px-3 text-right">Saldo Stok Fisik</th>
+                  <th className="py-2.5 px-3 text-right">Safety Stock</th>
+                  <th className="py-2.5 px-3 text-center">Lead Time</th>
+                  <th className="py-2.5 px-3.5">Supplier Utama</th>
+                  <th className="py-2.5 px-3 text-center">Aksi</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {materials.map((m) => (
+                  <tr key={m.id} className="hover:bg-slate-50">
+                    <td className="py-2.5 px-3.5 font-mono font-bold text-slate-900">{m.code}</td>
+                    <td className="py-2.5 px-3.5 font-medium text-slate-900">{m.name}</td>
+                    <td className="py-2.5 px-3">
+                      <span className="text-[11px] text-slate-600 bg-slate-100 px-2 py-0.5 rounded">
+                        {m.category}
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3 text-right font-mono font-semibold text-slate-900">
+                      {m.totalStock.toLocaleString('id-ID')} {m.unit}
+                    </td>
+                    <td className="py-2.5 px-3 text-right font-mono text-slate-500">
+                      {m.safetyStock.toLocaleString('id-ID')} {m.unit}
+                    </td>
+                    <td className="py-2.5 px-3 text-center font-mono text-slate-600">
+                      {m.leadTimeDays} Hari
+                    </td>
+                    <td className="py-2.5 px-3.5 text-slate-600">{m.supplierName}</td>
+                    <td className="py-2.5 px-3 text-center">
+                      <button
+                        onClick={() => {
+                          if (confirm(`Hapus master material ${m.code}?`)) {
+                            deleteMaterial(m.id);
+                          }
+                        }}
+                        className="p-1 text-slate-400 hover:text-red-600 rounded cursor-pointer"
+                        title="Hapus Master"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* Add / Edit Requirement Modal */}
+      {addReqModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
-          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-xl overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-lg overflow-hidden animate-in fade-in zoom-in-95 duration-150">
             <div className="flex items-center justify-between px-5 py-4 bg-slate-900 text-white">
               <div className="flex items-center gap-2">
                 <Boxes className="w-4 h-4 text-blue-400" />
                 <h3 className="text-sm font-bold">
-                  {editingMaterial ? 'Edit Parameter Material PPIC' : 'Tambah Material Baru'}
+                  {editingReq ? 'Edit Baris Kebutuhan Material' : 'Tambah Baris Kebutuhan Material'}
                 </h3>
               </div>
               <button
-                onClick={() => setModalOpen(false)}
-                className="text-slate-400 hover:text-white"
+                onClick={() => setAddReqModalOpen(false)}
+                className="text-slate-400 hover:text-white cursor-pointer"
               >
                 <X className="w-5 h-5" />
               </button>
             </div>
 
-            <form onSubmit={handleSubmitForm} className="p-5 space-y-4">
+            <form onSubmit={handleSubmitReqForm} className="p-5 space-y-4">
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Kode Material (Unique)
+                    Nomor OR Terkait
                   </label>
                   <input
                     type="text"
                     required
-                    value={formData.code}
-                    onChange={(e) => setFormData({ ...formData, code: e.target.value })}
-                    className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded font-mono focus:ring-1 focus:ring-blue-500 focus:outline-none"
-                    placeholder="e.g. RM-RESIN-01"
+                    value={reqFormData.orNumber}
+                    onChange={(e) => setReqFormData({ ...reqFormData, orNumber: e.target.value.toUpperCase() })}
+                    className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded font-mono uppercase focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                    placeholder="Contoh: OR-2026-001"
                   />
                 </div>
 
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Kategori Material
+                    Style Terkait
+                  </label>
+                  <input
+                    type="text"
+                    value={reqFormData.style}
+                    onChange={(e) => setReqFormData({ ...reqFormData, style: e.target.value })}
+                    className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                    placeholder="Contoh: Bomber Jacket Navy"
+                  />
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Kode Material
+                  </label>
+                  <input
+                    type="text"
+                    required
+                    value={reqFormData.materialCode}
+                    onChange={(e) => setReqFormData({ ...reqFormData, materialCode: e.target.value.toUpperCase() })}
+                    className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded font-mono uppercase focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                    placeholder="Contoh: FAB-TASLAN-NVY"
+                  />
+                </div>
+
+                <div>
+                  <label className="block text-xs font-semibold text-slate-700 mb-1">
+                    Satuan (UoM)
                   </label>
                   <select
-                    value={formData.category}
-                    onChange={(e) =>
-                      setFormData({ ...formData, category: e.target.value as MaterialCategory })
-                    }
+                    value={reqFormData.unit}
+                    onChange={(e) => setReqFormData({ ...reqFormData, unit: e.target.value as MaterialUnit })}
                     className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 focus:outline-none"
                   >
-                    <option value="Raw Material">Raw Material (Bahan Baku)</option>
-                    <option value="Packaging">Packaging (Kemasan)</option>
-                    <option value="Chemical">Chemical (Bahan Kimia/Aditif)</option>
-                    <option value="Auxiliary">Auxiliary (Bahan Penolong)</option>
+                    <option value="Yard">Yard</option>
+                    <option value="Meter">Meter</option>
+                    <option value="Kg">Kg</option>
+                    <option value="Pcs">Pcs</option>
+                    <option value="Roll">Roll</option>
+                    <option value="Drum">Drum</option>
+                    <option value="Box">Box</option>
+                    <option value="Liter">Liter</option>
                   </select>
                 </div>
               </div>
@@ -401,145 +863,64 @@ export const MaterialSummaryView: React.FC = () => {
                 <input
                   type="text"
                   required
-                  value={formData.name}
-                  onChange={(e) => setFormData({ ...formData, name: e.target.value })}
+                  value={reqFormData.materialName}
+                  onChange={(e) => setReqFormData({ ...reqFormData, materialName: e.target.value })}
                   className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 focus:outline-none"
-                  placeholder="e.g. Polypropylene Copolymer (PP Blow Grade)"
+                  placeholder="Contoh: Fabric Taslan Waterproof Navy 210T"
                 />
               </div>
 
-              <div className="grid grid-cols-3 gap-3">
+              <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Satuan (UoM)
-                  </label>
-                  <select
-                    value={formData.unit}
-                    onChange={(e) =>
-                      setFormData({ ...formData, unit: e.target.value as MaterialUnit })
-                    }
-                    className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 focus:outline-none"
-                  >
-                    <option value="Kg">Kg</option>
-                    <option value="Pcs">Pcs</option>
-                    <option value="Roll">Roll</option>
-                    <option value="Drum">Drum</option>
-                    <option value="Box">Box</option>
-                    <option value="Liter">Liter</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Total Stok Awal
+                    Kebutuhan
                   </label>
                   <input
                     type="number"
                     min="0"
                     required
-                    value={formData.totalStock}
-                    onChange={(e) =>
-                      setFormData({ ...formData, totalStock: parseFloat(e.target.value) || 0 })
-                    }
+                    value={reqFormData.requiredQty}
+                    onChange={(e) => setReqFormData({ ...reqFormData, requiredQty: parseFloat(e.target.value) || 0 })}
                     className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded font-mono focus:ring-1 focus:ring-blue-500 focus:outline-none"
                   />
                 </div>
 
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Safety Stock
+                    Diterima
                   </label>
                   <input
                     type="number"
                     min="0"
                     required
-                    value={formData.safetyStock}
-                    onChange={(e) =>
-                      setFormData({ ...formData, safetyStock: parseFloat(e.target.value) || 0 })
-                    }
+                    value={reqFormData.receivedQty}
+                    onChange={(e) => setReqFormData({ ...reqFormData, receivedQty: parseFloat(e.target.value) || 0 })}
                     className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded font-mono focus:ring-1 focus:ring-blue-500 focus:outline-none"
                   />
                 </div>
               </div>
 
-              <div className="grid grid-cols-3 gap-3">
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Lead Time (Hari)
-                  </label>
-                  <input
-                    type="number"
-                    min="1"
-                    required
-                    value={formData.leadTimeDays}
-                    onChange={(e) =>
-                      setFormData({ ...formData, leadTimeDays: parseInt(e.target.value, 10) || 1 })
-                    }
-                    className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded font-mono focus:ring-1 focus:ring-blue-500 focus:outline-none"
-                  />
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Gudang Default
-                  </label>
-                  <select
-                    value={formData.defaultWarehouse}
-                    onChange={(e) => setFormData({ ...formData, defaultWarehouse: e.target.value })}
-                    className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded font-mono focus:ring-1 focus:ring-blue-500 focus:outline-none"
-                  >
-                    <option value="WH-01">WH-01 (Bahan Baku)</option>
-                    <option value="WH-02">WH-02 (Kemasan)</option>
-                    <option value="WH-03">WH-03 (Bahan Kimia)</option>
-                    <option value="WH-04">WH-04 (Transit QC)</option>
-                    <option value="WH-05">WH-05 (WIP)</option>
-                  </select>
-                </div>
-
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Harga Satuan (IDR)
-                  </label>
-                  <input
-                    type="number"
-                    min="0"
-                    required
-                    value={formData.unitPrice}
-                    onChange={(e) =>
-                      setFormData({ ...formData, unitPrice: parseFloat(e.target.value) || 0 })
-                    }
-                    className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded font-mono focus:ring-1 focus:ring-blue-500 focus:outline-none"
-                  />
-                </div>
+              <div className="p-3 rounded bg-slate-50 border border-slate-200 text-xs flex items-center justify-between">
+                <span className="text-slate-600 font-medium">Perhitungan Kekurangan:</span>
+                <span className={`font-mono font-bold ${reqFormData.receivedQty - reqFormData.requiredQty < 0 ? 'text-red-600' : 'text-emerald-700'}`}>
+                  {reqFormData.receivedQty - reqFormData.requiredQty} {reqFormData.unit} (
+                  {reqFormData.receivedQty - reqFormData.requiredQty >= 0 ? 'READY' : 'BELUM READY'})
+                </span>
               </div>
 
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  Nama Vendor / Supplier Utama
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={formData.supplierName}
-                  onChange={(e) => setFormData({ ...formData, supplierName: e.target.value })}
-                  className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 focus:outline-none"
-                  placeholder="e.g. PT Chandra Asri Petrochemical Tbk"
-                />
-              </div>
-
-              <div className="pt-4 border-t border-slate-200 flex items-center justify-end gap-2">
+              <div className="pt-3 border-t border-slate-200 flex items-center justify-end gap-2">
                 <button
                   type="button"
-                  onClick={() => setModalOpen(false)}
-                  className="px-4 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 rounded"
+                  onClick={() => setAddReqModalOpen(false)}
+                  className="px-4 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 rounded cursor-pointer"
                 >
                   Batal
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded shadow-xs"
+                  className="px-4 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded shadow-xs cursor-pointer"
                 >
-                  {editingMaterial ? 'Perbarui Material' : 'Simpan Material'}
+                  {editingReq ? 'Perbarui Kebutuhan' : 'Simpan Kebutuhan'}
                 </button>
               </div>
             </form>
