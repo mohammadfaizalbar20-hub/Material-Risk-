@@ -1,0 +1,6 @@
+{
+  "name": "PPIC Material Management & Production Risk System",
+  "description": "Sistem terpadu manajemen kebutuhan material, monitoring stok antar gudang, penjadwalan produksi, dan analisis risiko kekurangan material berbasis AI untuk tim PPIC.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
