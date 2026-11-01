@@ -5,6 +5,7 @@ import {
   ProductionSchedule,
   OrStyleRelation,
   MaterialItemRequirement,
+  UploadHistoryItem,
 } from '../types/ppic';
 
 export const INITIAL_OR_STYLE_RELATIONS: OrStyleRelation[] = [
@@ -40,7 +41,7 @@ export const INITIAL_OR_STYLE_RELATIONS: OrStyleRelation[] = [
   },
 ];
 
-export const INITIAL_MATERIAL_REQUIREMENTS: MaterialItemRequirement[] = [
+export const INITIAL_MATERIAL_REQUIREMENTS: MaterialItemRequirement[] = ([
   // OR-2026-001: Bomber Jacket Taslan Navy
   {
     id: 'req-01',
@@ -190,6 +191,7 @@ export const INITIAL_MATERIAL_REQUIREMENTS: MaterialItemRequirement[] = [
     receivedQty: 1000, // Ready 100%
     unitPrice: 3800,
     supplierName: 'PT Tali Mulia Packaging',
+    updateDate: '2026-10-29',
   },
 
   // OR-2026-005: Chino Trousers Khaki
@@ -205,6 +207,133 @@ export const INITIAL_MATERIAL_REQUIREMENTS: MaterialItemRequirement[] = [
     receivedQty: 1950, // Shortage = 250 Yard (11%)
     unitPrice: 52000,
     supplierName: 'PT Grandtex Mills',
+    updateDate: '2026-10-30',
+  },
+
+  // Historical Snapshot 2026-10-25 for OR-2026-001 (Allows immediate date progress comparison)
+  {
+    id: 'req-01-hist',
+    orNumber: 'OR-2026-001',
+    style: 'Bomber Jacket Taslan Navy (BJ-01)',
+    materialCode: 'FAB-TASLAN-NVY',
+    materialName: 'Fabric Taslan Waterproof Navy 210T',
+    category: 'Raw Material',
+    unit: 'Yard',
+    requiredQty: 2500,
+    receivedQty: 500, // On 25 Oct, received was 500 (improved to 1200 on 31 Oct)
+    unitPrice: 42000,
+    supplierName: 'PT Kahatex Textile',
+    updateDate: '2026-10-25',
+  },
+  {
+    id: 'req-02-hist',
+    orNumber: 'OR-2026-001',
+    style: 'Bomber Jacket Taslan Navy (BJ-01)',
+    materialCode: 'ZIP-YKK-MET5',
+    materialName: 'Zipper Metal Antique Silver YKK #5 Open-End 65cm',
+    category: 'Packaging',
+    unit: 'Pcs',
+    requiredQty: 1000,
+    receivedQty: 200, // On 25 Oct, received was 200 (improved to 450 on 31 Oct)
+    unitPrice: 18500,
+    supplierName: 'PT YKK Zipper Indonesia',
+    updateDate: '2026-10-25',
+  },
+  {
+    id: 'req-03-hist',
+    orNumber: 'OR-2026-001',
+    style: 'Bomber Jacket Taslan Navy (BJ-01)',
+    materialCode: 'RIB-POLY-NVY',
+    materialName: 'Rib Spun Polyester 2x2 Navy',
+    category: 'Auxiliary',
+    unit: 'Kg',
+    requiredQty: 300,
+    receivedQty: 100, // On 25 Oct, received was 100 (improved to 300 on 31 Oct)
+    unitPrice: 65000,
+    supplierName: 'PT Tri Bintang Rib',
+    updateDate: '2026-10-25',
+  },
+  {
+    id: 'req-04-hist',
+    orNumber: 'OR-2026-001',
+    style: 'Bomber Jacket Taslan Navy (BJ-01)',
+    materialCode: 'LIN-QUILT-BLK',
+    materialName: 'Lining Quilting Dacron 4oz Black Diamond',
+    category: 'Raw Material',
+    unit: 'Yard',
+    requiredQty: 1800,
+    receivedQty: 800, // On 25 Oct, received was 800 (improved to 1600 on 31 Oct)
+    unitPrice: 28000,
+    supplierName: 'PT Sinar Mulia Lining',
+    updateDate: '2026-10-25',
+  },
+] as MaterialItemRequirement[]).map((r) => ({
+  ...r,
+  updateDate: r.updateDate || '2026-10-31',
+}));
+
+export const INITIAL_UPLOAD_HISTORY: UploadHistoryItem[] = [
+  {
+    id: 'hist-01',
+    updateDate: '2026-10-31',
+    uploadTime: '08:45:10 WIB',
+    orNumber: 'OR-2026-001',
+    style: 'Bomber Jacket Taslan Navy (BJ-01)',
+    fileName: 'Order_Lines_OR-2026-001_Final.xlsx',
+    rowCount: 4,
+    status: 'Sukses',
+    notes: 'Update penerimaan kain taslan dan zipper',
+  },
+  {
+    id: 'hist-02',
+    updateDate: '2026-10-25',
+    uploadTime: '11:12:35 WIB',
+    orNumber: 'OR-2026-001',
+    style: 'Bomber Jacket Taslan Navy (BJ-01)',
+    fileName: 'Order_Lines_OR-2026-001_Initial.xlsx',
+    rowCount: 4,
+    status: 'Sukses',
+    notes: 'BOM awal dan alokasi penerimaan batch 1',
+  },
+  {
+    id: 'hist-03',
+    updateDate: '2026-10-30',
+    uploadTime: '14:20:00 WIB',
+    orNumber: 'OR-2026-002',
+    style: 'Polo Shirt DryFit Performance White (PS-02)',
+    fileName: 'Order_Lines_OR-2026-002.xlsx',
+    rowCount: 3,
+    status: 'Sukses',
+  },
+  {
+    id: 'hist-04',
+    updateDate: '2026-10-28',
+    uploadTime: '09:30:15 WIB',
+    orNumber: 'OR-2026-003',
+    style: 'Cargo Pants Multi-Pocket Olive Drill (CP-03)',
+    fileName: 'Order_Lines_OR-2026-003.xlsx',
+    rowCount: 2,
+    status: 'Sukses',
+  },
+  {
+    id: 'hist-05',
+    updateDate: '2026-10-29',
+    uploadTime: '16:05:40 WIB',
+    orNumber: 'OR-2026-004',
+    style: 'Hoodie Heavyweight Fleece Heather Grey (HD-04)',
+    fileName: 'Order_Lines_OR-2026-004.xlsx',
+    rowCount: 2,
+    status: 'Sukses',
+  },
+  {
+    id: 'hist-06',
+    updateDate: '2026-10-30',
+    uploadTime: '13:50:22 WIB',
+    orNumber: 'OR-2026-005',
+    style: 'Chino Trousers SlimFit Khaki Stretch (CN-05)',
+    fileName: 'Order_Lines_OR-2026-005.xlsx',
+    rowCount: 1,
+    status: 'Sukses',
   },
 ];
 

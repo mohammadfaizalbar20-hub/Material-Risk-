@@ -23,10 +23,15 @@ export const Header: React.FC = () => {
     clearAllNotifications,
     activeSearchQuery,
     setActiveSearchQuery,
+    registeredOrNumbers,
+    searchRegisteredOrs,
+    getOrSummary,
   } = usePpic();
 
   const [notifOpen, setNotifOpen] = useState(false);
+  const [searchFocused, setSearchFocused] = useState(false);
   const notifRef = useRef<HTMLDivElement>(null);
+  const searchRef = useRef<HTMLDivElement>(null);
 
   const unreadCount = notifications.filter((n) => !n.read).length;
 
@@ -38,16 +43,32 @@ export const Header: React.FC = () => {
     year: 'numeric',
   }).format(new Date());
 
-  // Close popover on outside click
+  // Close popovers on outside click
   useEffect(() => {
     function handleClickOutside(event: MouseEvent) {
       if (notifRef.current && !notifRef.current.contains(event.target as Node)) {
         setNotifOpen(false);
       }
+      if (searchRef.current && !searchRef.current.contains(event.target as Node)) {
+        setSearchFocused(false);
+      }
     }
     document.addEventListener('mousedown', handleClickOutside);
     return () => document.removeEventListener('mousedown', handleClickOutside);
   }, []);
+
+  // Matched ORs based on search query or top registered ORs
+  const matchedOrs = activeSearchQuery.trim()
+    ? searchRegisteredOrs(activeSearchQuery)
+    : registeredOrNumbers.slice(0, 5);
+
+  const handleSelectOr = (orNumber: string, targetMenu?: 'Rekap Material' | 'Material Risk Analysis' | 'Penjadwalan Produksi') => {
+    setActiveSearchQuery(orNumber);
+    setSearchFocused(false);
+    if (targetMenu) {
+      setActiveMenu(targetMenu);
+    }
+  };
 
   return (
     <header className="sticky top-0 z-30 flex items-center justify-between h-16 px-4 md:px-6 bg-white border-b border-slate-200">
@@ -77,25 +98,105 @@ export const Header: React.FC = () => {
         </div>
       </div>
 
-      {/* Middle: Global Search */}
-      <div className="hidden md:flex items-center flex-1 max-w-md mx-6">
+      {/* Middle: Global Search (Single Source of Truth from Upload Excel) */}
+      <div className="hidden md:flex items-center flex-1 max-w-md mx-6" ref={searchRef}>
         <div className="relative w-full">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-slate-400" />
           <input
             type="text"
-            placeholder="Cari Nomor OR, Style, atau Kode Material..."
+            placeholder="Cari Nomor OR (contoh: OR-2026), Style, atau Kode Material..."
             value={activeSearchQuery}
-            onChange={(e) => setActiveSearchQuery(e.target.value)}
-            className="w-full pl-9 pr-8 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-none focus:ring-1 focus:ring-blue-500 focus:bg-white transition-all text-slate-800 placeholder-slate-400"
+            onFocus={() => setSearchFocused(true)}
+            onChange={(e) => {
+              setActiveSearchQuery(e.target.value);
+              setSearchFocused(true);
+            }}
+            className="w-full pl-9 pr-8 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-md focus:outline-hidden focus:ring-1 focus:ring-blue-500 focus:bg-white transition-all text-slate-800 placeholder-slate-400"
           />
           {activeSearchQuery && (
             <button
-              onClick={() => setActiveSearchQuery('')}
+              onClick={() => {
+                setActiveSearchQuery('');
+                setSearchFocused(false);
+              }}
               className="absolute right-2.5 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600"
               aria-label="Hapus pencarian"
             >
               <X className="w-3.5 h-3.5" />
             </button>
+          )}
+
+          {/* Autocomplete / Quick Search Dropdown */}
+          {searchFocused && (
+            <div className="absolute left-0 right-0 top-full mt-1.5 bg-white rounded-lg shadow-xl border border-slate-200 overflow-hidden z-50 animate-in fade-in zoom-in-95 duration-100">
+              <div className="px-3 py-2 bg-slate-50 border-b border-slate-100 flex items-center justify-between text-[11px] text-slate-600">
+                <span className="font-semibold text-slate-800">
+                  {activeSearchQuery.trim()
+                    ? `Hasil Pencarian OR (${matchedOrs.length})`
+                    : `Nomor OR Terdaftar (${registeredOrNumbers.length})`}
+                </span>
+                <span className="text-[10px] text-blue-600 font-medium">Single Source: Upload Excel</span>
+              </div>
+
+              {matchedOrs.length === 0 ? (
+                <div className="p-4 text-center text-xs text-slate-500">
+                  Tidak ada Nomor OR terdaftar yang cocok dengan &ldquo;{activeSearchQuery}&rdquo;.
+                </div>
+              ) : (
+                <div className="max-h-64 overflow-y-auto divide-y divide-slate-100">
+                  {matchedOrs.map((or) => {
+                    const summary = getOrSummary(or);
+                    return (
+                      <div
+                        key={or}
+                        className="p-2.5 hover:bg-slate-50 transition-colors flex items-center justify-between gap-3 text-xs"
+                      >
+                        <div
+                          className="flex-1 cursor-pointer"
+                          onClick={() => handleSelectOr(or, 'Rekap Material')}
+                        >
+                          <div className="flex items-center gap-2">
+                            <span className="font-mono font-bold text-blue-700 bg-blue-50 px-1.5 py-0.5 rounded text-[11px] border border-blue-200">
+                              {or}
+                            </span>
+                            {summary?.style && (
+                              <span className="text-slate-800 font-medium truncate max-w-xs">
+                                {summary.style}
+                              </span>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-3 text-[10px] text-slate-400 mt-1">
+                            {summary?.requirements?.length ? (
+                              <span>{summary.requirements.length} item material</span>
+                            ) : null}
+                            {summary?.latestUpdateDate ? (
+                              <span>Update: {summary.latestUpdateDate}</span>
+                            ) : null}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center gap-1">
+                          <button
+                            onClick={() => handleSelectOr(or, 'Rekap Material')}
+                            className="px-2 py-1 text-[10px] font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded border border-blue-200 transition-colors"
+                            title="Buka di Master Data Material"
+                          >
+                            Master Data
+                          </button>
+                          <button
+                            onClick={() => handleSelectOr(or, 'Material Risk Analysis')}
+                            className="px-2 py-1 text-[10px] font-semibold text-red-700 bg-red-50 hover:bg-red-100 rounded border border-red-200 transition-colors"
+                            title="Buka di Material Risk Analysis"
+                          >
+                            Risk
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
+            </div>
           )}
         </div>
       </div>

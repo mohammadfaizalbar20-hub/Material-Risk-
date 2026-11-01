@@ -28,16 +28,15 @@ export const DashboardView: React.FC = () => {
     productionSchedules,
     materialRiskAssessments,
     setActiveMenu,
+    registeredOrNumbers,
+    getOrSummary,
   } = usePpic();
 
   const [selectedOrFilter, setSelectedOrFilter] = useState<string>('ALL');
   const [selectedPeriodFilter, setSelectedPeriodFilter] = useState<string>('ALL');
 
-  // List of unique ORs
-  const availableOrs = useMemo(() => {
-    const set = new Set(materialRequirements.map((r) => r.orNumber).filter(Boolean));
-    return Array.from(set);
-  }, [materialRequirements]);
+  // Single Source of Truth for available ORs from Upload Excel
+  const availableOrs = registeredOrNumbers;
 
   // Filtered requirements based on selected OR
   const filteredRequirements = useMemo(() => {
@@ -147,12 +146,20 @@ export const DashboardView: React.FC = () => {
               className="px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded font-semibold text-slate-800 focus:outline-none focus:ring-1 focus:ring-blue-500"
             >
               <option value="ALL">Semua Nomor OR ({materialRequirements.length} item material)</option>
-              {availableOrs.map((or) => (
-                <option key={or} value={or}>
-                  {or}
-                </option>
-              ))}
+              {availableOrs.map((or) => {
+                const summary = getOrSummary(or);
+                return (
+                  <option key={or} value={or}>
+                    {or} {summary?.style ? `— ${summary.style}` : ''}
+                  </option>
+                );
+              })}
             </select>
+            {selectedOrFilter !== 'ALL' && getOrSummary(selectedOrFilter)?.style && (
+              <span className="hidden lg:inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-blue-50 text-blue-700 border border-blue-200">
+                Style: {getOrSummary(selectedOrFilter)?.style}
+              </span>
+            )}
           </div>
 
           {/* Periode Filter */}

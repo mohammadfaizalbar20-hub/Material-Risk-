@@ -61,6 +61,19 @@ export interface MaterialItemRequirement {
   supplierName?: string;
   isRecentlyImported?: boolean;
   importedAt?: string;
+  updateDate?: string; // YYYY-MM-DD (WIB) - Tanggal Update
+}
+
+export interface UploadHistoryItem {
+  id: string;
+  updateDate: string; // YYYY-MM-DD (WIB)
+  uploadTime: string; // e.g. 14:35:10 WIB
+  orNumber: string;
+  style: string;
+  fileName: string;
+  rowCount: number;
+  status: 'Sukses' | 'Peringatan' | 'Gagal';
+  notes?: string;
 }
 
 export interface ScheduleConflict {

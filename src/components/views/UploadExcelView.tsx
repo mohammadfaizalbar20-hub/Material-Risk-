@@ -16,14 +16,19 @@ import {
   Link as LinkIcon,
   Sparkles,
   Info,
+  Calendar,
+  History,
+  Clock,
+  Layers,
 } from 'lucide-react';
 import { parseExcelRowsToMaterials } from '../../utils/excelMaterialParser';
 
 export const UploadExcelView: React.FC = () => {
   const {
     materials,
-    warehouseStock,
-    productionSchedules,
+    registeredOrNumbers,
+    searchRegisteredOrs,
+    uploadHistory,
     orStyleRelations,
     saveOrStyleRelation,
     getStyleForOr,
@@ -33,7 +38,15 @@ export const UploadExcelView: React.FC = () => {
     lastImportedInfo,
   } = usePpic();
 
-  // Two inputs: Nomor OR and Style (with 2-way relation intelligence)
+  // Helper: Default today's date in Western Indonesia Time (WIB / Asia/Jakarta)
+  const getTodayWib = () => {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
+  };
+
+  // Mandatory Tanggal Update field (Default: WIB today)
+  const [updateDate, setUpdateDate] = useState<string>(getTodayWib());
+
+  // Two inputs: Nomor OR and Style (Integrated with Single Source of Truth)
   const [orNumber, setOrNumber] = useState<string>('');
   const [style, setStyle] = useState<string>('');
   const [multipleOrOptions, setMultipleOrOptions] = useState<string[]>([]);
@@ -44,11 +57,13 @@ export const UploadExcelView: React.FC = () => {
   const [fileName, setFileName] = useState<string | null>(null);
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Handle changes to OR Number with auto-fill for Style
   const handleOrChange = (value: string) => {
     setOrNumber(value);
     setMultipleOrOptions([]);
+    setErrorMessage(null);
     const clean = value.trim().toUpperCase();
     if (!clean) {
       setOrInputFeedback(null);
@@ -67,6 +82,7 @@ export const UploadExcelView: React.FC = () => {
   // Handle changes to Style with auto-fill for OR Number
   const handleStyleChange = (value: string) => {
     setStyle(value);
+    setErrorMessage(null);
     const clean = value.trim();
     if (!clean) {
       setMultipleOrOptions([]);
@@ -91,11 +107,21 @@ export const UploadExcelView: React.FC = () => {
   const selectSuggestedOr = (selectedOr: string) => {
     setOrNumber(selectedOr);
     setMultipleOrOptions([]);
-    setOrInputFeedback(`Nomor OR "${selectedOr}" dipilih untuk style "${style}".`);
+    const matchedStyle = getStyleForOr(selectedOr);
+    if (matchedStyle) setStyle(matchedStyle);
+    setOrInputFeedback(`Nomor OR "${selectedOr}" dipilih untuk style "${matchedStyle || style}".`);
   };
 
   // Immediate, fully automated Excel parsing & auto-storage into Master Data Material
   const handleFileUpload = (file: File) => {
+    setErrorMessage(null);
+
+    // Validation: Tanggal Update is mandatory
+    if (!updateDate) {
+      setErrorMessage('Tanggal Update wajib diisi sebelum file Excel diproses dan disimpan!');
+      return;
+    }
+
     setFileName(file.name);
     setIsProcessing(true);
     setStatusMessage('Membaca berkas Excel dan memproses kolom material...');
@@ -110,7 +136,7 @@ export const UploadExcelView: React.FC = () => {
         const rawJson: any[] = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName]);
 
         if (!rawJson || rawJson.length === 0) {
-          setStatusMessage('Berkas Excel kosong atau tidak memiliki baris data.');
+          setErrorMessage('Berkas Excel kosong atau tidak memiliki baris data.');
           setIsProcessing(false);
           return;
         }
@@ -121,24 +147,26 @@ export const UploadExcelView: React.FC = () => {
         // - Order Lines/Received Qty
         // - Order Lines/Product Unit of Measure/Display Name
         // - Master Data Material reference matching
-        const result = parseExcelRowsToMaterials(rawJson, materials, orNumber, style);
+        // - Tanggal Update tagging
+        const result = parseExcelRowsToMaterials(rawJson, materials, orNumber, style, updateDate);
 
-        // Immediate automatic storage into Master Data Material
-        // No manual confirmation or revision required!
+        // Immediate automatic storage into Master Data Material with date and upload history
         autoSaveExcelMaterials({
           newRequirements: result.requirements,
           newMasterMaterials: result.newMasterMaterials,
           newRelations: result.relations,
+          updateDate: updateDate,
+          fileName: file.name,
         });
 
         setIsProcessing(false);
         setStatusMessage(
-          `Sukses! ${result.summary.validRows} baris material berhasil dibaca dan otomatis disimpan ke Master Data Material. Mengarahkan...`
+          `Sukses! ${result.summary.validRows} baris material berhasil dibaca dan otomatis disimpan ke Master Data Material (Tanggal Update: ${updateDate}). Mengarahkan...`
         );
       } catch (err: any) {
         console.error(err);
         setIsProcessing(false);
-        setStatusMessage(`Gagal membaca file Excel: ${err.message || 'Format tidak valid'}`);
+        setErrorMessage(`Gagal membaca file Excel: ${err.message || 'Format tidak valid'}`);
       }
     };
     reader.readAsBinaryString(file);
@@ -146,6 +174,12 @@ export const UploadExcelView: React.FC = () => {
 
   // 1-Click Load Realistic Sample Excel Data directly into Master Data Material
   const loadRealisticSampleExcel = () => {
+    setErrorMessage(null);
+    if (!updateDate) {
+      setErrorMessage('Tanggal Update wajib diisi sebelum memuat data!');
+      return;
+    }
+
     const targetOr = orNumber.trim().toUpperCase() || 'OR-2026-088';
     const targetStyle = style.trim() || getStyleForOr(targetOr) || 'Casual Daily Bomber Jacket Navy';
     setOrNumber(targetOr);
@@ -154,14 +188,13 @@ export const UploadExcelView: React.FC = () => {
     setIsProcessing(true);
     setStatusMessage('Memuat dataset Excel realistis ERP (Order Lines)...');
 
-    // Create realistic rows with exact column headers specified by user
     const sampleRows = [
       {
         'Order Reference': targetOr,
         'Style': targetStyle,
         'Order Lines/Product/Display Name': '[FAB-TASLAN-NVY] Fabric Taslan Waterproof Navy 210T',
         'Order Lines/Quantity': 2500,
-        'Order Lines/Received Qty': 1200,
+        'Order Lines/Received Qty': 1400,
         'Order Lines/Product Unit of Measure/Display Name': 'Yard',
         'Supplier': 'PT Kahatex Textile',
         'Harga Satuan (IDR)': 42000,
@@ -171,7 +204,7 @@ export const UploadExcelView: React.FC = () => {
         'Style': targetStyle,
         'Order Lines/Product/Display Name': '[ZIP-YKK-MET5] Zipper Metal Antique Silver YKK #5 65cm',
         'Order Lines/Quantity': 1000,
-        'Order Lines/Received Qty': 450,
+        'Order Lines/Received Qty': 600,
         'Order Lines/Product Unit of Measure/Display Name': 'Pcs',
         'Supplier': 'PT YKK Zipper Indonesia',
         'Harga Satuan (IDR)': 18500,
@@ -191,39 +224,21 @@ export const UploadExcelView: React.FC = () => {
         'Style': targetStyle,
         'Order Lines/Product/Display Name': '[LIN-QUILT-BLK] Lining Quilting Dacron 4oz Black Diamond',
         'Order Lines/Quantity': 1800,
-        'Order Lines/Received Qty': 1600,
+        'Order Lines/Received Qty': 1750,
         'Order Lines/Product Unit of Measure/Display Name': 'Yard',
         'Supplier': 'PT Sinar Mulia Lining',
         'Harga Satuan (IDR)': 28000,
       },
-      {
-        'Order Reference': targetOr,
-        'Style': targetStyle,
-        'Order Lines/Product/Display Name': '[PKG-POLY-A3] Polybag Self-Adhesive Seal 35x45cm Clear',
-        'Order Lines/Quantity': 1000,
-        'Order Lines/Received Qty': 1000,
-        'Order Lines/Product Unit of Measure/Display Name': 'Pcs',
-        'Supplier': 'PT Poly Unggul Perkasa',
-        'Harga Satuan (IDR)': 850,
-      },
-      {
-        'Order Reference': targetOr,
-        'Style': targetStyle,
-        'Order Lines/Product/Display Name': '[PKG-BOX-MSTR] Master Carton Box K150 Double Wall 60x40x40cm',
-        'Order Lines/Quantity': 40,
-        'Order Lines/Received Qty': 40,
-        'Order Lines/Product Unit of Measure/Display Name': 'Box',
-        'Supplier': 'PT Fajar Surya Wisesa',
-        'Harga Satuan (IDR)': 22000,
-      },
     ];
 
     setTimeout(() => {
-      const result = parseExcelRowsToMaterials(sampleRows, materials, targetOr, targetStyle);
+      const result = parseExcelRowsToMaterials(sampleRows, materials, targetOr, targetStyle, updateDate);
       autoSaveExcelMaterials({
         newRequirements: result.requirements,
         newMasterMaterials: result.newMasterMaterials,
         newRelations: result.relations,
+        updateDate: updateDate,
+        fileName: 'PPIC_Order_Lines_Odoo_ERP.xlsx',
       });
       setIsProcessing(false);
       setStatusMessage(`Berhasil memuat ${result.summary.validRows} baris material contoh ke Master Data Material.`);
@@ -234,48 +249,11 @@ export const UploadExcelView: React.FC = () => {
   const handleSaveOnlyRelation = (e: React.FormEvent) => {
     e.preventDefault();
     if (!orNumber.trim() || !style.trim()) {
-      setStatusMessage('Silakan lengkapi Nomor OR dan Style sebelum menyimpan relasi.');
+      setErrorMessage('Silakan lengkapi Nomor OR dan Style sebelum menyimpan relasi.');
       return;
     }
     saveOrStyleRelation(orNumber.trim().toUpperCase(), style.trim());
     setStatusMessage(`Hubungan Nomor OR "${orNumber.toUpperCase()}" dan Style "${style}" berhasil disimpan!`);
-  };
-
-  // Export current active state to real Excel (.xlsx) file
-  const handleExportCurrentToExcel = () => {
-    const wb = XLSX.utils.book_new();
-
-    // Sheet 1: Master Data Material (Kebutuhan & Status)
-    const matSheetData = materials.map((m) => ({
-      'Kode Material': m.code,
-      'Nama Material': m.name,
-      Kategori: m.category,
-      Satuan: m.unit,
-      'Total Stok': m.totalStock,
-      'Alokasi SPK': m.allocatedStock,
-      'Safety Stock': m.safetyStock,
-      'Lead Time (Hari)': m.leadTimeDays,
-      Supplier: m.supplierName,
-      'Gudang Default': m.defaultWarehouse,
-      'Harga Satuan (IDR)': m.unitPrice,
-    }));
-    const wsMaterials = XLSX.utils.json_to_sheet(matSheetData);
-    XLSX.utils.book_append_sheet(wb, wsMaterials, 'Master_Material');
-
-    // Sheet 2: Jadwal Produksi
-    const woSheetData = productionSchedules.map((w) => ({
-      'Nomor OR': w.orNumber,
-      Style: w.style,
-      Target: w.target,
-      'Line Produksi': w.productionLine,
-      'Tgl Mulai': w.productionDate,
-      'Tgl Selesai': w.finishDate,
-      Status: w.status,
-    }));
-    const wsWO = XLSX.utils.json_to_sheet(woSheetData);
-    XLSX.utils.book_append_sheet(wb, wsWO, 'Jadwal_Produksi');
-
-    XLSX.writeFile(wb, `PPIC_Export_Data_${new Date().toISOString().slice(0, 10)}.xlsx`);
   };
 
   // Download official template file (.xlsx) with exact required column names
@@ -283,6 +261,7 @@ export const UploadExcelView: React.FC = () => {
     const wb = XLSX.utils.book_new();
     const templateData = [
       {
+        'Tanggal Update': updateDate,
         'Order Reference': 'OR-2026-001',
         'Style': 'Bomber Jacket Taslan Navy (BJ-01)',
         'Order Lines/Product/Display Name': '[FAB-TASLAN-NVY] Fabric Taslan Waterproof Navy 210T',
@@ -291,6 +270,7 @@ export const UploadExcelView: React.FC = () => {
         'Order Lines/Product Unit of Measure/Display Name': 'Yard',
       },
       {
+        'Tanggal Update': updateDate,
         'Order Reference': 'OR-2026-001',
         'Style': 'Bomber Jacket Taslan Navy (BJ-01)',
         'Order Lines/Product/Display Name': '[ZIP-YKK-MET5] Zipper Metal Antique Silver YKK #5 65cm',
@@ -299,6 +279,7 @@ export const UploadExcelView: React.FC = () => {
         'Order Lines/Product Unit of Measure/Display Name': 'Pcs',
       },
       {
+        'Tanggal Update': updateDate,
         'Order Reference': 'OR-2026-002',
         'Style': 'Polo Shirt DryFit Performance White (PS-02)',
         'Order Lines/Product/Display Name': '[FAB-DRYFIT-WHT] Fabric Micro DryFit Pique UV-Shield White',
@@ -317,29 +298,29 @@ export const UploadExcelView: React.FC = () => {
       {/* Top Header Card */}
       <div className="p-5 bg-white rounded-lg border border-slate-200 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
-          <div className="inline-flex items-center gap-1.5 px-2 py-0.5 rounded text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 mb-1.5">
+          <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded text-[11px] font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200 mb-1.5">
             <Sparkles className="w-3.5 h-3.5" />
-            Otomatisasi Pembacaan Excel Langsung ke Master Data Material
+            Upload Excel & Pencatatan Perkembangan Tanggal Harian
           </div>
           <h2 className="text-base md:text-lg font-bold text-slate-900">
-            Unggah Berkas Excel Kebutuhan Material (Order Lines)
+            Unggah Berkas Excel Kebutuhan Material & Manajemen Tanggal Update
           </h2>
           <p className="text-xs text-slate-500 mt-0.5 max-w-2xl">
-            Sistem secara otomatis membaca kolom <code>Order Lines/Product/Display Name</code>, <code>Quantity</code>, <code>Received Qty</code>, dan <code>UoM</code> lalu langsung menyimpannya ke <strong>Master Data Material</strong> tanpa revisi manual.
+            Seluruh data Nomor OR yang dimasukkan di sini menjadi <strong>sumber data utama (single source of truth)</strong> untuk seluruh fitur pencarian OR di aplikasi, dilengkapi dengan <strong>Tanggal Update</strong> untuk pelacakan perkembangan material harian.
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2">
           <button
             onClick={handleDownloadBlankTemplate}
-            className="px-3 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors flex items-center gap-1.5"
+            className="px-3 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors flex items-center gap-1.5 cursor-pointer"
           >
             <Download className="w-4 h-4 text-slate-500" />
             Unduh Template Excel ERP
           </button>
           <button
             onClick={() => setActiveMenu('Rekap Material')}
-            className="px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-md transition-colors flex items-center gap-1.5 shadow-xs"
+            className="px-3.5 py-2 text-xs font-semibold text-white bg-slate-900 hover:bg-slate-800 rounded-md transition-colors flex items-center gap-1.5 shadow-xs cursor-pointer"
           >
             Buka Master Data Material
             <ArrowRight className="w-3.5 h-3.5" />
@@ -347,66 +328,94 @@ export const UploadExcelView: React.FC = () => {
         </div>
       </div>
 
-      {/* Information Banner on Auto-Save Behavior */}
-      <div className="p-3.5 bg-blue-50 border border-blue-200 rounded-lg flex items-start gap-3 text-xs text-blue-900">
-        <Info className="w-4 h-4 text-blue-600 shrink-0 mt-0.5" />
-        <div className="space-y-1">
-          <div className="font-semibold">Mekanisme Pembacaan Otomatis (Tanpa Revisi Manual):</div>
-          <div className="text-blue-800 text-[11px] leading-relaxed">
-            1. Seluruh baris material dibaca langsung dari file Excel sesuai struktur kolom ERP Odoo/SAP.<br />
-            2. Master Data Material digunakan sebagai referensi untuk mengenali kode, nama, dan satuan jika penulisan tidak konsisten.<br />
-            3. Data langsung tersimpan dan otomatis terhubung ke Nomor OR serta Style terkait per baris transaksi.<br />
-            4. Setelah pembacaan, tampilan langsung berpindah ke Master Data Material untuk pengecekan cepat.
-          </div>
+      {/* Error alert banner */}
+      {errorMessage && (
+        <div className="p-3.5 rounded-lg bg-red-50 border border-red-300 text-red-900 text-xs flex items-center gap-2">
+          <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
+          <span className="font-semibold">{errorMessage}</span>
         </div>
-      </div>
+      )}
 
-      {/* SECTION: Nomor OR & Style 2-Way Mapping Card */}
-      <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-xs">
-        <div className="flex items-center justify-between pb-3 mb-4 border-b border-slate-100">
+      {/* SECTION 1: Tanggal Update, Nomor OR & Style Mapping Card */}
+      <div className="bg-white rounded-xl border border-slate-200 p-5 shadow-xs space-y-4">
+        <div className="flex items-center justify-between pb-3 border-b border-slate-100">
           <div className="flex items-center gap-2">
             <div className="w-7 h-7 rounded-md bg-blue-50 border border-blue-200 text-blue-600 flex items-center justify-center">
-              <LinkIcon className="w-4 h-4" />
+              <Calendar className="w-4 h-4" />
             </div>
             <div>
               <h3 className="text-sm font-bold text-slate-900">
-                Hubungan Nomor OR & Style
+                1. Parameter Upload: Tanggal Update & Relasi OR - Style
               </h3>
               <p className="text-[11px] text-slate-500">
-                Digunakan sebagai fallback jika kolom OR/Style di file Excel kosong. Nilai otomatis terisi dua arah berdasarkan riwayat.
+                Nomor OR yang dimasukkan akan otomatis menjadi Single Source of Truth bagi seluruh fitur Search OR di sistem.
               </p>
             </div>
           </div>
-          <span className="text-[11px] px-2.5 py-1 bg-slate-100 text-slate-600 font-medium rounded-full">
-            Tersimpan: {orStyleRelations.length} Pasangan
+          <span className="text-[11px] px-2.5 py-1 bg-blue-50 text-blue-700 font-semibold rounded-full border border-blue-200">
+            {registeredOrNumbers.length} Nomor OR Terdaftar
           </span>
         </div>
 
         <form onSubmit={handleSaveOnlyRelation} className="space-y-4">
-          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-            {/* Input 1: Nomor OR */}
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+            {/* Input 1: TANGGAL UPDATE (Wajib) */}
+            <div className="p-3 bg-blue-50/50 border border-blue-200 rounded-lg">
+              <label className="block text-xs font-bold text-blue-950 mb-1 flex items-center justify-between">
+                <span className="flex items-center gap-1.5">
+                  <Calendar className="w-3.5 h-3.5 text-blue-600" />
+                  Tanggal Update *
+                </span>
+                <span className="text-[10px] font-normal text-blue-700 bg-blue-100 px-1.5 py-0.2 rounded font-mono">
+                  WIB (Jakarta)
+                </span>
+              </label>
+              <input
+                type="date"
+                required
+                value={updateDate}
+                onChange={(e) => {
+                  setUpdateDate(e.target.value);
+                  setErrorMessage(null);
+                }}
+                className="w-full px-3 py-2 text-xs border border-blue-300 rounded-md font-mono bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 font-semibold text-slate-900"
+              />
+              <p className="text-[10px] text-blue-800 mt-1">
+                Data material akan dikelompokkan pada tanggal ini untuk melacak perkembangan harian.
+              </p>
+            </div>
+
+            {/* Input 2: Nomor OR (Searchable from Single Source of Truth) */}
             <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1.5 flex items-center gap-1.5">
+              <label className="block text-xs font-semibold text-slate-700 mb-1 flex items-center gap-1.5">
                 <Hash className="w-3.5 h-3.5 text-blue-600" />
                 Nomor OR
               </label>
               <div className="relative">
                 <input
                   type="text"
+                  list="registeredOrDatalist"
                   value={orNumber}
                   onChange={(e) => handleOrChange(e.target.value)}
-                  placeholder="Contoh: OR-2026-001"
-                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-blue-500 font-mono uppercase bg-white"
+                  placeholder="Ketik / pilih OR (Contoh: OR-2026-001)"
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono uppercase bg-white font-medium"
                 />
+                <datalist id="registeredOrDatalist">
+                  {registeredOrNumbers.map((or) => (
+                    <option key={or} value={or}>
+                      {getStyleForOr(or) ? `${or} (${getStyleForOr(or)})` : or}
+                    </option>
+                  ))}
+                </datalist>
               </div>
               <p className="text-[11px] text-slate-400 mt-1">
-                Ketik nomor OR untuk melengkapi Style secara otomatis.
+                Mendukung pencarian sebagian teks. OR yang dipilih otomatis mengisi Style.
               </p>
             </div>
 
-            {/* Input 2: Style */}
+            {/* Input 3: Style */}
             <div>
-              <label className="block text-xs font-semibold text-slate-700 mb-1.5 flex items-center gap-1.5">
+              <label className="block text-xs font-semibold text-slate-700 mb-1 flex items-center gap-1.5">
                 <Tag className="w-3.5 h-3.5 text-blue-600" />
                 Style
               </label>
@@ -416,11 +425,11 @@ export const UploadExcelView: React.FC = () => {
                   value={style}
                   onChange={(e) => handleStyleChange(e.target.value)}
                   placeholder="Contoh: Bomber Jacket Taslan Navy"
-                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-blue-500 bg-white"
+                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
                 />
               </div>
               <p className="text-[11px] text-slate-400 mt-1">
-                Ketik Style untuk mencari nomor OR yang cocok.
+                Ketik Style untuk mencari Nomor OR terkait secara dua arah.
               </p>
             </div>
           </div>
@@ -431,7 +440,7 @@ export const UploadExcelView: React.FC = () => {
               <span className="font-medium">{orInputFeedback}</span>
               <button
                 type="submit"
-                className="text-[11px] font-semibold text-blue-700 hover:text-blue-900 underline ml-2"
+                className="text-[11px] font-semibold text-blue-700 hover:text-blue-900 underline ml-2 cursor-pointer"
               >
                 Simpan Hubungan Pasangan Ini
               </button>
@@ -451,7 +460,7 @@ export const UploadExcelView: React.FC = () => {
                     key={opt}
                     type="button"
                     onClick={() => selectSuggestedOr(opt)}
-                    className="px-2.5 py-1 text-xs font-mono font-medium bg-white hover:bg-amber-100 border border-amber-300 rounded text-slate-800 transition-colors shadow-2xs"
+                    className="px-2.5 py-1 text-xs font-mono font-medium bg-white hover:bg-amber-100 border border-amber-300 rounded text-slate-800 transition-colors shadow-2xs cursor-pointer"
                   >
                     {opt}
                   </button>
@@ -460,35 +469,37 @@ export const UploadExcelView: React.FC = () => {
             </div>
           )}
 
-          {/* Quick Select from Saved Relations */}
+          {/* Quick Select from Single Source of Truth Registered ORs */}
           <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center gap-1.5">
-            <span className="text-[11px] text-slate-500 font-medium mr-1">
-              Pilihan Cepat Riwayat:
+            <span className="text-[11px] text-slate-500 font-medium mr-1 flex items-center gap-1">
+              <Hash className="w-3 h-3 text-slate-400" />
+              Pilihan Cepat OR Terdaftar:
             </span>
-            {orStyleRelations.slice(0, 6).map((rel) => (
+            {registeredOrNumbers.slice(0, 8).map((regOr) => (
               <button
-                key={rel.id}
+                key={regOr}
                 type="button"
                 onClick={() => {
-                  setOrNumber(rel.orNumber);
-                  setStyle(rel.style);
+                  setOrNumber(regOr);
+                  const st = getStyleForOr(regOr);
+                  if (st) setStyle(st);
                   setMultipleOrOptions([]);
-                  setOrInputFeedback(`Dipilih: ${rel.orNumber} - ${rel.style}`);
+                  setOrInputFeedback(`Dipilih: ${regOr} ${st ? `- ${st}` : ''}`);
                 }}
-                className={`text-[11px] px-2 py-0.5 rounded border transition-colors ${
-                  orNumber === rel.orNumber
+                className={`text-[11px] px-2 py-0.5 rounded border transition-colors cursor-pointer font-mono ${
+                  orNumber === regOr
                     ? 'bg-blue-600 text-white border-blue-600 font-semibold'
                     : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
                 }`}
               >
-                {rel.orNumber} ({rel.style.slice(0, 16)}...)
+                {regOr}
               </button>
             ))}
           </div>
         </form>
       </div>
 
-      {/* Upload Drop Zone & Fast Demo */}
+      {/* SECTION 2: Upload Drop Zone & Fast Demo */}
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Dropzone Column */}
         <div className="lg:col-span-2">
@@ -516,10 +527,10 @@ export const UploadExcelView: React.FC = () => {
                 <Upload className="w-6 h-6" />
               </div>
               <h3 className="text-sm font-bold text-slate-900">
-                Tarik & Lepas File Excel di Sini
+                2. Tarik & Lepas File Excel di Sini
               </h3>
               <p className="text-xs text-slate-500 leading-relaxed">
-                Mendukung file .xlsx, .xls, atau .csv hasil ekspor ERP. Hasil pembacaan akan <strong>langsung disimpan dan ditampilkan ke Master Data Material</strong> tanpa perlu revisi atau konfirmasi manual.
+                Mendukung .xlsx, .xls, atau .csv. Data otomatis disimpan ke <strong>Master Data Material</strong> dengan Tanggal Update: <strong className="text-blue-700">{updateDate}</strong> tanpa perlu koreksi manual.
               </p>
 
               <div className="pt-2 flex items-center justify-center gap-3">
@@ -558,16 +569,15 @@ export const UploadExcelView: React.FC = () => {
               Simulasi Data Excel ERP (1-Klik)
             </div>
             <p className="text-xs text-slate-600 leading-relaxed">
-              Uji langsung alur pembacaan dan penyimpanan otomatis menggunakan sampel riil struktur kolom <code>Order Lines</code> Odoo ERP.
+              Uji langsung alur pembacaan dan pencatatan tanggal harian menggunakan sampel riil struktur kolom <code>Order Lines</code> Odoo ERP.
             </p>
 
             <div className="mt-4 p-3 bg-slate-50 rounded border border-slate-100 text-[11px] text-slate-600 space-y-1.5">
-              <div className="font-semibold text-slate-800">Kolom Teruji:</div>
-              <div>• <code>Order Lines/Product/Display Name</code></div>
-              <div>• <code>Order Lines/Quantity</code> (Kebutuhan)</div>
-              <div>• <code>Order Lines/Received Qty</code> (Diterima)</div>
-              <div>• <code>Order Lines/Product Unit of Measure</code></div>
-              <div>• Otomatis menghitung <code>Kekurangan & Status READY</code></div>
+              <div className="font-semibold text-slate-800">Detail Simulasi:</div>
+              <div>• Tanggal Update Aktif: <strong className="font-mono text-blue-700">{updateDate}</strong></div>
+              <div>• Kolom: <code>Order Lines/Product/Display Name</code></div>
+              <div>• Kolom: <code>Order Lines/Quantity</code> & <code>Received Qty</code></div>
+              <div>• Disimpan ke Riwayat Update & Master Data</div>
             </div>
           </div>
 
@@ -593,37 +603,101 @@ export const UploadExcelView: React.FC = () => {
           </div>
           <button
             onClick={() => setActiveMenu('Rekap Material')}
-            className="px-3 py-1.5 bg-blue-700 hover:bg-blue-800 text-white font-semibold text-xs rounded shadow-xs transition-colors shrink-0 flex items-center gap-1.5"
+            className="px-3 py-1.5 bg-blue-700 hover:bg-blue-800 text-white font-semibold text-xs rounded shadow-xs transition-colors shrink-0 flex items-center gap-1.5 cursor-pointer"
           >
             Buka Master Data Material <ArrowRight className="w-3.5 h-3.5" />
           </button>
         </div>
       )}
 
-      {/* Info card for previous upload */}
-      {lastImportedInfo && (
-        <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-lg flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="w-8 h-8 rounded-full bg-emerald-100 text-emerald-700 flex items-center justify-center shrink-0">
-              <CheckCircle className="w-4 h-4" />
+      {/* SECTION 3: RIWAYAT UPDATE (UPLOAD HISTORY) - Required Specification */}
+      <div className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
+        <div className="p-4 bg-slate-50 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-center gap-2">
+            <div className="w-7 h-7 rounded-md bg-emerald-50 border border-emerald-200 text-emerald-600 flex items-center justify-center">
+              <History className="w-4 h-4" />
             </div>
             <div>
-              <div className="text-xs font-bold text-emerald-950">
-                Penyimpanan Terakhir: {lastImportedInfo.count} Baris Material Tersimpan
-              </div>
-              <div className="text-[11px] text-emerald-800">
-                Nomor OR: <strong className="font-mono">{lastImportedInfo.orNumber}</strong> {lastImportedInfo.style && `(${lastImportedInfo.style})`} · Tersimpan di Master Data Material tanpa revisi manual.
-              </div>
+              <h3 className="text-xs font-bold text-slate-900 uppercase tracking-wide">
+                Riwayat Update & Log Pengunggahan File Excel ({uploadHistory.length} Proses Tercatat)
+              </h3>
+              <p className="text-[11px] text-slate-500">
+                Setiap proses upload tercatat permanen dengan Tanggal Update, waktu upload, OR, file, dan status.
+              </p>
             </div>
           </div>
-          <button
-            onClick={() => setActiveMenu('Rekap Material')}
-            className="px-3 py-1.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-md transition-colors"
-          >
-            Lihat Hasil di Master Data
-          </button>
+
+          <div className="text-[11px] text-slate-500">
+            Riwayat tidak ditimpa saat ada upload baru
+          </div>
         </div>
-      )}
+
+        <div className="overflow-x-auto">
+          <table className="w-full text-left border-collapse text-xs">
+            <thead>
+              <tr className="bg-slate-100/70 text-slate-700 font-semibold border-b border-slate-200">
+                <th className="py-2.5 px-3.5">Tanggal Update</th>
+                <th className="py-2.5 px-3">Waktu Upload</th>
+                <th className="py-2.5 px-3.5">Nomor OR</th>
+                <th className="py-2.5 px-3.5">Style Terkait</th>
+                <th className="py-2.5 px-3.5">Nama File Excel</th>
+                <th className="py-2.5 px-3 text-right">Jumlah Baris</th>
+                <th className="py-2.5 px-3 text-center">Status</th>
+                <th className="py-2.5 px-3.5 text-center">Aksi</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-slate-100">
+              {uploadHistory.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="py-8 text-center text-slate-400 text-xs">
+                    Belum ada riwayat proses upload. Silakan unggah berkas Excel.
+                  </td>
+                </tr>
+              ) : (
+                uploadHistory.map((hist) => (
+                  <tr key={hist.id} className="hover:bg-slate-50 transition-colors">
+                    <td className="py-2.5 px-3.5 font-mono font-bold text-blue-700 whitespace-nowrap">
+                      <div className="inline-flex items-center gap-1.5 px-2 py-0.5 bg-blue-50 border border-blue-200 rounded">
+                        <Calendar className="w-3 h-3 text-blue-600" />
+                        {hist.updateDate}
+                      </div>
+                    </td>
+                    <td className="py-2.5 px-3 text-slate-600 font-mono text-[11px] whitespace-nowrap">
+                      {hist.uploadTime}
+                    </td>
+                    <td className="py-2.5 px-3.5 font-mono font-bold text-slate-900 whitespace-nowrap">
+                      {hist.orNumber}
+                    </td>
+                    <td className="py-2.5 px-3.5 text-slate-700 max-w-[200px] truncate">
+                      {hist.style}
+                    </td>
+                    <td className="py-2.5 px-3.5 font-mono text-slate-600 text-[11px] max-w-[180px] truncate">
+                      {hist.fileName}
+                    </td>
+                    <td className="py-2.5 px-3 text-right font-mono font-semibold text-slate-800">
+                      {hist.rowCount} Baris
+                    </td>
+                    <td className="py-2.5 px-3 text-center whitespace-nowrap">
+                      <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
+                        <CheckCircle className="w-3 h-3 text-emerald-600" />
+                        {hist.status}
+                      </span>
+                    </td>
+                    <td className="py-2.5 px-3.5 text-center whitespace-nowrap">
+                      <button
+                        onClick={() => setActiveMenu('Rekap Material')}
+                        className="text-xs text-blue-600 hover:text-blue-800 font-semibold underline cursor-pointer"
+                      >
+                        Buka di Master Data
+                      </button>
+                    </td>
+                  </tr>
+                ))
+              )}
+            </tbody>
+          </table>
+        </div>
+      </div>
     </div>
   );
 };

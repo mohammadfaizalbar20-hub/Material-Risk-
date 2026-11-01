@@ -21,12 +21,19 @@ import {
   Trash2,
   Edit2,
   Info,
+  Calendar,
+  GitCompare,
+  TrendingUp,
+  ArrowRight,
 } from 'lucide-react';
 
 export const MaterialSummaryView: React.FC = () => {
   const {
     materials,
     materialRequirements,
+    registeredOrNumbers,
+    searchRegisteredOrs,
+    getOrSummary,
     addMaterialRequirement,
     updateMaterialRequirement,
     deleteMaterialRequirement,
@@ -40,11 +47,15 @@ export const MaterialSummaryView: React.FC = () => {
     setActiveSearchQuery,
   } = usePpic();
 
-  // Active view tab: 'REQUIREMENTS' (Default Master Data Material) vs 'CATALOG' (Katalog Bahan Baku)
-  const [activeTab, setActiveTab] = useState<'REQUIREMENTS' | 'CATALOG'>('REQUIREMENTS');
+  // Active view tab:
+  // - 'REQUIREMENTS' (Master Data Material Transaksi OR)
+  // - 'DAILY_DIFF' (Komparasi Perkembangan Tanggal)
+  // - 'CATALOG' (Katalog Bahan Baku & Stok Fisik)
+  const [activeTab, setActiveTab] = useState<'REQUIREMENTS' | 'DAILY_DIFF' | 'CATALOG'>('REQUIREMENTS');
 
   // Filters for Master Data Material Requirements Table
   const [selectedOrFilter, setSelectedOrFilter] = useState<string>('ALL');
+  const [selectedDateFilter, setSelectedDateFilter] = useState<string>('ALL');
   const [statusFilter, setStatusFilter] = useState<'ALL' | 'READY' | 'BELUM_READY'>('ALL');
   const [onlyRecentFilter, setOnlyRecentFilter] = useState<boolean>(false);
 
@@ -64,6 +75,7 @@ export const MaterialSummaryView: React.FC = () => {
     receivedQty: number;
     unitPrice: number;
     supplierName: string;
+    updateDate: string;
   }>({
     orNumber: 'OR-2026-001',
     style: '',
@@ -75,12 +87,16 @@ export const MaterialSummaryView: React.FC = () => {
     receivedQty: 1000,
     unitPrice: 25000,
     supplierName: '',
+    updateDate: new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date()),
   });
 
-  // Extract unique OR list
-  const uniqueOrList = useMemo(() => {
-    const set = new Set(materialRequirements.map((r) => r.orNumber.trim().toUpperCase()).filter(Boolean));
-    return Array.from(set);
+  // Daily Comparison State (Komparasi Perkembangan Antar Tanggal)
+  const [compareOr, setCompareOr] = useState<string>(registeredOrNumbers[0] || 'OR-2026-001');
+
+  // Distinct Update Dates available across requirements
+  const availableUpdateDates = useMemo(() => {
+    const set = new Set(materialRequirements.map((r) => r.updateDate).filter(Boolean) as string[]);
+    return Array.from(set).sort().reverse();
   }, [materialRequirements]);
 
   // Master Data Material Rows with calculated Kekurangan & Status
@@ -97,6 +113,7 @@ export const MaterialSummaryView: React.FC = () => {
         shortage,
         isReady,
         statusLabel: isReady ? 'READY' : 'BELUM READY',
+        effectiveDate: req.updateDate || '2026-10-31',
       };
     });
   }, [materialRequirements]);
@@ -117,30 +134,35 @@ export const MaterialSummaryView: React.FC = () => {
         }
       }
 
-      // 2. OR Filter
+      // 2. OR Filter (Single source of truth)
       if (selectedOrFilter !== 'ALL' && r.orNumber.toUpperCase() !== selectedOrFilter.toUpperCase()) {
         return false;
       }
 
-      // 3. Status Filter
+      // 3. Tanggal Update Filter
+      if (selectedDateFilter !== 'ALL' && r.effectiveDate !== selectedDateFilter) {
+        return false;
+      }
+
+      // 4. Status Filter
       if (statusFilter === 'READY' && !r.isReady) return false;
       if (statusFilter === 'BELUM_READY' && r.isReady) return false;
 
-      // 4. Only recent filter
+      // 5. Only recent filter
       if (onlyRecentFilter && !r.isRecentlyImported) return false;
 
       return true;
     });
-  }, [processedRequirements, activeSearchQuery, selectedOrFilter, statusFilter, onlyRecentFilter]);
+  }, [processedRequirements, activeSearchQuery, selectedOrFilter, selectedDateFilter, statusFilter, onlyRecentFilter]);
 
   // KPI Metrics
   const metrics = useMemo(() => {
-    const total = processedRequirements.length;
-    const ready = processedRequirements.filter((r) => r.isReady).length;
+    const total = filteredRequirements.length;
+    const ready = filteredRequirements.filter((r) => r.isReady).length;
     const notReady = total - ready;
-    const totalRequired = processedRequirements.reduce((sum, r) => sum + r.requiredQty, 0);
-    const totalReceived = processedRequirements.reduce((sum, r) => sum + r.receivedQty, 0);
-    const recentlyImportedCount = processedRequirements.filter((r) => r.isRecentlyImported).length;
+    const totalRequired = filteredRequirements.reduce((sum, r) => sum + r.requiredQty, 0);
+    const totalReceived = filteredRequirements.reduce((sum, r) => sum + r.receivedQty, 0);
+    const recentlyImportedCount = filteredRequirements.filter((r) => r.isRecentlyImported).length;
 
     return {
       total,
@@ -152,13 +174,76 @@ export const MaterialSummaryView: React.FC = () => {
       totalReceived,
       recentlyImportedCount,
     };
-  }, [processedRequirements]);
+  }, [filteredRequirements]);
+
+  // Comparison logic for Daily Diff (Komparasi Perkembangan Tanggal)
+  const comparisonData = useMemo(() => {
+    const orReqs = materialRequirements.filter(
+      (r) => r.orNumber.trim().toUpperCase() === compareOr.trim().toUpperCase()
+    );
+
+    // Get unique dates for this OR
+    const dates = Array.from(new Set(orReqs.map((r) => r.updateDate || '2026-10-31'))).sort();
+
+    const dateA = dates[0] || '2026-10-25';
+    const dateB = dates[dates.length - 1] || '2026-10-31';
+
+    const reqsA = orReqs.filter((r) => (r.updateDate || '2026-10-31') === dateA);
+    const reqsB = orReqs.filter((r) => (r.updateDate || '2026-10-31') === dateB);
+
+    // Group by materialCode
+    const codes = Array.from(new Set([...reqsA.map((r) => r.materialCode), ...reqsB.map((r) => r.materialCode)]));
+
+    const rows = codes.map((code) => {
+      const itemA = reqsA.find((r) => r.materialCode === code);
+      const itemB = reqsB.find((r) => r.materialCode === code);
+
+      const reqA = itemA?.requiredQty ?? 0;
+      const recA = itemA?.receivedQty ?? 0;
+      const shortA = recA - reqA;
+      const readyA = shortA >= 0;
+
+      const reqB = itemB?.requiredQty ?? 0;
+      const recB = itemB?.receivedQty ?? 0;
+      const shortB = recB - reqB;
+      const readyB = shortB >= 0;
+
+      const diffReceived = recB - recA;
+      const diffShortage = shortB - shortA;
+
+      return {
+        materialCode: code,
+        materialName: itemB?.materialName || itemA?.materialName || code,
+        unit: itemB?.unit || itemA?.unit || 'Kg',
+        dateA,
+        dateB,
+        reqA,
+        recA,
+        shortA,
+        readyA,
+        reqB,
+        recB,
+        shortB,
+        readyB,
+        diffReceived,
+        diffShortage,
+      };
+    });
+
+    return {
+      dateA,
+      dateB,
+      datesAvailable: dates,
+      rows,
+      hasMultipleDates: dates.length > 1,
+    };
+  }, [materialRequirements, compareOr]);
 
   // Handlers for modal
   const handleOpenAddModal = () => {
     setEditingReq(null);
     setReqFormData({
-      orNumber: selectedOrFilter !== 'ALL' ? selectedOrFilter : 'OR-2026-001',
+      orNumber: selectedOrFilter !== 'ALL' ? selectedOrFilter : registeredOrNumbers[0] || 'OR-2026-001',
       style: '',
       materialCode: '',
       materialName: '',
@@ -168,6 +253,7 @@ export const MaterialSummaryView: React.FC = () => {
       receivedQty: 500,
       unitPrice: 25000,
       supplierName: '',
+      updateDate: new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date()),
     });
     setAddReqModalOpen(true);
   };
@@ -185,6 +271,7 @@ export const MaterialSummaryView: React.FC = () => {
       receivedQty: req.receivedQty,
       unitPrice: req.unitPrice,
       supplierName: req.supplierName || '',
+      updateDate: req.updateDate || new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date()),
     });
     setAddReqModalOpen(true);
   };
@@ -205,6 +292,7 @@ export const MaterialSummaryView: React.FC = () => {
   const handleExportMasterDataExcel = () => {
     const wb = XLSX.utils.book_new();
     const exportData = filteredRequirements.map((r) => ({
+      'Tanggal Update': r.effectiveDate,
       'Kode Material': r.materialCode,
       'Nama Material': r.materialName,
       'Satuan': r.unit,
@@ -235,7 +323,7 @@ export const MaterialSummaryView: React.FC = () => {
             Master Data Material & Kesiapan Produksi
           </h2>
           <p className="text-xs text-slate-500 mt-0.5 max-w-2xl">
-            Hasil pembacaan Excel otomatis: Kebutuhan, Diterima, Kekurangan (<code>Diterima - Kebutuhan</code>), serta status <strong>READY</strong> atau <strong>BELUM READY</strong> per baris transaksi OR.
+            Hasil pembacaan Excel otomatis per <strong>Tanggal Update</strong>: Kebutuhan, Diterima, Kekurangan (<code>Diterima - Kebutuhan</code>), serta status <strong>READY</strong> atau <strong>BELUM READY</strong> per baris transaksi OR.
           </p>
         </div>
 
@@ -277,9 +365,13 @@ export const MaterialSummaryView: React.FC = () => {
                 <span className="px-2 py-0.5 text-[10px] font-mono font-bold bg-emerald-200 text-emerald-900 rounded-full">
                   {lastImportedInfo.count} Baris Transaksi
                 </span>
+                <span className="px-2 py-0.5 text-[10px] font-mono font-bold bg-blue-100 text-blue-800 rounded-full flex items-center gap-1">
+                  <Calendar className="w-3 h-3" />
+                  {lastImportedInfo.updateDate}
+                </span>
               </div>
               <p className="text-xs text-emerald-800 mt-0.5">
-                Nomor OR: <strong className="font-mono">{lastImportedInfo.orNumber}</strong> {lastImportedInfo.style && `· Style: ${lastImportedInfo.style}`}. Data langsung aktif tanpa perlu konfirmasi manual.
+                Nomor OR: <strong className="font-mono">{lastImportedInfo.orNumber}</strong> {lastImportedInfo.style && `· Style: ${lastImportedInfo.style}`}. Data langsung aktif dan terhubung ke seluruh sistem.
               </p>
             </div>
           </div>
@@ -288,15 +380,17 @@ export const MaterialSummaryView: React.FC = () => {
             <button
               onClick={() => {
                 setSelectedOrFilter(lastImportedInfo.orNumber);
+                setSelectedDateFilter(lastImportedInfo.updateDate);
                 setOnlyRecentFilter(true);
               }}
               className="px-3 py-1.5 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-md shadow-2xs transition-colors cursor-pointer"
             >
-              Filter Hanya Data Baru
+              Filter Data Baru Ini
             </button>
             <button
               onClick={() => {
                 setSelectedOrFilter('ALL');
+                setSelectedDateFilter('ALL');
                 setOnlyRecentFilter(false);
               }}
               className="px-2.5 py-1.5 text-xs font-medium text-emerald-800 hover:bg-emerald-100 rounded transition-colors cursor-pointer"
@@ -322,7 +416,7 @@ export const MaterialSummaryView: React.FC = () => {
             {metrics.total.toLocaleString('id-ID')}
           </div>
           <div className="text-[11px] text-slate-400 mt-1">
-            {uniqueOrList.length} Nomor OR terhubung
+            {registeredOrNumbers.length} Nomor OR terdaftar (Single Source of Truth)
           </div>
         </div>
 
@@ -356,14 +450,14 @@ export const MaterialSummaryView: React.FC = () => {
 
         <div className="p-4 bg-white rounded-xl border border-slate-200 shadow-xs">
           <div className="text-xs font-medium text-blue-700 flex items-center gap-1.5">
-            <Sparkles className="w-3.5 h-3.5" />
-            Baru Dibaca / Diimpor
+            <Calendar className="w-3.5 h-3.5" />
+            Tanggal Update Terdata
           </div>
           <div className="text-xl md:text-2xl font-bold font-mono text-blue-700 mt-1">
-            {metrics.recentlyImportedCount.toLocaleString('id-ID')}
+            {availableUpdateDates.length} Tanggal
           </div>
           <div className="text-[11px] text-slate-400 mt-1">
-            {onlyRecentFilter ? 'Sedang difilter' : 'Tersimpan otomatis ke sistem'}
+            Terbaru: {availableUpdateDates[0] || '-'}
           </div>
         </div>
       </div>
@@ -386,6 +480,21 @@ export const MaterialSummaryView: React.FC = () => {
         </button>
 
         <button
+          onClick={() => setActiveTab('DAILY_DIFF')}
+          className={`pb-3 px-3 text-xs font-bold border-b-2 transition-colors cursor-pointer flex items-center gap-2 ${
+            activeTab === 'DAILY_DIFF'
+              ? 'border-blue-600 text-blue-600'
+              : 'border-transparent text-slate-500 hover:text-slate-900'
+          }`}
+        >
+          <GitCompare className="w-4 h-4 text-emerald-600" />
+          Komparasi Perkembangan Antar Tanggal
+          <span className="ml-1 px-1.5 py-0.2 rounded-full text-[10px] bg-emerald-100 text-emerald-800 font-semibold">
+            Daily Diff
+          </span>
+        </button>
+
+        <button
           onClick={() => setActiveTab('CATALOG')}
           className={`pb-3 px-3 text-xs font-bold border-b-2 transition-colors cursor-pointer flex items-center gap-2 ${
             activeTab === 'CATALOG'
@@ -394,40 +503,61 @@ export const MaterialSummaryView: React.FC = () => {
           }`}
         >
           <Layers className="w-4 h-4" />
-          Katalog Master Material (Database Bahan Baku & Stok Fisik)
+          Katalog Master Material & Stok Fisik
           <span className="ml-1 px-1.5 py-0.2 rounded-full text-[10px] bg-slate-100 text-slate-700 font-mono">
             {materials.length}
           </span>
         </button>
       </div>
 
-      {/* TAB 1: MASTER DATA MATERIAL TRANSACTION TABLE (The exact requested view) */}
+      {/* TAB 1: MASTER DATA MATERIAL TRANSACTION TABLE */}
       {activeTab === 'REQUIREMENTS' && (
         <div className="space-y-4">
           {/* Filter Toolbar */}
           <div className="p-4 bg-white rounded-lg border border-slate-200 shadow-xs space-y-3">
             <div className="flex flex-col md:flex-row md:items-center justify-between gap-3">
-              {/* Filter 1: Nomor OR */}
-              <div className="flex flex-wrap items-center gap-2">
-                <span className="text-xs font-semibold text-slate-600 flex items-center gap-1">
-                  <Hash className="w-3.5 h-3.5 text-blue-600" />
-                  Nomor OR:
-                </span>
-                <select
-                  value={selectedOrFilter}
-                  onChange={(e) => setSelectedOrFilter(e.target.value)}
-                  className="px-2.5 py-1.5 text-xs font-mono border border-slate-300 rounded-md bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none"
-                >
-                  <option value="ALL">Semua Nomor OR ({uniqueOrList.length})</option>
-                  {uniqueOrList.map((or) => (
-                    <option key={or} value={or}>
-                      {or}
-                    </option>
-                  ))}
-                </select>
+              <div className="flex flex-wrap items-center gap-2.5">
+                {/* Filter 1: Nomor OR (Single Source of Truth) */}
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-semibold text-slate-600 flex items-center gap-1">
+                    <Hash className="w-3.5 h-3.5 text-blue-600" />
+                    Nomor OR:
+                  </span>
+                  <select
+                    value={selectedOrFilter}
+                    onChange={(e) => setSelectedOrFilter(e.target.value)}
+                    className="px-2.5 py-1.5 text-xs font-mono border border-slate-300 rounded-md bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none font-semibold text-slate-900"
+                  >
+                    <option value="ALL">Semua Nomor OR ({registeredOrNumbers.length})</option>
+                    {registeredOrNumbers.map((or) => (
+                      <option key={or} value={or}>
+                        {or}
+                      </option>
+                    ))}
+                  </select>
+                </div>
 
-                {/* Filter 2: Status READY / BELUM READY */}
-                <span className="text-xs font-semibold text-slate-600 ml-2">Status:</span>
+                {/* Filter 2: Tanggal Update */}
+                <div className="flex items-center gap-1.5">
+                  <span className="text-xs font-semibold text-slate-600 flex items-center gap-1">
+                    <Calendar className="w-3.5 h-3.5 text-blue-600" />
+                    Tanggal Update:
+                  </span>
+                  <select
+                    value={selectedDateFilter}
+                    onChange={(e) => setSelectedDateFilter(e.target.value)}
+                    className="px-2.5 py-1.5 text-xs font-mono border border-slate-300 rounded-md bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                  >
+                    <option value="ALL">Semua Tanggal ({availableUpdateDates.length})</option>
+                    {availableUpdateDates.map((dt) => (
+                      <option key={dt} value={dt}>
+                        {dt}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+
+                {/* Filter 3: Status READY / BELUM READY */}
                 <div className="flex items-center gap-1">
                   {[
                     { id: 'ALL', label: 'Semua Status' },
@@ -452,18 +582,18 @@ export const MaterialSummaryView: React.FC = () => {
                   ))}
                 </div>
 
-                {/* Filter 3: Data Baru Dibaca Toggle */}
+                {/* Filter 4: Data Baru Dibaca Toggle */}
                 {metrics.recentlyImportedCount > 0 && (
                   <button
                     onClick={() => setOnlyRecentFilter(!onlyRecentFilter)}
-                    className={`ml-2 px-2.5 py-1 text-xs rounded border transition-colors cursor-pointer flex items-center gap-1.5 ${
+                    className={`px-2.5 py-1 text-xs rounded border transition-colors cursor-pointer flex items-center gap-1.5 ${
                       onlyRecentFilter
                         ? 'bg-blue-600 text-white border-blue-600 font-semibold'
                         : 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100 font-medium'
                     }`}
                   >
                     <Sparkles className="w-3.5 h-3.5" />
-                    Hanya Baru Dibaca ({metrics.recentlyImportedCount})
+                    Baru Dibaca ({metrics.recentlyImportedCount})
                   </button>
                 )}
               </div>
@@ -486,15 +616,21 @@ export const MaterialSummaryView: React.FC = () => {
                 Menampilkan <strong className="text-slate-900">{filteredRequirements.length}</strong> dari {materialRequirements.length} baris transaksi material
                 {selectedOrFilter !== 'ALL' && (
                   <span className="ml-2 font-mono text-blue-700 font-semibold">
-                    [Filter OR: {selectedOrFilter}]
+                    [OR: {selectedOrFilter}]
+                  </span>
+                )}
+                {selectedDateFilter !== 'ALL' && (
+                  <span className="ml-2 font-mono text-emerald-700 font-semibold">
+                    [Tanggal: {selectedDateFilter}]
                   </span>
                 )}
               </div>
 
-              {(selectedOrFilter !== 'ALL' || statusFilter !== 'ALL' || onlyRecentFilter || activeSearchQuery) && (
+              {(selectedOrFilter !== 'ALL' || selectedDateFilter !== 'ALL' || statusFilter !== 'ALL' || onlyRecentFilter || activeSearchQuery) && (
                 <button
                   onClick={() => {
                     setSelectedOrFilter('ALL');
+                    setSelectedDateFilter('ALL');
                     setStatusFilter('ALL');
                     setOnlyRecentFilter(false);
                     setActiveSearchQuery('');
@@ -514,6 +650,7 @@ export const MaterialSummaryView: React.FC = () => {
                 <thead>
                   <tr className="bg-slate-50 text-slate-700 font-semibold border-b border-slate-200">
                     <th className="py-3 px-3 w-10 text-center">#</th>
+                    <th className="py-3 px-3.5 whitespace-nowrap">Tanggal Update</th>
                     <th className="py-3 px-3.5 whitespace-nowrap">Kode Material</th>
                     <th className="py-3 px-3.5">Nama Material</th>
                     <th className="py-3 px-3 text-center whitespace-nowrap">Satuan</th>
@@ -534,7 +671,7 @@ export const MaterialSummaryView: React.FC = () => {
                 <tbody className="divide-y divide-slate-100">
                   {filteredRequirements.length === 0 ? (
                     <tr>
-                      <td colSpan={11} className="py-12 text-center text-slate-400 text-xs">
+                      <td colSpan={12} className="py-12 text-center text-slate-400 text-xs">
                         <div className="flex flex-col items-center justify-center gap-2">
                           <Boxes className="w-8 h-8 text-slate-300" />
                           <span className="font-medium text-slate-600">
@@ -561,6 +698,14 @@ export const MaterialSummaryView: React.FC = () => {
                           {/* Row Index */}
                           <td className="py-3 px-3 text-center text-slate-400 font-mono text-[11px]">
                             {idx + 1}
+                          </td>
+
+                          {/* Tanggal Update */}
+                          <td className="py-3 px-3.5 font-mono text-slate-700 whitespace-nowrap">
+                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-slate-100 border border-slate-200 text-slate-700 text-[11px]">
+                              <Calendar className="w-3 h-3 text-slate-500" />
+                              {row.effectiveDate}
+                            </span>
                           </td>
 
                           {/* 1. Kode Material */}
@@ -680,7 +825,136 @@ export const MaterialSummaryView: React.FC = () => {
         </div>
       )}
 
-      {/* TAB 2: MASTER MATERIAL CATALOG (Master Parameters, Safety Stock, Lead Time) */}
+      {/* TAB 2: KOMPARASI PERKEMBANGAN ANTAR TANGGAL (DAILY DIFF) */}
+      {activeTab === 'DAILY_DIFF' && (
+        <div className="bg-white rounded-lg border border-slate-200 shadow-xs p-5 space-y-5">
+          <div className="flex flex-col md:flex-row md:items-center justify-between gap-4 pb-4 border-b border-slate-200">
+            <div>
+              <div className="flex items-center gap-2">
+                <GitCompare className="w-5 h-5 text-emerald-600" />
+                <h3 className="text-sm font-bold text-slate-900">
+                  Komparasi Perkembangan Kebutuhan & Penerimaan Antar Tanggal Update
+                </h3>
+              </div>
+              <p className="text-xs text-slate-500 mt-1">
+                Bandingkan data material antar tanggal untuk melacak perubahan Kebutuhan, penambahan material Diterima, dan pengurangan defisit material.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-2">
+              <label className="text-xs font-semibold text-slate-700">Pilih Nomor OR:</label>
+              <select
+                value={compareOr}
+                onChange={(e) => setCompareOr(e.target.value)}
+                className="px-3 py-1.5 text-xs font-mono font-bold text-blue-700 border border-slate-300 rounded-md bg-white focus:ring-1 focus:ring-blue-500"
+              >
+                {registeredOrNumbers.map((or) => (
+                  <option key={or} value={or}>
+                    {or}
+                  </option>
+                ))}
+              </select>
+            </div>
+          </div>
+
+          {/* Date Comparison Summary Header */}
+          <div className="p-4 bg-slate-50 border border-slate-200 rounded-lg flex flex-col md:flex-row md:items-center justify-between gap-3 text-xs">
+            <div className="flex items-center gap-3">
+              <span className="font-semibold text-slate-700">Periode Perbandingan:</span>
+              <div className="flex items-center gap-2 font-mono">
+                <span className="px-2.5 py-1 bg-white border border-slate-300 rounded text-slate-800 font-bold">
+                  {comparisonData.dateA}
+                </span>
+                <ArrowRight className="w-4 h-4 text-slate-400" />
+                <span className="px-2.5 py-1 bg-blue-50 border border-blue-300 rounded text-blue-800 font-bold">
+                  {comparisonData.dateB} (Terbaru)
+                </span>
+              </div>
+            </div>
+
+            <div className="text-[11px] text-slate-500">
+              {comparisonData.hasMultipleDates ? (
+                <span className="text-emerald-700 font-semibold flex items-center gap-1">
+                  <CheckCircle2 className="w-3.5 h-3.5" />
+                  Ditemukan riwayat pembaruan antar tanggal untuk OR {compareOr}.
+                </span>
+              ) : (
+                <span className="text-slate-500">
+                  OR ini baru memiliki 1 tanggal update. Unggah kembali di tanggal lain untuk melihat perbandingan dinamis.
+                </span>
+              )}
+            </div>
+          </div>
+
+          {/* Comparison Table */}
+          <div className="overflow-x-auto">
+            <table className="w-full text-left border-collapse text-xs">
+              <thead>
+                <tr className="bg-slate-100/80 text-slate-700 font-semibold border-b border-slate-200">
+                  <th className="py-2.5 px-3">Kode Material</th>
+                  <th className="py-2.5 px-3">Nama Material</th>
+                  <th className="py-2.5 px-3 text-center">Satuan</th>
+                  <th className="py-2.5 px-3 text-right bg-slate-50">Diterima ({comparisonData.dateA})</th>
+                  <th className="py-2.5 px-3 text-right bg-blue-50/50">Diterima ({comparisonData.dateB})</th>
+                  <th className="py-2.5 px-3 text-right font-bold">Perubahan Diterima</th>
+                  <th className="py-2.5 px-3 text-right">Kebutuhan</th>
+                  <th className="py-2.5 px-3 text-center">Status Awal</th>
+                  <th className="py-2.5 px-3 text-center">Status Akhir</th>
+                </tr>
+              </thead>
+              <tbody className="divide-y divide-slate-100">
+                {comparisonData.rows.map((row) => (
+                  <tr key={row.materialCode} className="hover:bg-slate-50">
+                    <td className="py-2.5 px-3 font-mono font-bold text-slate-900">{row.materialCode}</td>
+                    <td className="py-2.5 px-3 font-medium text-slate-800">{row.materialName}</td>
+                    <td className="py-2.5 px-3 text-center font-mono text-slate-600">{row.unit}</td>
+
+                    <td className="py-2.5 px-3 text-right font-mono text-slate-700 bg-slate-50">
+                      {row.recA.toLocaleString('id-ID')}
+                    </td>
+
+                    <td className="py-2.5 px-3 text-right font-mono font-bold text-blue-700 bg-blue-50/50">
+                      {row.recB.toLocaleString('id-ID')}
+                    </td>
+
+                    <td className="py-2.5 px-3 text-right font-mono font-bold">
+                      {row.diffReceived > 0 ? (
+                        <span className="text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded">
+                          +{row.diffReceived.toLocaleString('id-ID')} {row.unit}
+                        </span>
+                      ) : row.diffReceived === 0 ? (
+                        <span className="text-slate-400">0</span>
+                      ) : (
+                        <span className="text-red-600">
+                          {row.diffReceived.toLocaleString('id-ID')} {row.unit}
+                        </span>
+                      )}
+                    </td>
+
+                    <td className="py-2.5 px-3 text-right font-mono text-slate-800">
+                      {row.reqB.toLocaleString('id-ID')}
+                    </td>
+
+                    <td className="py-2.5 px-3 text-center">
+                      <span className={`px-2 py-0.5 text-[10px] font-bold rounded-full ${row.readyA ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>
+                        {row.readyA ? 'READY' : 'BELUM READY'}
+                      </span>
+                    </td>
+
+                    <td className="py-2.5 px-3 text-center">
+                      <span className={`px-2 py-0.5 text-[10px] font-bold rounded-full ${row.readyB ? 'bg-emerald-100 text-emerald-800' : 'bg-red-100 text-red-800'}`}>
+                        {row.readyB ? 'READY' : 'BELUM READY'}
+                      </span>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      {/* TAB 3: MASTER MATERIAL CATALOG */}
       {activeTab === 'CATALOG' && (
         <div className="bg-white rounded-lg border border-slate-200 shadow-xs overflow-hidden">
           <div className="p-4 bg-slate-50 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -794,30 +1068,49 @@ export const MaterialSummaryView: React.FC = () => {
               <div className="grid grid-cols-2 gap-3">
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Nomor OR Terkait
+                    Nomor OR Terkait (Single Source)
                   </label>
                   <input
                     type="text"
                     required
+                    list="modalOrDatalist"
                     value={reqFormData.orNumber}
                     onChange={(e) => setReqFormData({ ...reqFormData, orNumber: e.target.value.toUpperCase() })}
                     className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded font-mono uppercase focus:ring-1 focus:ring-blue-500 focus:outline-none"
                     placeholder="Contoh: OR-2026-001"
                   />
+                  <datalist id="modalOrDatalist">
+                    {registeredOrNumbers.map((or) => (
+                      <option key={or} value={or} />
+                    ))}
+                  </datalist>
                 </div>
 
                 <div>
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    Style Terkait
+                    Tanggal Update *
                   </label>
                   <input
-                    type="text"
-                    value={reqFormData.style}
-                    onChange={(e) => setReqFormData({ ...reqFormData, style: e.target.value })}
-                    className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 focus:outline-none"
-                    placeholder="Contoh: Bomber Jacket Navy"
+                    type="date"
+                    required
+                    value={reqFormData.updateDate}
+                    onChange={(e) => setReqFormData({ ...reqFormData, updateDate: e.target.value })}
+                    className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded font-mono focus:ring-1 focus:ring-blue-500 focus:outline-none"
                   />
                 </div>
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-slate-700 mb-1">
+                  Style Terkait
+                </label>
+                <input
+                  type="text"
+                  value={reqFormData.style}
+                  onChange={(e) => setReqFormData({ ...reqFormData, style: e.target.value })}
+                  className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                  placeholder="Contoh: Bomber Jacket Navy"
+                />
               </div>
 
               <div className="grid grid-cols-2 gap-3">

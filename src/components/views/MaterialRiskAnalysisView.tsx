@@ -28,6 +28,8 @@ export const MaterialRiskAnalysisView: React.FC = () => {
     orRiskSummaries,
     productionSchedules,
     setActiveMenu,
+    registeredOrNumbers,
+    getOrSummary,
   } = usePpic();
 
   const [activeTab, setActiveTab] = useState<'or' | 'material'>('or');
@@ -35,10 +37,8 @@ export const MaterialRiskAnalysisView: React.FC = () => {
   const [filterOr, setFilterOr] = useState<string>('ALL');
   const [expandedOrNumber, setExpandedOrNumber] = useState<string | null>(null);
 
-  // List of unique ORs for filter
-  const uniqueOrs = useMemo(() => {
-    return Array.from(new Set(orRiskSummaries.map((s) => s.orNumber)));
-  }, [orRiskSummaries]);
+  // Single Source of Truth for unique ORs from Upload Excel
+  const uniqueOrs = registeredOrNumbers;
 
   // Filtered OR Summaries
   const filteredOrSummaries = useMemo(() => {
@@ -273,12 +273,15 @@ export const MaterialRiskAnalysisView: React.FC = () => {
             onChange={(e) => setFilterOr(e.target.value)}
             className="px-2.5 py-1 text-xs bg-slate-50 border border-slate-200 rounded-md text-slate-800 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
           >
-            <option value="ALL">Semua Nomor OR</option>
-            {uniqueOrs.map((or) => (
-              <option key={or} value={or}>
-                {or}
-              </option>
-            ))}
+            <option value="ALL">Semua Nomor OR ({uniqueOrs.length})</option>
+            {uniqueOrs.map((or) => {
+              const summary = getOrSummary(or);
+              return (
+                <option key={or} value={or}>
+                  {or} {summary?.style ? `— ${summary.style}` : ''}
+                </option>
+              );
+            })}
           </select>
 
           {(filterRisk !== 'ALL' || filterOr !== 'ALL') && (

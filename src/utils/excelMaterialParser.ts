@@ -110,7 +110,8 @@ export function parseExcelRowsToMaterials(
   rawRows: any[],
   existingMaterials: Material[],
   defaultOrNumber: string,
-  defaultStyle: string
+  defaultStyle: string,
+  updateDate?: string
 ): ParseExcelResult {
   const requirements: MaterialItemRequirement[] = [];
   const newMasterMaterialsMap = new Map<string, Material>();
@@ -300,6 +301,7 @@ export function parseExcelRowsToMaterials(
       supplierName,
       isRecentlyImported: true,
       importedAt: new Date().toISOString(),
+      updateDate: updateDate || new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date()),
     };
     requirements.push(reqItem);
 

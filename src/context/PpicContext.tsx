@@ -12,6 +12,7 @@ import {
   ScheduleConflict,
   StockTransferPayload,
   ProductionSimulationConfig,
+  UploadHistoryItem,
 } from '../types/ppic';
 import {
   INITIAL_MATERIALS,
@@ -20,6 +21,7 @@ import {
   INITIAL_PRODUCTION_SCHEDULES,
   INITIAL_OR_STYLE_RELATIONS,
   INITIAL_MATERIAL_REQUIREMENTS,
+  INITIAL_UPLOAD_HISTORY,
 } from '../data/initialPpicData';
 import {
   assessAllMaterialRisks,
@@ -113,13 +115,30 @@ interface PpicContextType {
   selectedWorkOrderId: string | null;
   setSelectedWorkOrderId: (id: string | null) => void;
 
+  // Single Source of Truth for Registered OR Numbers (Derived from Upload Excel data)
+  registeredOrNumbers: string[];
+  searchRegisteredOrs: (query: string) => string[];
+  getOrSummary: (orNumber: string) => {
+    orNumber: string;
+    style: string;
+    latestUpdateDate?: string;
+    updateDates: string[];
+    requirements: MaterialItemRequirement[];
+  };
+
+  // Upload History & Tanggal Update Tracking
+  uploadHistory: UploadHistoryItem[];
+  addUploadHistory: (item: Omit<UploadHistoryItem, 'id'>) => void;
+
   // Realtime Excel auto-save and highlight tracking
-  lastImportedInfo: { orNumber: string; style?: string; count: number; timestamp: number } | null;
-  setLastImportedInfo: (info: { orNumber: string; style?: string; count: number; timestamp: number } | null) => void;
+  lastImportedInfo: { orNumber: string; style?: string; count: number; updateDate: string; timestamp: number } | null;
+  setLastImportedInfo: (info: { orNumber: string; style?: string; count: number; updateDate: string; timestamp: number } | null) => void;
   autoSaveExcelMaterials: (params: {
     newRequirements: MaterialItemRequirement[];
     newMasterMaterials?: Material[];
     newRelations?: OrStyleRelation[];
+    updateDate: string;
+    fileName?: string;
   }) => void;
 }
 
@@ -141,8 +160,19 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     orNumber: string;
     style?: string;
     count: number;
+    updateDate: string;
     timestamp: number;
   } | null>(null);
+
+  // Upload History & Tanggal Update Tracking
+  const [uploadHistory, setUploadHistory] = useState<UploadHistoryItem[]>(() => {
+    try {
+      const saved = localStorage.getItem(`${LOCAL_STORAGE_KEY}_upload_history`);
+      return saved ? JSON.parse(saved) : INITIAL_UPLOAD_HISTORY;
+    } catch {
+      return INITIAL_UPLOAD_HISTORY;
+    }
+  });
 
   // OR & Style Relations
   const [orStyleRelations, setOrStyleRelations] = useState<OrStyleRelation[]>(() => {
@@ -245,6 +275,68 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       console.error(e);
     }
   }, [materials]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(`${LOCAL_STORAGE_KEY}_upload_history`, JSON.stringify(uploadHistory));
+    } catch (e) {
+      console.error(e);
+    }
+  }, [uploadHistory]);
+
+  // SINGLE SOURCE OF TRUTH FOR REGISTERED OR NUMBERS
+  // Derived strictly from Excel uploads (material requirements, upload history, and mapped relations)
+  const registeredOrNumbers = useMemo(() => {
+    const set = new Set<string>();
+    for (const req of materialRequirements) {
+      if (req.orNumber && req.orNumber.trim()) {
+        set.add(req.orNumber.trim().toUpperCase());
+      }
+    }
+    for (const hist of uploadHistory) {
+      if (hist.orNumber && hist.orNumber.trim()) {
+        set.add(hist.orNumber.trim().toUpperCase());
+      }
+    }
+    for (const rel of orStyleRelations) {
+      if (rel.orNumber && rel.orNumber.trim()) {
+        set.add(rel.orNumber.trim().toUpperCase());
+      }
+    }
+    return Array.from(set).sort();
+  }, [materialRequirements, uploadHistory, orStyleRelations]);
+
+  const searchRegisteredOrs = (query: string): string[] => {
+    const clean = (query || '').trim().toUpperCase();
+    if (!clean) return registeredOrNumbers;
+    // Supports partial / substring input matching
+    return registeredOrNumbers.filter((or) => or.includes(clean));
+  };
+
+  const getOrSummary = (orNumber: string) => {
+    const clean = (orNumber || '').trim().toUpperCase();
+    const matchedStyle = getStyleForOr(clean) || '';
+    const reqs = materialRequirements.filter((r) => r.orNumber.trim().toUpperCase() === clean);
+    const dates = Array.from(
+      new Set(reqs.map((r) => r.updateDate).filter(Boolean) as string[])
+    ).sort().reverse();
+
+    return {
+      orNumber: clean,
+      style: matchedStyle,
+      latestUpdateDate: dates[0] || undefined,
+      updateDates: dates,
+      requirements: reqs,
+    };
+  };
+
+  const addUploadHistory = (item: Omit<UploadHistoryItem, 'id'>) => {
+    const newHist: UploadHistoryItem = {
+      ...item,
+      id: `hist-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+    };
+    setUploadHistory((prev) => [newHist, ...prev]);
+  };
 
   // Save or update OR <-> Style relation
   const saveOrStyleRelation = (orNumber: string, style: string) => {
@@ -435,12 +527,20 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     newRequirements,
     newMasterMaterials = [],
     newRelations = [],
+    updateDate,
+    fileName = 'Data_Material_PPIC.xlsx',
   }: {
     newRequirements: MaterialItemRequirement[];
     newMasterMaterials?: Material[];
     newRelations?: OrStyleRelation[];
+    updateDate: string;
+    fileName?: string;
   }) => {
     if (newRequirements.length === 0) return;
+
+    // Use selected updateDate or default to current date in WIB (Asia/Jakarta)
+    const effectiveUpdateDate =
+      updateDate || new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
 
     // 1. Master Data Material Catalog (Prevent duplicate codes)
     if (newMasterMaterials.length > 0) {
@@ -453,21 +553,29 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       });
     }
 
-    // 2. Transaction Lines (Preserve distinct transaction per OR)
-    const orSet = new Set(newRequirements.map((r) => r.orNumber.trim().toUpperCase()));
+    // 2. Transaction Lines (Preserve distinct transaction per OR and historical update dates)
+    // "Jika material dan Nomor OR yang sama diunggah kembali pada tanggal berbeda, simpan sebagai update/transaksi pada tanggal baru. Jangan menghapus riwayat data tanggal sebelumnya. Hindari duplikasi akibat pengulangan upload file yang sama pada tanggal yang sama."
+    const targetOrs = new Set(newRequirements.map((r) => r.orNumber.trim().toUpperCase()));
+
     setMaterialRequirements((prev) => {
-      // Remove previous lines for these specific ORs being replaced/updated to avoid duplicate re-imports
-      const otherOrLines = prev
-        .filter((r) => !orSet.has(r.orNumber.trim().toUpperCase()))
+      // Remove only previous lines for the SAME OR on the SAME updateDate (so re-uploads on the same day update that day's data)
+      // Keep earlier or later updateDates for that same OR intact for daily progress comparison!
+      const kept = prev
+        .filter((r) => {
+          const isSameOr = targetOrs.has(r.orNumber.trim().toUpperCase());
+          const isSameDate = (r.updateDate || '') === effectiveUpdateDate;
+          return !(isSameOr && isSameDate);
+        })
         .map((r) => ({ ...r, isRecentlyImported: false }));
 
       const taggedNewReqs = newRequirements.map((r) => ({
         ...r,
+        updateDate: effectiveUpdateDate,
         isRecentlyImported: true,
         importedAt: r.importedAt || new Date().toISOString(),
       }));
 
-      return [...taggedNewReqs, ...otherOrLines];
+      return [...taggedNewReqs, ...kept];
     });
 
     // 3. Save OR <-> Style relations
@@ -486,30 +594,53 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       });
     }
 
-    // 4. Record recently imported batch info
+    // 4. Save to Riwayat Update (Upload History)
     const primaryOr = newRequirements[0]?.orNumber || '';
     const primaryStyle = newRequirements[0]?.style || '';
+    const formattedTime =
+      new Intl.DateTimeFormat('id-ID', {
+        timeZone: 'Asia/Jakarta',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      }).format(new Date()) + ' WIB';
+
+    const newHistItem: UploadHistoryItem = {
+      id: `hist-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      updateDate: effectiveUpdateDate,
+      uploadTime: formattedTime,
+      orNumber: primaryOr,
+      style: primaryStyle,
+      fileName: fileName,
+      rowCount: newRequirements.length,
+      status: 'Sukses',
+      notes: `Berhasil diproses & disimpan untuk tanggal update ${effectiveUpdateDate}`,
+    };
+    setUploadHistory((prev) => [newHistItem, ...prev]);
+
+    // 5. Record recently imported batch info
     setLastImportedInfo({
       orNumber: primaryOr,
       style: primaryStyle,
       count: newRequirements.length,
+      updateDate: effectiveUpdateDate,
       timestamp: Date.now(),
     });
 
-    // 5. Add system notification
+    // 6. Add system notification
     setNotifications((prev) => [
       {
         id: `notif-${Date.now()}`,
         type: 'info',
         title: 'Hasil Pembacaan Excel Otomatis Tersimpan',
-        message: `${newRequirements.length} baris material langsung dimasukkan ke Master Data Material (OR: ${primaryOr}).`,
+        message: `${newRequirements.length} baris material (${primaryOr}) tersimpan untuk Tanggal Update: ${effectiveUpdateDate}.`,
         timestamp: 'Baru saja',
         read: false,
       },
       ...prev,
     ]);
 
-    // 6. Direct automatic navigation to Master Data Material
+    // 7. Direct automatic navigation to Master Data Material
     setActiveMenu('Rekap Material');
   };
 
@@ -519,12 +650,14 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setProductionSchedules(INITIAL_PRODUCTION_SCHEDULES);
     setMaterials(INITIAL_MATERIALS);
     setWarehouseStock(INITIAL_WAREHOUSE_STOCK);
+    setUploadHistory(INITIAL_UPLOAD_HISTORY);
     setLastImportedInfo(null);
     localStorage.removeItem(`${LOCAL_STORAGE_KEY}_or_style`);
     localStorage.removeItem(`${LOCAL_STORAGE_KEY}_requirements`);
     localStorage.removeItem(`${LOCAL_STORAGE_KEY}_schedules`);
     localStorage.removeItem(`${LOCAL_STORAGE_KEY}_materials`);
     localStorage.removeItem(`${LOCAL_STORAGE_KEY}_stock`);
+    localStorage.removeItem(`${LOCAL_STORAGE_KEY}_upload_history`);
   };
 
   return (
@@ -535,6 +668,15 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
         sidebarOpen,
         setSidebarOpen,
         toggleSidebar,
+
+        // Single Source of Truth for Registered OR Numbers
+        registeredOrNumbers,
+        searchRegisteredOrs,
+        getOrSummary,
+
+        // Upload History & Tanggal Update Tracking
+        uploadHistory,
+        addUploadHistory,
 
         orStyleRelations,
         saveOrStyleRelation,
