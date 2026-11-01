@@ -182,3 +182,15 @@ export interface ProductionSimulationConfig {
   leadTimeDelayDays: number;
   transferQcTransit: boolean;
 }
+
+export interface DeletionHistoryItem {
+  id: string;
+  timestamp: string; // e.g. '01/11/2026, 14:30:12 WIB'
+  method: 'BY_OR' | 'BY_DATE';
+  methodLabel: string; // 'Berdasarkan Nomor OR' | 'Berdasarkan Tanggal Update'
+  targetValue: string; // e.g. 'OR-2026-001' or '2026-10-25'
+  targetDetails?: string; // e.g. Style name or list of ORs
+  deletedRowCount: number;
+  affectedOrs: string[];
+  user: string;
+}
