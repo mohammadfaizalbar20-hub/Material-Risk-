@@ -267,10 +267,19 @@ export const INITIAL_MATERIAL_REQUIREMENTS: MaterialItemRequirement[] = ([
     supplierName: 'PT Sinar Mulia Lining',
     updateDate: '2026-10-25',
   },
-] as MaterialItemRequirement[]).map((r) => ({
-  ...r,
-  updateDate: r.updateDate || '2026-10-31',
-}));
+] as MaterialItemRequirement[]).map((r) => {
+  let uploadId = 'hist-01';
+  if (r.orNumber === 'OR-2026-001' && r.updateDate === '2026-10-25') uploadId = 'hist-02';
+  else if (r.orNumber === 'OR-2026-002') uploadId = 'hist-03';
+  else if (r.orNumber === 'OR-2026-003') uploadId = 'hist-04';
+  else if (r.orNumber === 'OR-2026-004') uploadId = 'hist-05';
+  else if (r.orNumber === 'OR-2026-005') uploadId = 'hist-06';
+  return {
+    ...r,
+    uploadId: r.uploadId || uploadId,
+    updateDate: r.updateDate || '2026-10-31',
+  };
+});
 
 export const INITIAL_UPLOAD_HISTORY: UploadHistoryItem[] = [
   {

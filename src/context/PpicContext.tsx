@@ -144,7 +144,11 @@ interface PpicContextType {
 
   // Master Data Deletion Feature
   deletionHistory: DeletionHistoryItem[];
-  deleteDataByOr: (orNumber: string) => { success: boolean; deletedCount: number; message: string };
+  deleteSingleRequirement: (id: string) => { success: boolean; deletedCount: number; message: string };
+  deleteMultipleRequirements: (ids: string[]) => { success: boolean; deletedCount: number; message: string };
+  deleteDataByOr: (orNumber: string, includeHistory?: boolean) => { success: boolean; deletedCount: number; message: string };
+  deleteOrHistory: (orNumber: string, targetDate?: string) => { success: boolean; deletedCount: number; message: string };
+  deleteDataByStyle: (styleName: string) => { success: boolean; deletedCount: number; message: string };
   deleteDataByUpdateDate: (updateDate: string) => {
     success: boolean;
     deletedCount: number;
@@ -164,6 +168,30 @@ interface PpicContextType {
     rowCount: number;
     affectedOrs: { orNumber: string; style: string; rowCount: number }[];
     rows: MaterialItemRequirement[];
+  };
+  getDeletionImpactByStyle: (styleName: string) => {
+    style: string;
+    rowCount: number;
+    affectedOrs: string[];
+    totalRequiredQty: number;
+    rows: MaterialItemRequirement[];
+  };
+  deleteDataByUploadId: (uploadId: string) => { success: boolean; deletedCount: number; message: string };
+  getDeletionImpactByUploadId: (uploadId: string) => {
+    uploadId: string;
+    orNumber: string;
+    style: string;
+    fileName: string;
+    updateDate: string;
+    rowCount: number;
+    rows: MaterialItemRequirement[];
+  };
+  getOrHistoryDetails: (orNumber: string) => {
+    orNumber: string;
+    style: string;
+    dates: { updateDate: string; rowCount: number; totalQty: number; fileName?: string; uploadId?: string }[];
+    totalRows: number;
+    uploadHistoryItems: UploadHistoryItem[];
   };
 }
 
@@ -345,6 +373,21 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return Array.from(set).sort();
   }, [uploadHistory, materialRequirements]);
 
+  // Timestamp formatter helper
+  const getNowWibTimestamp = () => {
+    return (
+      new Intl.DateTimeFormat('id-ID', {
+        timeZone: 'Asia/Jakarta',
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      }).format(new Date()) + ' WIB'
+    );
+  };
+
   // Impact calculation before deleting by OR
   const getDeletionImpactByOr = (orNumber: string) => {
     const clean = (orNumber || '').trim().toUpperCase();
@@ -366,7 +409,7 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
   };
 
   // Safe Deletion by OR Number
-  const deleteDataByOr = (orNumber: string) => {
+  const deleteDataByOr = (orNumber: string, includeHistory: boolean = true) => {
     const clean = (orNumber || '').trim().toUpperCase();
     const rowsToDelete = materialRequirements.filter((r) => r.orNumber.trim().toUpperCase() === clean);
     const rowCount = rowsToDelete.length;
@@ -379,33 +422,21 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // 1. Remove from materialRequirements
     setMaterialRequirements((prev) => prev.filter((r) => r.orNumber.trim().toUpperCase() !== clean));
 
-    // 2. Remove from uploadHistory
-    setUploadHistory((prev) => prev.filter((h) => h.orNumber.trim().toUpperCase() !== clean));
+    // 2. Remove from uploadHistory if requested
+    if (includeHistory) {
+      setUploadHistory((prev) => prev.filter((h) => h.orNumber.trim().toUpperCase() !== clean));
+      setOrStyleRelations((prev) => prev.filter((r) => r.orNumber.trim().toUpperCase() !== clean));
+      setProductionSchedules((prev) => prev.filter((s) => s.orNumber.trim().toUpperCase() !== clean));
+    }
 
-    // 3. Remove relation from orStyleRelations
-    setOrStyleRelations((prev) => prev.filter((r) => r.orNumber.trim().toUpperCase() !== clean));
-
-    // 4. Remove matching production schedules so no dangling invalid schedule remains
-    setProductionSchedules((prev) => prev.filter((s) => s.orNumber.trim().toUpperCase() !== clean));
-
-    // 5. Record in deletionHistory audit log
-    const nowWib = new Intl.DateTimeFormat('id-ID', {
-      timeZone: 'Asia/Jakarta',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    }).format(new Date()) + ' WIB';
-
+    // 3. Record in deletionHistory audit log
     const newRecord: DeletionHistoryItem = {
       id: `del-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      timestamp: nowWib,
+      timestamp: getNowWibTimestamp(),
       method: 'BY_OR',
-      methodLabel: 'Berdasarkan Nomor OR',
+      methodLabel: 'Hapus Berdasarkan Nomor OR',
       targetValue: clean,
-      targetDetails: `Style: ${styleName}`,
+      targetDetails: `Style: ${styleName}${includeHistory ? ' (Termasuk riwayat upload)' : ''}`,
       deletedRowCount: rowCount,
       affectedOrs: [clean],
       user: 'Tim PPIC (Terautentikasi)',
@@ -413,7 +444,7 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
     setDeletionHistory((prev) => [newRecord, ...prev]);
 
-    // 6. System notification
+    // 4. System notification
     setNotifications((prev) => [
       {
         id: `notif-${Date.now()}`,
@@ -431,6 +462,349 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       deletedCount: rowCount,
       message: `Data transaksi ${clean} (${rowCount} baris material) berhasil dihapus permanen.`,
     };
+  };
+
+  // Safe Deletion of a single material requirement row
+  const deleteSingleRequirement = (id: string) => {
+    const target = materialRequirements.find((r) => r.id === id);
+    if (!target) {
+      return { success: false, deletedCount: 0, message: 'Baris material tidak ditemukan.' };
+    }
+
+    setMaterialRequirements((prev) => prev.filter((r) => r.id !== id));
+
+    const orClean = target.orNumber.trim().toUpperCase();
+    const otherReqs = materialRequirements.filter((r) => r.id !== id && r.orNumber.trim().toUpperCase() === orClean);
+    const hasHistory = uploadHistory.some((h) => h.orNumber.trim().toUpperCase() === orClean);
+    if (otherReqs.length === 0 && !hasHistory) {
+      setOrStyleRelations((prev) => prev.filter((r) => r.orNumber.trim().toUpperCase() !== orClean));
+    }
+
+    const newRecord: DeletionHistoryItem = {
+      id: `del-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      timestamp: getNowWibTimestamp(),
+      method: 'BY_ROW',
+      methodLabel: 'Hapus Satu Baris Material',
+      targetValue: `${target.materialCode} (${target.materialName})`,
+      targetDetails: `No. OR: ${target.orNumber} | Style: ${target.style} | Tanggal: ${target.updateDate || '2026-10-31'}`,
+      deletedRowCount: 1,
+      affectedOrs: [orClean],
+      user: 'Tim PPIC (Terautentikasi)',
+    };
+    setDeletionHistory((prev) => [newRecord, ...prev]);
+
+    setNotifications((prev) => [
+      {
+        id: `notif-${Date.now()}`,
+        type: 'warning',
+        title: 'Penghapusan Baris Material Berhasil',
+        message: `Baris material ${target.materialCode} untuk OR ${target.orNumber} telah dihapus permanen.`,
+        timestamp: 'Baru saja',
+        read: false,
+      },
+      ...prev,
+    ]);
+
+    return {
+      success: true,
+      deletedCount: 1,
+      message: `Baris material ${target.materialCode} (${target.materialName}) berhasil dihapus.`,
+    };
+  };
+
+  // Safe Deletion of multiple selected material requirement rows
+  const deleteMultipleRequirements = (ids: string[]) => {
+    if (ids.length === 0) {
+      return { success: false, deletedCount: 0, message: 'Tidak ada baris material yang dipilih.' };
+    }
+    const idSet = new Set(ids);
+    const targets = materialRequirements.filter((r) => idSet.has(r.id));
+    const count = targets.length;
+    const affectedOrs = Array.from(new Set(targets.map((r) => r.orNumber.trim().toUpperCase())));
+
+    setMaterialRequirements((prev) => prev.filter((r) => !idSet.has(r.id)));
+
+    setOrStyleRelations((prev) => {
+      const remainingOrs = new Set<string>();
+      materialRequirements
+        .filter((r) => !idSet.has(r.id))
+        .forEach((r) => remainingOrs.add(r.orNumber.trim().toUpperCase()));
+      uploadHistory.forEach((h) => remainingOrs.add(h.orNumber.trim().toUpperCase()));
+      return prev.filter((rel) => remainingOrs.has(rel.orNumber.trim().toUpperCase()));
+    });
+
+    const newRecord: DeletionHistoryItem = {
+      id: `del-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      timestamp: getNowWibTimestamp(),
+      method: 'BATCH_SELECTED',
+      methodLabel: 'Hapus Data Pilihan',
+      targetValue: `${count} Baris Terpilih`,
+      targetDetails: `OR Terdampak: ${affectedOrs.join(', ')}`,
+      deletedRowCount: count,
+      affectedOrs,
+      user: 'Tim PPIC (Terautentikasi)',
+    };
+    setDeletionHistory((prev) => [newRecord, ...prev]);
+
+    setNotifications((prev) => [
+      {
+        id: `notif-${Date.now()}`,
+        type: 'warning',
+        title: 'Penghapusan Data Terpilih Berhasil',
+        message: `${count} baris transaksi material telah berhasil dihapus permanen.`,
+        timestamp: 'Baru saja',
+        read: false,
+      },
+      ...prev,
+    ]);
+
+    return {
+      success: true,
+      deletedCount: count,
+      message: `${count} baris material terpilih berhasil dihapus permanen.`,
+    };
+  };
+
+  // Deletion by Style
+  const getDeletionImpactByStyle = (styleName: string) => {
+    const cleanStyle = (styleName || '').trim().toLowerCase();
+    const rows = materialRequirements.filter((r) => (r.style || '').trim().toLowerCase() === cleanStyle);
+    const affectedOrs = Array.from(new Set(rows.map((r) => r.orNumber.trim().toUpperCase())));
+    const totalRequiredQty = rows.reduce((acc, r) => acc + (r.requiredQty || 0), 0);
+
+    return {
+      style: styleName.trim(),
+      rowCount: rows.length,
+      affectedOrs,
+      totalRequiredQty,
+      rows,
+    };
+  };
+
+  const deleteDataByStyle = (styleName: string) => {
+    const cleanStyle = (styleName || '').trim().toLowerCase();
+    const rowsToDelete = materialRequirements.filter((r) => (r.style || '').trim().toLowerCase() === cleanStyle);
+    const count = rowsToDelete.length;
+
+    if (count === 0) {
+      return { success: false, deletedCount: 0, message: `Tidak ditemukan transaksi untuk Style "${styleName}".` };
+    }
+
+    const affectedOrs = Array.from(new Set(rowsToDelete.map((r) => r.orNumber.trim().toUpperCase())));
+
+    setMaterialRequirements((prev) => prev.filter((r) => (r.style || '').trim().toLowerCase() !== cleanStyle));
+    setOrStyleRelations((prev) => prev.filter((r) => r.style.trim().toLowerCase() !== cleanStyle));
+
+    const newRecord: DeletionHistoryItem = {
+      id: `del-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      timestamp: getNowWibTimestamp(),
+      method: 'BY_STYLE',
+      methodLabel: 'Hapus Berdasarkan Style',
+      targetValue: styleName.trim(),
+      targetDetails: `OR Terdampak: ${affectedOrs.join(', ') || '-'}`,
+      deletedRowCount: count,
+      affectedOrs,
+      user: 'Tim PPIC (Terautentikasi)',
+    };
+    setDeletionHistory((prev) => [newRecord, ...prev]);
+
+    setNotifications((prev) => [
+      {
+        id: `notif-${Date.now()}`,
+        type: 'warning',
+        title: 'Penghapusan Berdasarkan Style Berhasil',
+        message: `Transaksi untuk Style "${styleName}" (${count} baris) telah berhasil dihapus.`,
+        timestamp: 'Baru saja',
+        read: false,
+      },
+      ...prev,
+    ]);
+
+    return {
+      success: true,
+      deletedCount: count,
+      message: `Data transaksi untuk Style "${styleName}" (${count} baris) berhasil dihapus.`,
+    };
+  };
+
+  // OR History Details & Deletion
+  const getOrHistoryDetails = (orNumber: string) => {
+    const clean = (orNumber || '').trim().toUpperCase();
+    const rows = materialRequirements.filter((r) => r.orNumber.trim().toUpperCase() === clean);
+    const styleName = getStyleForOr(clean) || rows[0]?.style || '-';
+    const datesSet = Array.from(new Set(rows.map((r) => r.updateDate || '2026-10-31'))).sort().reverse();
+
+    const dates = datesSet.map((d) => {
+      const dateRows = rows.filter((r) => (r.updateDate || '2026-10-31') === d);
+      const totalQty = dateRows.reduce((acc, r) => acc + (r.requiredQty || 0), 0);
+      const hist = uploadHistory.find((h) => h.orNumber.trim().toUpperCase() === clean && h.updateDate === d);
+      return {
+        updateDate: d,
+        rowCount: dateRows.length,
+        totalQty,
+        fileName: hist?.fileName,
+        uploadId: hist?.id || dateRows[0]?.uploadId,
+      };
+    });
+
+    const relatedHistory = uploadHistory.filter((h) => h.orNumber.trim().toUpperCase() === clean);
+
+    return {
+      orNumber: clean,
+      style: styleName,
+      dates,
+      totalRows: rows.length,
+      uploadHistoryItems: relatedHistory,
+    };
+  };
+
+  const getDeletionImpactByUploadId = (uploadId: string) => {
+    const uploadItem = uploadHistory.find((h) => h.id === uploadId);
+    const rows = materialRequirements.filter((r) => r.uploadId === uploadId);
+    const orNumber = uploadItem?.orNumber || rows[0]?.orNumber || '-';
+    const style = uploadItem?.style || rows[0]?.style || '-';
+    const fileName = uploadItem?.fileName || 'File Excel';
+    const updateDate = uploadItem?.updateDate || rows[0]?.updateDate || '-';
+
+    return {
+      uploadId,
+      orNumber,
+      style,
+      fileName,
+      updateDate,
+      rowCount: rows.length,
+      rows,
+    };
+  };
+
+  const deleteDataByUploadId = (uploadId: string) => {
+    const uploadItem = uploadHistory.find((h) => h.id === uploadId);
+    const rowsToDelete = materialRequirements.filter((r) => r.uploadId === uploadId);
+    const rowCount = rowsToDelete.length;
+    const orNumber = uploadItem?.orNumber || rowsToDelete[0]?.orNumber || '-';
+
+    setMaterialRequirements((prev) => prev.filter((r) => r.uploadId !== uploadId));
+    setUploadHistory((prev) => prev.filter((h) => h.id !== uploadId));
+
+    // Clean relations if OR has no remaining rows and no upload history
+    setOrStyleRelations((prev) => {
+      const remainingOrs = new Set<string>();
+      materialRequirements
+        .filter((r) => r.uploadId !== uploadId)
+        .forEach((r) => remainingOrs.add(r.orNumber.trim().toUpperCase()));
+      uploadHistory
+        .filter((h) => h.id !== uploadId)
+        .forEach((h) => remainingOrs.add(h.orNumber.trim().toUpperCase()));
+      return prev.filter((rel) => remainingOrs.has(rel.orNumber.trim().toUpperCase()));
+    });
+
+    const newRecord: DeletionHistoryItem = {
+      id: `del-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      timestamp: getNowWibTimestamp(),
+      method: 'BY_UPLOAD',
+      methodLabel: 'Hapus Satu Riwayat Upload File',
+      targetValue: uploadItem?.fileName || uploadId,
+      targetDetails: `OR: ${orNumber} | Tanggal: ${uploadItem?.updateDate || '-'} | ${rowCount} Baris Material`,
+      deletedRowCount: rowCount,
+      affectedOrs: [orNumber],
+      user: 'Tim PPIC (Terautentikasi)',
+    };
+    setDeletionHistory((prev) => [newRecord, ...prev]);
+
+    setNotifications((prev) => [
+      {
+        id: `notif-${Date.now()}`,
+        type: 'warning',
+        title: 'Riwayat Upload File Dihapus',
+        message: `File ${uploadItem?.fileName || uploadId} (${rowCount} baris material untuk ${orNumber}) telah dihapus.`,
+        timestamp: 'Baru saja',
+        read: false,
+      },
+      ...prev,
+    ]);
+
+    return {
+      success: true,
+      deletedCount: rowCount,
+      message: `Riwayat upload ${uploadItem?.fileName || uploadId} (${rowCount} baris material) berhasil dihapus.`,
+    };
+  };
+
+  const deleteOrHistory = (orNumber: string, targetDate?: string) => {
+    const clean = (orNumber || '').trim().toUpperCase();
+    const isSpecificDate = targetDate && targetDate !== 'ALL';
+
+    if (isSpecificDate) {
+      const rowsToDelete = materialRequirements.filter(
+        (r) => r.orNumber.trim().toUpperCase() === clean && (r.updateDate || '2026-10-31') === targetDate
+      );
+      const rowCount = rowsToDelete.length;
+
+      setMaterialRequirements((prev) =>
+        prev.filter(
+          (r) => !(r.orNumber.trim().toUpperCase() === clean && (r.updateDate || '2026-10-31') === targetDate)
+        )
+      );
+
+      setUploadHistory((prev) =>
+        prev.filter((h) => !(h.orNumber.trim().toUpperCase() === clean && h.updateDate === targetDate))
+      );
+
+      // Check if OR has any remaining rows
+      const remainingForOr = materialRequirements.filter(
+        (r) => r.orNumber.trim().toUpperCase() === clean && (r.updateDate || '2026-10-31') !== targetDate
+      );
+      if (remainingForOr.length === 0) {
+        setOrStyleRelations((prev) => prev.filter((r) => r.orNumber.trim().toUpperCase() !== clean));
+      }
+
+      const newRecord: DeletionHistoryItem = {
+        id: `del-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        timestamp: getNowWibTimestamp(),
+        method: 'OR_HISTORY',
+        methodLabel: 'Hapus Riwayat OR (Tanggal Tertentu)',
+        targetValue: `${clean} (${targetDate})`,
+        targetDetails: `Dihapus ${rowCount} baris pada tanggal ${targetDate}. Tanggal lain tetap aman.`,
+        deletedRowCount: rowCount,
+        affectedOrs: [clean],
+        user: 'Tim PPIC (Terautentikasi)',
+      };
+      setDeletionHistory((prev) => [newRecord, ...prev]);
+
+      return {
+        success: true,
+        deletedCount: rowCount,
+        message: `Riwayat OR ${clean} pada tanggal ${targetDate} (${rowCount} baris) berhasil dihapus.`,
+      };
+    } else {
+      // Delete all history for this OR
+      const rowsToDelete = materialRequirements.filter((r) => r.orNumber.trim().toUpperCase() === clean);
+      const rowCount = rowsToDelete.length;
+
+      setMaterialRequirements((prev) => prev.filter((r) => r.orNumber.trim().toUpperCase() !== clean));
+      setUploadHistory((prev) => prev.filter((h) => h.orNumber.trim().toUpperCase() !== clean));
+      setOrStyleRelations((prev) => prev.filter((r) => r.orNumber.trim().toUpperCase() !== clean));
+      setProductionSchedules((prev) => prev.filter((s) => s.orNumber.trim().toUpperCase() !== clean));
+
+      const newRecord: DeletionHistoryItem = {
+        id: `del-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+        timestamp: getNowWibTimestamp(),
+        method: 'OR_HISTORY',
+        methodLabel: 'Hapus Seluruh Riwayat OR',
+        targetValue: clean,
+        targetDetails: `Seluruh transaksi (${rowCount} baris) dan riwayat upload dihapus.`,
+        deletedRowCount: rowCount,
+        affectedOrs: [clean],
+        user: 'Tim PPIC (Terautentikasi)',
+      };
+      setDeletionHistory((prev) => [newRecord, ...prev]);
+
+      return {
+        success: true,
+        deletedCount: rowCount,
+        message: `Seluruh riwayat OR ${clean} (${rowCount} baris transaksi) berhasil dihapus permanen.`,
+      };
+    }
   };
 
   // Impact calculation before deleting by Tanggal Update
@@ -497,21 +871,11 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     });
 
     // 4. Record in deletionHistory audit log
-    const nowWib = new Intl.DateTimeFormat('id-ID', {
-      timeZone: 'Asia/Jakarta',
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    }).format(new Date()) + ' WIB';
-
     const newRecord: DeletionHistoryItem = {
       id: `del-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      timestamp: nowWib,
+      timestamp: getNowWibTimestamp(),
       method: 'BY_DATE',
-      methodLabel: 'Berdasarkan Tanggal Update',
+      methodLabel: 'Hapus Berdasarkan Tanggal Update',
       targetValue: cleanDate,
       targetDetails: `OR Terdampak: ${affectedOrsList.join(', ') || '-'}`,
       deletedRowCount: rowCount,
@@ -801,32 +1165,30 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       });
     }
 
-    // 2. Transaction Lines (Preserve distinct transaction per OR and historical update dates)
-    // "Jika material dan Nomor OR yang sama diunggah kembali pada tanggal berbeda, simpan sebagai update/transaksi pada tanggal baru. Jangan menghapus riwayat data tanggal sebelumnya. Hindari duplikasi akibat pengulangan upload file yang sama pada tanggal yang sama."
-    const targetOrs = new Set(newRequirements.map((r) => r.orNumber.trim().toUpperCase()));
+    // 2. Transaction Lines (1 Upload = 1 OR = N Material Details)
+    const uploadId = `upload-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    const primaryOr = (newRequirements[0]?.orNumber || '').trim().toUpperCase();
+    const primaryStyle = (newRequirements[0]?.style || '').trim();
 
     setMaterialRequirements((prev) => {
-      // Remove only previous lines for the SAME OR on the SAME updateDate (so re-uploads on the same day update that day's data)
-      // Keep earlier or later updateDates for that same OR intact for daily progress comparison!
-      const kept = prev
-        .filter((r) => {
-          const isSameOr = targetOrs.has(r.orNumber.trim().toUpperCase());
-          const isSameDate = (r.updateDate || '') === effectiveUpdateDate;
-          return !(isSameOr && isSameDate);
-        })
-        .map((r) => ({ ...r, isRecentlyImported: false }));
-
-      const taggedNewReqs = newRequirements.map((r) => ({
+      const taggedNewReqs = newRequirements.map((r, idx) => ({
         ...r,
+        id: r.id && !r.id.startsWith('temp-') ? r.id : `req-${Date.now()}-${idx}-${Math.floor(Math.random() * 1000)}`,
+        uploadId,
+        orNumber: primaryOr,
+        style: primaryStyle,
         updateDate: effectiveUpdateDate,
         isRecentlyImported: true,
         importedAt: r.importedAt || new Date().toISOString(),
       }));
 
-      return [...taggedNewReqs, ...kept];
+      return [...taggedNewReqs, ...prev.map((r) => ({ ...r, isRecentlyImported: false }))];
     });
 
     // 3. Save OR <-> Style relations
+    if (primaryOr && primaryStyle) {
+      saveOrStyleRelation(primaryOr, primaryStyle);
+    }
     if (newRelations.length > 0) {
       setOrStyleRelations((prev) => {
         const map = new Map(
@@ -842,9 +1204,7 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       });
     }
 
-    // 4. Save to Riwayat Update (Upload History)
-    const primaryOr = newRequirements[0]?.orNumber || '';
-    const primaryStyle = newRequirements[0]?.style || '';
+    // 4. Save to Riwayat Update (Upload History / Snapshot Header)
     const formattedTime =
       new Intl.DateTimeFormat('id-ID', {
         timeZone: 'Asia/Jakarta',
@@ -854,7 +1214,7 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }).format(new Date()) + ' WIB';
 
     const newHistItem: UploadHistoryItem = {
-      id: `hist-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
+      id: uploadId,
       updateDate: effectiveUpdateDate,
       uploadTime: formattedTime,
       orNumber: primaryOr,
@@ -862,7 +1222,7 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       fileName: fileName,
       rowCount: newRequirements.length,
       status: 'Sukses',
-      notes: `Berhasil diproses & disimpan untuk tanggal update ${effectiveUpdateDate}`,
+      notes: `Berhasil diproses & disimpan (${newRequirements.length} baris material)`,
     };
     setUploadHistory((prev) => [newHistItem, ...prev]);
 
@@ -930,10 +1290,18 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
         // Master Data Deletion Feature
         deletionHistory,
+        deleteSingleRequirement,
+        deleteMultipleRequirements,
         deleteDataByOr,
+        deleteOrHistory,
+        deleteDataByStyle,
         deleteDataByUpdateDate,
         getDeletionImpactByOr,
         getDeletionImpactByDate,
+        getDeletionImpactByStyle,
+        deleteDataByUploadId,
+        getDeletionImpactByUploadId,
+        getOrHistoryDetails,
 
         orStyleRelations,
         saveOrStyleRelation,

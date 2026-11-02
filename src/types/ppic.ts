@@ -62,6 +62,7 @@ export interface MaterialItemRequirement {
   isRecentlyImported?: boolean;
   importedAt?: string;
   updateDate?: string; // YYYY-MM-DD (WIB) - Tanggal Update
+  uploadId?: string; // ID Upload from parent UploadHistoryItem (1 Upload = 1 OR = N Material Details)
 }
 
 export interface UploadHistoryItem {
@@ -186,9 +187,9 @@ export interface ProductionSimulationConfig {
 export interface DeletionHistoryItem {
   id: string;
   timestamp: string; // e.g. '01/11/2026, 14:30:12 WIB'
-  method: 'BY_OR' | 'BY_DATE';
-  methodLabel: string; // 'Berdasarkan Nomor OR' | 'Berdasarkan Tanggal Update'
-  targetValue: string; // e.g. 'OR-2026-001' or '2026-10-25'
+  method: 'BY_OR' | 'BY_DATE' | 'BY_STYLE' | 'BY_ROW' | 'BATCH_SELECTED' | 'OR_HISTORY' | 'BY_UPLOAD';
+  methodLabel: string; // 'Berdasarkan Nomor OR' | 'Berdasarkan Tanggal Update' | 'Berdasarkan Style' | etc.
+  targetValue: string; // e.g. 'OR-2026-001' or '2026-10-25' or 'Bomber Jacket'
   targetDetails?: string; // e.g. Style name or list of ORs
   deletedRowCount: number;
   affectedOrs: string[];

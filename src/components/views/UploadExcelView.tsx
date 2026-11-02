@@ -112,13 +112,45 @@ export const UploadExcelView: React.FC = () => {
     setOrInputFeedback(`Nomor OR "${selectedOr}" dipilih untuk style "${matchedStyle || style}".`);
   };
 
-  // Immediate, fully automated Excel parsing & auto-storage into Master Data Material
+  // Temporary Preview State (Tahap 2 & 3: Does NOT write to DB before user confirmation)
+  interface UploadPreviewData {
+    fileName: string;
+    orNumber: string;
+    style: string;
+    updateDate: string;
+    rows: Array<{
+      materialCode: string;
+      materialName: string;
+      category: any;
+      unit: any;
+      requiredQty: number;
+      receivedQty: number;
+      shortage: number;
+      isReady: boolean;
+      statusLabel: string;
+      unitPrice: number;
+      supplierName?: string;
+    }>;
+    parsedResult: any;
+    summary: {
+      totalRows: number;
+      validRows: number;
+      failedRows: number;
+      totalRequired: number;
+      totalReceived: number;
+    };
+  }
+
+  const [previewData, setPreviewData] = useState<UploadPreviewData | null>(null);
+
+  // Tahap 2: Pembacaan Excel ke state sementara (Tanpa menyimpan ke database)
   const handleFileUpload = (file: File) => {
     setErrorMessage(null);
+    setStatusMessage(null);
 
     // Validation: Tanggal Update is mandatory
     if (!updateDate) {
-      setErrorMessage('Tanggal Update wajib diisi sebelum file Excel diproses dan disimpan!');
+      setErrorMessage('Tanggal Update wajib diisi sebelum file Excel diproses!');
       return;
     }
 
@@ -130,7 +162,7 @@ export const UploadExcelView: React.FC = () => {
 
     setFileName(file.name);
     setIsProcessing(true);
-    setStatusMessage('Membaca berkas Excel dan memproses kolom material...');
+    setStatusMessage('Membaca berkas Excel ke memori sementara (Belum disimpan ke database)...');
 
     const reader = new FileReader();
     reader.onload = (e) => {
@@ -147,28 +179,50 @@ export const UploadExcelView: React.FC = () => {
           return;
         }
 
-        // Automatic parsing with full support for:
-        // - Order Lines/Product/Display Name
-        // - Order Lines/Quantity
-        // - Order Lines/Received Qty
-        // - Order Lines/Product Unit of Measure/Display Name
-        // - Master Data Material reference matching
-        // - Tanggal Update tagging
-        const result = parseExcelRowsToMaterials(rawJson, materials, orNumber, style, updateDate);
+        // Parse rows using manual user OR & Style (PO numbers in file are ignored)
+        const cleanOr = orNumber.trim().toUpperCase();
+        const cleanStyle = style.trim();
+        const result = parseExcelRowsToMaterials(rawJson, materials, cleanOr, cleanStyle, updateDate);
 
-        // Immediate automatic storage into Master Data Material with date and upload history
-        autoSaveExcelMaterials({
-          newRequirements: result.requirements,
-          newMasterMaterials: result.newMasterMaterials,
-          newRelations: result.relations,
-          updateDate: updateDate,
+        const rowsWithStatus = result.requirements.map((r) => {
+          const shortage = r.receivedQty - r.requiredQty;
+          const isReady = shortage >= 0;
+          return {
+            ...r,
+            orNumber: cleanOr,
+            style: cleanStyle,
+            shortage,
+            isReady,
+            statusLabel: isReady ? 'READY' : 'BELUM READY',
+          };
+        });
+
+        const totalRequired = rowsWithStatus.reduce((acc, r) => acc + (r.requiredQty || 0), 0);
+        const totalReceived = rowsWithStatus.reduce((acc, r) => acc + (r.receivedQty || 0), 0);
+        const failedRows = Math.max(0, rawJson.length - rowsWithStatus.length);
+
+        // Tahap 3: Set preview data (Database remains untouched!)
+        setPreviewData({
           fileName: file.name,
+          orNumber: cleanOr,
+          style: cleanStyle,
+          updateDate: updateDate,
+          rows: rowsWithStatus,
+          parsedResult: {
+            ...result,
+            requirements: rowsWithStatus,
+          },
+          summary: {
+            totalRows: rawJson.length,
+            validRows: rowsWithStatus.length,
+            failedRows,
+            totalRequired,
+            totalReceived,
+          },
         });
 
         setIsProcessing(false);
-        setStatusMessage(
-          `Sukses! ${result.summary.validRows} baris material berhasil dibaca dan otomatis disimpan ke Master Data Material (Tanggal Update: ${updateDate}). Mengarahkan...`
-        );
+        setStatusMessage(null);
       } catch (err: any) {
         console.error(err);
         setIsProcessing(false);
@@ -178,9 +232,50 @@ export const UploadExcelView: React.FC = () => {
     reader.readAsBinaryString(file);
   };
 
-  // 1-Click Load Realistic Sample Excel Data directly into Master Data Material
+  // Tahap 4: Pembatalan Preview (Membuang data sementara, database tidak berubah sama sekali)
+  const handleCancelPreview = () => {
+    setPreviewData(null);
+    setFileName(null);
+    setStatusMessage('Proses upload dibatalkan. Tidak ada data yang disimpan ke database.');
+    setErrorMessage(null);
+  };
+
+  // Tahap 4 & 5: Konfirmasi dan Penyimpanan Atomik ke Database
+  const handleConfirmAndSave = () => {
+    if (!previewData) return;
+
+    setIsProcessing(true);
+    setStatusMessage('Menyimpan transaksi material dan memperbarui Master Data...');
+
+    try {
+      autoSaveExcelMaterials({
+        newRequirements: previewData.parsedResult.requirements,
+        newMasterMaterials: previewData.parsedResult.newMasterMaterials,
+        newRelations: previewData.parsedResult.relations,
+        updateDate: previewData.updateDate,
+        fileName: previewData.fileName,
+      });
+
+      const savedCount = previewData.rows.length;
+      const savedOr = previewData.orNumber;
+      const savedDate = previewData.updateDate;
+
+      setPreviewData(null);
+      setIsProcessing(false);
+      setStatusMessage(
+        `Sukses! ${savedCount} baris material untuk ${savedOr} berhasil disimpan ke Master Data Material (Tanggal Update: ${savedDate}).`
+      );
+    } catch (err: any) {
+      console.error(err);
+      setIsProcessing(false);
+      setErrorMessage(`Gagal menyimpan data: ${err.message || 'Terjadi kesalahan sistem'}`);
+    }
+  };
+
+  // 1-Click Load Realistic Sample Excel Data ke Tahap Preview
   const loadRealisticSampleExcel = () => {
     setErrorMessage(null);
+    setStatusMessage(null);
     if (!updateDate) {
       setErrorMessage('Tanggal Update wajib diisi sebelum memuat data!');
       return;
@@ -192,7 +287,7 @@ export const UploadExcelView: React.FC = () => {
     setStyle(targetStyle);
     setFileName('PPIC_Order_Lines_Odoo_ERP.xlsx');
     setIsProcessing(true);
-    setStatusMessage('Memuat dataset Excel realistis ERP (Order Lines)...');
+    setStatusMessage('Membaca dataset Excel realistis ERP ke tahap preview...');
 
     const sampleRows = [
       {
@@ -239,16 +334,44 @@ export const UploadExcelView: React.FC = () => {
 
     setTimeout(() => {
       const result = parseExcelRowsToMaterials(sampleRows, materials, targetOr, targetStyle, updateDate);
-      autoSaveExcelMaterials({
-        newRequirements: result.requirements,
-        newMasterMaterials: result.newMasterMaterials,
-        newRelations: result.relations,
-        updateDate: updateDate,
-        fileName: 'PPIC_Order_Lines_Odoo_ERP.xlsx',
+      const rowsWithStatus = result.requirements.map((r) => {
+        const shortage = r.receivedQty - r.requiredQty;
+        const isReady = shortage >= 0;
+        return {
+          ...r,
+          orNumber: targetOr,
+          style: targetStyle,
+          shortage,
+          isReady,
+          statusLabel: isReady ? 'READY' : 'BELUM READY',
+        };
       });
+
+      const totalRequired = rowsWithStatus.reduce((acc, r) => acc + (r.requiredQty || 0), 0);
+      const totalReceived = rowsWithStatus.reduce((acc, r) => acc + (r.receivedQty || 0), 0);
+
+      setPreviewData({
+        fileName: 'PPIC_Order_Lines_Odoo_ERP.xlsx',
+        orNumber: targetOr,
+        style: targetStyle,
+        updateDate: updateDate,
+        rows: rowsWithStatus,
+        parsedResult: {
+          ...result,
+          requirements: rowsWithStatus,
+        },
+        summary: {
+          totalRows: sampleRows.length,
+          validRows: rowsWithStatus.length,
+          failedRows: 0,
+          totalRequired,
+          totalReceived,
+        },
+      });
+
       setIsProcessing(false);
-      setStatusMessage(`Berhasil memuat ${result.summary.validRows} baris material contoh ke Master Data Material.`);
-    }, 400);
+      setStatusMessage(null);
+    }, 300);
   };
 
   // Save relation only button
@@ -536,7 +659,7 @@ export const UploadExcelView: React.FC = () => {
                 2. Tarik & Lepas File Excel di Sini
               </h3>
               <p className="text-xs text-slate-500 leading-relaxed">
-                Mendukung .xlsx, .xls, atau .csv. Data otomatis disimpan ke <strong>Master Data Material</strong> dengan Tanggal Update: <strong className="text-blue-700">{updateDate}</strong> tanpa perlu koreksi manual.
+                Mendukung .xlsx, .xls, atau .csv. File akan dibaca ke <strong>tahap preview</strong> terlebih dahulu untuk diperiksa sebelum dikonfirmasi dan disimpan ke database.
               </p>
 
               <div className="pt-2 flex items-center justify-center gap-3">
@@ -560,7 +683,7 @@ export const UploadExcelView: React.FC = () => {
               {fileName && (
                 <div className="mt-3 p-2 bg-blue-50 border border-blue-200 rounded text-xs text-blue-800 font-medium inline-flex items-center gap-1.5">
                   <FileCheck className="w-4 h-4 text-blue-600" />
-                  Berkas Terakhir: <strong>{fileName}</strong>
+                  Berkas Terpilih: <strong>{fileName}</strong>
                 </div>
               )}
             </div>
@@ -572,18 +695,17 @@ export const UploadExcelView: React.FC = () => {
           <div>
             <div className="flex items-center gap-2 text-slate-900 font-bold text-sm mb-2">
               <Database className="w-4 h-4 text-blue-600" />
-              Simulasi Data Excel ERP (1-Klik)
+              Simulasi Data Excel ERP (1-Klik ke Preview)
             </div>
             <p className="text-xs text-slate-600 leading-relaxed">
-              Uji langsung alur pembacaan dan pencatatan tanggal harian menggunakan sampel riil struktur kolom <code>Order Lines</code> Odoo ERP.
+              Uji coba alur pembacaan ke tahap preview menggunakan sampel data realistis ERP. Data tidak akan langsung disimpan ke database sebelum Anda menekan tombol konfirmasi.
             </p>
 
             <div className="mt-4 p-3 bg-slate-50 rounded border border-slate-100 text-[11px] text-slate-600 space-y-1.5">
               <div className="font-semibold text-slate-800">Detail Simulasi:</div>
-              <div>• Tanggal Update Aktif: <strong className="font-mono text-blue-700">{updateDate}</strong></div>
-              <div>• Kolom: <code>Order Lines/Product/Display Name</code></div>
-              <div>• Kolom: <code>Order Lines/Quantity</code> & <code>Received Qty</code></div>
-              <div>• Disimpan ke Riwayat Update & Master Data</div>
+              <div>• Tanggal Update: <strong className="font-mono text-blue-700">{updateDate}</strong></div>
+              <div>• Nomor OR: <strong className="font-mono text-blue-700">{orNumber || 'OR-2026-088'}</strong></div>
+              <div>• 1 File Excel = Tepat 1 OR (Seluruh baris terhubung)</div>
             </div>
           </div>
 
@@ -594,11 +716,190 @@ export const UploadExcelView: React.FC = () => {
               className="w-full py-2.5 px-3 bg-slate-900 hover:bg-slate-800 text-white font-semibold text-xs rounded-md shadow-xs transition-colors flex items-center justify-center gap-2 cursor-pointer"
             >
               <RefreshCw className={`w-3.5 h-3.5 text-blue-400 ${isProcessing ? 'animate-spin' : ''}`} />
-              Muat & Simpan Otomatis Sampel ERP
+              Muat Sampel ke Tahap Preview
             </button>
           </div>
         </div>
       </div>
+
+      {/* TAHAP 3 & 4: PREVIEW DATA & KONFIRMASI PENGGUNA (WAJIB DITAMPILKAN SEBELUM SIMPAN) */}
+      {previewData && (
+        <div className="bg-white rounded-xl border-2 border-blue-400 shadow-lg p-5 space-y-5 animate-in fade-in duration-200">
+          <div className="flex flex-col md:flex-row md:items-center justify-between pb-4 border-b border-slate-200 gap-3">
+            <div>
+              <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded text-[11px] font-bold bg-amber-100 text-amber-900 border border-amber-300 mb-1">
+                <Clock className="w-3.5 h-3.5 text-amber-700" />
+                Tahap 3 & 4: Preview Data & Konfirmasi Pengguna
+              </div>
+              <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                <span>Hasil Pembacaan Excel (Belum Tersimpan ke Database)</span>
+              </h3>
+              <p className="text-xs text-slate-500 mt-0.5">
+                Periksa kesesuaian data material di bawah ini. Data hanya akan disimpan ke database setelah Anda menekan tombol <strong>Konfirmasi dan Simpan</strong>.
+              </p>
+            </div>
+
+            <div className="flex items-center gap-3">
+              <button
+                type="button"
+                onClick={handleCancelPreview}
+                disabled={isProcessing}
+                className="px-4 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-red-50 hover:text-red-700 hover:border-red-300 border border-slate-300 rounded-md transition-colors cursor-pointer"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmAndSave}
+                disabled={isProcessing}
+                className="px-4 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-md shadow-xs transition-colors flex items-center gap-1.5 cursor-pointer"
+              >
+                <CheckCircle className="w-4 h-4 text-emerald-100" />
+                {isProcessing ? 'Menyimpan...' : 'Konfirmasi dan Simpan'}
+              </button>
+            </div>
+          </div>
+
+          {/* Metadata & Summary Cards */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-6 gap-3 text-xs">
+            <div className="p-3 bg-slate-50 rounded-lg border border-slate-200">
+              <span className="text-[11px] text-slate-500 block mb-0.5">Nama File Excel</span>
+              <span className="font-mono font-bold text-slate-800 truncate block text-[11px]" title={previewData.fileName}>
+                {previewData.fileName}
+              </span>
+            </div>
+            <div className="p-3 bg-blue-50/60 rounded-lg border border-blue-200">
+              <span className="text-[11px] text-blue-700 block mb-0.5">Nomor OR (Input Manual)</span>
+              <span className="font-mono font-bold text-blue-900 block text-xs">
+                {previewData.orNumber}
+              </span>
+            </div>
+            <div className="p-3 bg-slate-50 rounded-lg border border-slate-200">
+              <span className="text-[11px] text-slate-500 block mb-0.5">Style (Input Manual)</span>
+              <span className="font-semibold text-slate-800 truncate block text-xs" title={previewData.style}>
+                {previewData.style || '-'}
+              </span>
+            </div>
+            <div className="p-3 bg-slate-50 rounded-lg border border-slate-200">
+              <span className="text-[11px] text-slate-500 block mb-0.5">Tanggal Update</span>
+              <span className="font-mono font-bold text-slate-800 block text-xs">
+                {previewData.updateDate}
+              </span>
+            </div>
+            <div className="p-3 bg-emerald-50/70 rounded-lg border border-emerald-200">
+              <span className="text-[11px] text-emerald-700 block mb-0.5">Baris Berhasil / Gagal</span>
+              <span className="font-mono font-bold text-emerald-900 block text-xs">
+                {previewData.summary.validRows} / {previewData.summary.failedRows}
+              </span>
+            </div>
+            <div className="p-3 bg-slate-50 rounded-lg border border-slate-200">
+              <span className="text-[11px] text-slate-500 block mb-0.5">Total Kebutuhan / Diterima</span>
+              <span className="font-mono font-bold text-slate-800 block text-xs">
+                {previewData.summary.totalRequired.toLocaleString('id-ID')} / {previewData.summary.totalReceived.toLocaleString('id-ID')}
+              </span>
+            </div>
+          </div>
+
+          {/* Informational Safety Banner */}
+          <div className="p-3 bg-amber-50/80 border border-amber-200 rounded-lg text-xs text-amber-900 flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <AlertCircle className="w-4 h-4 text-amber-600 shrink-0" />
+              <span>
+                <strong>Aturan Bisnis:</strong> Satu file Excel ini mewakili tepat 1 OR (<strong>{previewData.orNumber}</strong>) dengan {previewData.rows.length} baris detail material. Nomor PO dalam file Excel tidak digunakan sebagai Nomor OR.
+              </span>
+            </div>
+            <span className="text-[11px] text-amber-700 font-semibold uppercase shrink-0 ml-2">Preview Mode</span>
+          </div>
+
+          {/* Table Preview with Exact 9 Columns Specified */}
+          <div className="border border-slate-200 rounded-lg overflow-hidden">
+            <div className="max-h-80 overflow-y-auto">
+              <table className="w-full text-left border-collapse text-xs">
+                <thead className="bg-slate-100 text-slate-700 font-semibold sticky top-0 z-10 border-b border-slate-200">
+                  <tr>
+                    <th className="py-2 px-3">1. Tanggal Update</th>
+                    <th className="py-2 px-3">2. No. OR</th>
+                    <th className="py-2 px-3">3. Style</th>
+                    <th className="py-2 px-3">4. Kode Material</th>
+                    <th className="py-2 px-3">5. Nama Material</th>
+                    <th className="py-2 px-3 text-right">6. Kebutuhan</th>
+                    <th className="py-2 px-3 text-right">7. Diterima</th>
+                    <th className="py-2 px-2.5 text-center">8. Satuan</th>
+                    <th className="py-2 px-3 text-center">9. Status Kesiapan</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-slate-100">
+                  {previewData.rows.map((r, i) => (
+                    <tr key={i} className="hover:bg-slate-50 transition-colors">
+                      <td className="py-2 px-3 font-mono text-blue-700 whitespace-nowrap">
+                        {previewData.updateDate}
+                      </td>
+                      <td className="py-2 px-3 font-mono font-bold text-slate-900 whitespace-nowrap">
+                        {previewData.orNumber}
+                      </td>
+                      <td className="py-2 px-3 text-slate-700 max-w-[160px] truncate" title={previewData.style}>
+                        {previewData.style || '-'}
+                      </td>
+                      <td className="py-2 px-3 font-mono font-semibold text-slate-800 whitespace-nowrap">
+                        {r.materialCode}
+                      </td>
+                      <td className="py-2 px-3 text-slate-800 max-w-[200px] truncate" title={r.materialName}>
+                        {r.materialName}
+                      </td>
+                      <td className="py-2 px-3 text-right font-mono font-semibold text-slate-900">
+                        {r.requiredQty.toLocaleString('id-ID')}
+                      </td>
+                      <td className="py-2 px-3 text-right font-mono font-semibold text-slate-900">
+                        {r.receivedQty.toLocaleString('id-ID')}
+                      </td>
+                      <td className="py-2 px-2.5 text-center text-slate-600 font-medium">
+                        {r.unit}
+                      </td>
+                      <td className="py-2 px-3 text-center whitespace-nowrap">
+                        <span
+                          className={`inline-flex items-center px-2 py-0.5 rounded text-[10px] font-bold ${
+                            r.isReady
+                              ? 'bg-emerald-100 text-emerald-800 border border-emerald-300'
+                              : 'bg-red-100 text-red-800 border border-red-300'
+                          }`}
+                        >
+                          {r.statusLabel} ({r.shortage >= 0 ? `+${r.shortage}` : r.shortage})
+                        </span>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          </div>
+
+          {/* Bottom Confirmation Bar */}
+          <div className="pt-3 border-t border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+            <div className="text-xs text-slate-500">
+              Menampilkan {previewData.rows.length} baris material. Belum ada perubahan tersimpan ke Master Data.
+            </div>
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={handleCancelPreview}
+                disabled={isProcessing}
+                className="px-4 py-2 text-xs font-semibold text-slate-700 bg-white hover:bg-slate-100 border border-slate-300 rounded-md transition-colors cursor-pointer"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                onClick={handleConfirmAndSave}
+                disabled={isProcessing}
+                className="px-4 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-md shadow-xs transition-colors flex items-center gap-1.5 cursor-pointer"
+              >
+                <CheckCircle className="w-4 h-4 text-emerald-100" />
+                {isProcessing ? 'Menyimpan...' : 'Konfirmasi dan Simpan'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Status banner */}
       {statusMessage && (
