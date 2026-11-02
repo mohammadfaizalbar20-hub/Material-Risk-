@@ -476,14 +476,18 @@ export const ProductionScheduleView: React.FC = () => {
               className="px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-md text-slate-800 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
             >
               <option value="ALL">Semua OR ({registeredOrNumbers.length})</option>
-              {registeredOrNumbers.map((or) => {
-                const summary = getOrSummary(or);
-                return (
-                  <option key={or} value={or}>
-                    {or} {summary?.style ? `— ${summary.style}` : ''}
-                  </option>
-                );
-              })}
+              {registeredOrNumbers.length === 0 ? (
+                <option disabled value="">Belum ada Nomor OR</option>
+              ) : (
+                registeredOrNumbers.map((or) => {
+                  const summary = getOrSummary(or);
+                  return (
+                    <option key={or} value={or}>
+                      {or} {summary?.style ? `— ${summary.style}` : ''}
+                    </option>
+                  );
+                })
+              )}
             </select>
           </div>
         </div>
@@ -949,7 +953,7 @@ export const ProductionScheduleView: React.FC = () => {
                   </datalist>
 
                   {/* Quick OR selector chips */}
-                  {registeredOrNumbers.length > 0 && (
+                  {registeredOrNumbers.length > 0 ? (
                     <div className="flex items-center gap-1.5 flex-wrap pt-0.5">
                       <span className="text-[10px] text-slate-400">Pilih cepat:</span>
                       {registeredOrNumbers.slice(0, 5).map((or) => (
@@ -966,6 +970,10 @@ export const ProductionScheduleView: React.FC = () => {
                           {or}
                         </button>
                       ))}
+                    </div>
+                  ) : (
+                    <div className="text-[11px] text-amber-600 font-medium py-1">
+                      Belum ada Nomor OR. Unggah file Excel terlebih dahulu.
                     </div>
                   )}
                 </div>

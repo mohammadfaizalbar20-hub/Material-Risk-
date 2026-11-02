@@ -138,7 +138,11 @@ export const Header: React.FC = () => {
                 <span className="text-[10px] text-blue-600 font-medium">Single Source: Upload Excel</span>
               </div>
 
-              {matchedOrs.length === 0 ? (
+              {registeredOrNumbers.length === 0 ? (
+                <div className="p-4 text-center text-xs text-slate-500">
+                  Belum ada Nomor OR
+                </div>
+              ) : matchedOrs.length === 0 ? (
                 <div className="p-4 text-center text-xs text-slate-500">
                   Tidak ada Nomor OR terdaftar yang cocok dengan &ldquo;{activeSearchQuery}&rdquo;.
                 </div>

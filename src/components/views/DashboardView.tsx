@@ -145,7 +145,11 @@ export const DashboardView: React.FC = () => {
               onChange={(e) => setSelectedOrFilter(e.target.value)}
               className="px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded font-semibold text-slate-800 focus:outline-none focus:ring-1 focus:ring-blue-500"
             >
-              <option value="ALL">Semua Nomor OR ({materialRequirements.length} item material)</option>
+              <option value="ALL">
+                {availableOrs.length === 0
+                  ? 'Belum ada Nomor OR'
+                  : `Semua Nomor OR (${materialRequirements.length} item material)`}
+              </option>
               {availableOrs.map((or) => {
                 const summary = getOrSummary(or);
                 return (

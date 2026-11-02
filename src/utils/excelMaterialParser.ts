@@ -249,26 +249,11 @@ export function parseExcelRowsToMaterials(
     const unit = normalizeUnit(uomVal, matchedMaterial?.unit || 'Kg');
 
     // 5. Identify Nomor OR & Style
-    const rowOrVal = getRowValue(row, [
-      'Order Lines/Order Reference',
-      'Order Reference',
-      'Nomor OR',
-      'OR Number',
-      'No. OR',
-      'OR',
-      'Reference',
-      'Source Document',
-    ]);
-    const rowOr = rowOrVal ? String(rowOrVal).trim().toUpperCase() : activeOrFallback;
-
-    const rowStyleVal = getRowValue(row, [
-      'Order Lines/Style',
-      'Style',
-      'Model',
-      'Nama Style',
-      'Deskripsi Style',
-    ]);
-    const rowStyle = rowStyleVal ? String(rowStyleVal).trim() : activeStyleFallback;
+    // ATURAN WAJIB: Nomor OR HANYA boleh berasal dari input manual pengguna pada field Nomor OR di Upload Excel.
+    // Nomor PO yang terdapat di dalam Excel (misal Order Reference, Source Document) BUKAN Nomor OR.
+    // Dilarang keras menggunakan Nomor PO / kolom Excel sebagai Nomor OR.
+    const rowOr = (defaultOrNumber || '').trim().toUpperCase() || activeOrFallback;
+    const rowStyle = (defaultStyle || '').trim() || (rowOr ? `Style ${rowOr}` : activeStyleFallback);
 
     // Track OR <-> Style relation
     const relKey = `${rowOr}__${rowStyle.toLowerCase()}`;

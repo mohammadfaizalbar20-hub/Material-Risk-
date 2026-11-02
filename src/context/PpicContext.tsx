@@ -604,21 +604,33 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const match = orStyleRelations.find((r) => r.orNumber.toUpperCase() === clean);
     if (match) return match.style;
     const partial = orStyleRelations.find((r) => r.orNumber.toUpperCase().includes(clean));
-    return partial ? partial.style : null;
+    if (partial) return partial.style;
+    const reqMatch = materialRequirements.find((r) => r.orNumber.trim().toUpperCase() === clean);
+    if (reqMatch && reqMatch.style) return reqMatch.style;
+    return null;
   };
 
   const getOrsForStyle = (style: string): string[] => {
     const clean = (style || '').trim().toLowerCase();
     if (!clean) return [];
-    // 1. Exact matches first
+    // 1. Exact matches first from orStyleRelations
     const exact = orStyleRelations.filter((r) => r.style.toLowerCase() === clean);
     if (exact.length > 0) {
       return Array.from(new Set(exact.map((m) => m.orNumber)));
     }
+    // Fallback: check material requirements
+    const reqExact = materialRequirements.filter((r) => r.style.toLowerCase() === clean);
+    if (reqExact.length > 0) {
+      return Array.from(new Set(reqExact.map((m) => m.orNumber)));
+    }
     // 2. Partial/substring matches if >= 3 characters
     if (clean.length >= 3) {
       const partials = orStyleRelations.filter((r) => r.style.toLowerCase().includes(clean));
-      return Array.from(new Set(partials.map((m) => m.orNumber)));
+      if (partials.length > 0) {
+        return Array.from(new Set(partials.map((m) => m.orNumber)));
+      }
+      const reqPartials = materialRequirements.filter((r) => r.style.toLowerCase().includes(clean));
+      return Array.from(new Set(reqPartials.map((m) => m.orNumber)));
     }
     return [];
   };

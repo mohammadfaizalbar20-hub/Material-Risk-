@@ -45,6 +45,11 @@ export const MaterialSummaryView: React.FC = () => {
     setLastImportedInfo,
     activeSearchQuery,
     setActiveSearchQuery,
+    deletionHistory,
+    deleteDataByOr,
+    deleteDataByUpdateDate,
+    getDeletionImpactByOr,
+    getDeletionImpactByDate,
   } = usePpic();
 
   // Active view tab:
@@ -62,6 +67,15 @@ export const MaterialSummaryView: React.FC = () => {
   // Modal states
   const [addReqModalOpen, setAddReqModalOpen] = useState<boolean>(false);
   const [editingReq, setEditingReq] = useState<MaterialItemRequirement | null>(null);
+
+  // Deletion Modal & Confirmation States (Fitur Hapus Data Master Material)
+  const [deleteModalOpen, setDeleteModalOpen] = useState<boolean>(false);
+  const [deleteMethod, setDeleteMethod] = useState<'BY_OR' | 'BY_DATE' | 'AUDIT_LOG'>('BY_OR');
+  const [targetDeleteOr, setTargetDeleteOr] = useState<string>('');
+  const [targetDeleteDate, setTargetDeleteDate] = useState<string>('');
+  const [searchDeleteOrQuery, setSearchDeleteOrQuery] = useState<string>('');
+  const [isConfirmingDelete, setIsConfirmingDelete] = useState<boolean>(false);
+  const [deleteNotice, setDeleteNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
   // Form data for Requirement modal
   const [reqFormData, setReqFormData] = useState<{
@@ -310,6 +324,51 @@ export const MaterialSummaryView: React.FC = () => {
     XLSX.writeFile(wb, `Master_Data_Material_${new Date().toISOString().slice(0, 10)}.xlsx`);
   };
 
+  // Impact calculations for Deletion Feature
+  const currentOrImpact = useMemo(() => {
+    if (!targetDeleteOr) return null;
+    return getDeletionImpactByOr(targetDeleteOr);
+  }, [targetDeleteOr, getDeletionImpactByOr, materialRequirements]);
+
+  const currentDateImpact = useMemo(() => {
+    if (!targetDeleteDate) return null;
+    return getDeletionImpactByDate(targetDeleteDate);
+  }, [targetDeleteDate, getDeletionImpactByDate, materialRequirements]);
+
+  // Registered ORs filtered by search query in deletion modal
+  const filteredDeleteOrList = useMemo(() => {
+    if (!searchDeleteOrQuery.trim()) return registeredOrNumbers;
+    const q = searchDeleteOrQuery.trim().toUpperCase();
+    return registeredOrNumbers.filter((or) => or.includes(q));
+  }, [registeredOrNumbers, searchDeleteOrQuery]);
+
+  // Execute deletion after user confirms in confirmation dialog
+  const handleExecuteDelete = () => {
+    if (deleteMethod === 'BY_OR') {
+      if (!targetDeleteOr) return;
+      const res = deleteDataByOr(targetDeleteOr);
+      if (res.success) {
+        setDeleteNotice({ type: 'success', message: res.message });
+        setTargetDeleteOr('');
+        setIsConfirmingDelete(false);
+      } else {
+        setDeleteNotice({ type: 'error', message: res.message });
+        setIsConfirmingDelete(false);
+      }
+    } else if (deleteMethod === 'BY_DATE') {
+      if (!targetDeleteDate) return;
+      const res = deleteDataByUpdateDate(targetDeleteDate);
+      if (res.success) {
+        setDeleteNotice({ type: 'success', message: res.message });
+        setTargetDeleteDate('');
+        setIsConfirmingDelete(false);
+      } else {
+        setDeleteNotice({ type: 'error', message: res.message });
+        setIsConfirmingDelete(false);
+      }
+    }
+  };
+
   return (
     <div className="space-y-6">
       {/* Top Banner: Master Data Material Header */}
@@ -348,6 +407,24 @@ export const MaterialSummaryView: React.FC = () => {
           >
             <Plus className="w-4 h-4" />
             Tambah Baris Manual
+          </button>
+          <button
+            onClick={() => {
+              setDeleteModalOpen(true);
+              setDeleteNotice(null);
+              setIsConfirmingDelete(false);
+              if (registeredOrNumbers.length > 0 && !targetDeleteOr) {
+                setTargetDeleteOr(registeredOrNumbers[0]);
+              }
+              if (availableUpdateDates.length > 0 && !targetDeleteDate) {
+                setTargetDeleteDate(availableUpdateDates[0]);
+              }
+            }}
+            className="px-3.5 py-2 text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-300 rounded-md transition-colors flex items-center gap-1.5 cursor-pointer shadow-xs"
+            title="Buka dialog Hapus Data Master Material"
+          >
+            <Trash2 className="w-4 h-4 text-rose-600" />
+            Hapus Data
           </button>
         </div>
       </div>
@@ -528,12 +605,19 @@ export const MaterialSummaryView: React.FC = () => {
                     onChange={(e) => setSelectedOrFilter(e.target.value)}
                     className="px-2.5 py-1.5 text-xs font-mono border border-slate-300 rounded-md bg-white focus:ring-1 focus:ring-blue-500 focus:outline-none font-semibold text-slate-900"
                   >
-                    <option value="ALL">Semua Nomor OR ({registeredOrNumbers.length})</option>
-                    {registeredOrNumbers.map((or) => (
-                      <option key={or} value={or}>
-                        {or}
-                      </option>
-                    ))}
+                    <option value="ALL">
+                      {registeredOrNumbers.length === 0
+                        ? 'Belum ada Nomor OR'
+                        : `Semua Nomor OR (${registeredOrNumbers.length})`}
+                    </option>
+                    {registeredOrNumbers.map((or) => {
+                      const summary = getOrSummary(or);
+                      return (
+                        <option key={or} value={or}>
+                          {or} {summary?.style ? `— ${summary.style}` : ''}
+                        </option>
+                      );
+                    })}
                   </select>
                 </div>
 
@@ -848,11 +932,18 @@ export const MaterialSummaryView: React.FC = () => {
                 onChange={(e) => setCompareOr(e.target.value)}
                 className="px-3 py-1.5 text-xs font-mono font-bold text-blue-700 border border-slate-300 rounded-md bg-white focus:ring-1 focus:ring-blue-500"
               >
-                {registeredOrNumbers.map((or) => (
-                  <option key={or} value={or}>
-                    {or}
-                  </option>
-                ))}
+                {registeredOrNumbers.length === 0 ? (
+                  <option value="">Belum ada Nomor OR</option>
+                ) : (
+                  registeredOrNumbers.map((or) => {
+                    const summary = getOrSummary(or);
+                    return (
+                      <option key={or} value={or}>
+                        {or} {summary?.style ? `— ${summary.style}` : ''}
+                      </option>
+                    );
+                  })
+                )}
               </select>
             </div>
           </div>
@@ -1217,6 +1308,585 @@ export const MaterialSummaryView: React.FC = () => {
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* MODAL 2: HAPUS DATA MASTER MATERIAL (Panel Khusus dengan 2 Metode & Riwayat) */}
+      {deleteModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
+          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-3xl max-h-[92vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-150">
+            {/* Header Modal */}
+            <div className="p-4 bg-slate-900 text-white flex items-center justify-between sticky top-0 z-10">
+              <div className="flex items-center gap-2">
+                <div className="p-1.5 bg-rose-500/20 text-rose-400 rounded-md border border-rose-500/30">
+                  <Trash2 className="w-4 h-4" />
+                </div>
+                <div>
+                  <h3 className="text-sm font-bold">Hapus Data Master Material</h3>
+                  <p className="text-[11px] text-slate-400">
+                    Pilih metode penghapusan data transaksi material secara selektif dan aman.
+                  </p>
+                </div>
+              </div>
+              <button
+                onClick={() => {
+                  setDeleteModalOpen(false);
+                  setIsConfirmingDelete(false);
+                  setDeleteNotice(null);
+                }}
+                className="text-slate-400 hover:text-white cursor-pointer"
+                title="Tutup dialog"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-5">
+              {/* Notification Banner */}
+              {deleteNotice && (
+                <div
+                  className={`p-3 rounded-lg text-xs flex items-center justify-between ${
+                    deleteNotice.type === 'success'
+                      ? 'bg-emerald-50 text-emerald-800 border border-emerald-300'
+                      : 'bg-rose-50 text-rose-800 border border-rose-300'
+                  }`}
+                >
+                  <div className="flex items-center gap-2">
+                    {deleteNotice.type === 'success' ? (
+                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                    ) : (
+                      <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                    )}
+                    <span className="font-medium">{deleteNotice.message}</span>
+                  </div>
+                  <button
+                    onClick={() => setDeleteNotice(null)}
+                    className="text-slate-400 hover:text-slate-600 ml-2"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              )}
+
+              {/* Method Selector Tabs */}
+              <div className="flex items-center border-b border-slate-200">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDeleteMethod('BY_OR');
+                    setDeleteNotice(null);
+                  }}
+                  className={`px-4 py-2.5 text-xs font-bold border-b-2 transition-colors cursor-pointer flex items-center gap-2 ${
+                    deleteMethod === 'BY_OR'
+                      ? 'border-rose-600 text-rose-700 bg-rose-50/40'
+                      : 'border-transparent text-slate-500 hover:text-slate-800'
+                  }`}
+                >
+                  <Hash className="w-4 h-4 text-rose-600" />
+                  1. Hapus Berdasarkan Nomor OR
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDeleteMethod('BY_DATE');
+                    setDeleteNotice(null);
+                  }}
+                  className={`px-4 py-2.5 text-xs font-bold border-b-2 transition-colors cursor-pointer flex items-center gap-2 ${
+                    deleteMethod === 'BY_DATE'
+                      ? 'border-rose-600 text-rose-700 bg-rose-50/40'
+                      : 'border-transparent text-slate-500 hover:text-slate-800'
+                  }`}
+                >
+                  <Calendar className="w-4 h-4 text-rose-600" />
+                  2. Hapus Berdasarkan Tanggal Update
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDeleteMethod('AUDIT_LOG');
+                    setDeleteNotice(null);
+                  }}
+                  className={`px-4 py-2.5 text-xs font-bold border-b-2 transition-colors cursor-pointer flex items-center gap-2 ${
+                    deleteMethod === 'AUDIT_LOG'
+                      ? 'border-blue-600 text-blue-700 bg-blue-50/40'
+                      : 'border-transparent text-slate-500 hover:text-slate-800'
+                  }`}
+                >
+                  <span>Riwayat Penghapusan</span>
+                  <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-slate-200 text-slate-700 font-mono">
+                    {deletionHistory.length}
+                  </span>
+                </button>
+              </div>
+
+              {/* TAB 1: HAPUS BERDASARKAN NOMOR OR */}
+              {deleteMethod === 'BY_OR' && (
+                <div className="space-y-4">
+                  <div className="p-3 bg-amber-50/60 border border-amber-200 rounded-lg text-xs text-amber-900 leading-relaxed">
+                    <p className="font-semibold flex items-center gap-1.5">
+                      <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                      Ketentuan Hapus Berdasarkan Nomor OR:
+                    </p>
+                    <p className="text-[11px] text-amber-800 mt-1">
+                      Daftar OR hanya mengambil Nomor OR yang sudah diinput melalui <strong>Upload Excel</strong>. Penghapusan hanya berlaku untuk seluruh transaksi material milik OR yang dipilih. Data OR lainnya dan Master Data Material utama tetap aman.
+                    </p>
+                  </div>
+
+                  {/* Search OR Input for Filter */}
+                  <div className="space-y-2">
+                    <label className="block text-xs font-bold text-slate-700">
+                      Pilih Nomor OR yang Akan Dihapus:
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <div className="relative flex-1">
+                        <Search className="w-3.5 h-3.5 text-slate-400 absolute left-3 top-1/2 -translate-y-1/2" />
+                        <input
+                          type="text"
+                          placeholder="Ketik sebagian nomor OR untuk mencari..."
+                          value={searchDeleteOrQuery}
+                          onChange={(e) => setSearchDeleteOrQuery(e.target.value)}
+                          className="w-full pl-9 pr-3 py-1.5 text-xs border border-slate-300 rounded-md font-mono focus:ring-1 focus:ring-rose-500 focus:outline-none"
+                        />
+                      </div>
+                      {searchDeleteOrQuery && (
+                        <button
+                          type="button"
+                          onClick={() => setSearchDeleteOrQuery('')}
+                          className="text-xs text-slate-500 hover:text-slate-800"
+                        >
+                          Reset
+                        </button>
+                      )}
+                    </div>
+
+                    {/* OR Select Dropdown */}
+                    {registeredOrNumbers.length === 0 ? (
+                      <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-500 text-center">
+                        Belum ada Nomor OR yang terdaftar melalui menu Upload Excel.
+                      </div>
+                    ) : (
+                      <select
+                        value={targetDeleteOr}
+                        onChange={(e) => setTargetDeleteOr(e.target.value)}
+                        className="w-full px-3 py-2 text-xs font-mono font-bold border border-slate-300 rounded-md bg-white focus:ring-1 focus:ring-rose-500 focus:outline-none text-slate-900"
+                      >
+                        <option value="">-- Pilih Nomor OR Terdaftar --</option>
+                        {filteredDeleteOrList.map((or) => {
+                          const summary = getOrSummary(or);
+                          return (
+                            <option key={or} value={or}>
+                              {or} {summary?.style ? `— ${summary.style}` : ''} ({summary?.requirements?.length || 0} baris)
+                            </option>
+                          );
+                        })}
+                      </select>
+                    )}
+                  </div>
+
+                  {/* Impact Preview Card for Selected OR */}
+                  {currentOrImpact && (
+                    <div className="p-4 bg-rose-50/60 border border-rose-200 rounded-xl space-y-3">
+                      <div className="flex items-center justify-between border-b border-rose-200 pb-2">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-bold text-xs bg-rose-100 text-rose-800 px-2 py-0.5 rounded border border-rose-300">
+                            {currentOrImpact.orNumber}
+                          </span>
+                          <span className="text-xs font-bold text-slate-900">
+                            {currentOrImpact.style}
+                          </span>
+                        </div>
+                        <span className="text-xs font-bold text-rose-700 bg-white px-2.5 py-0.5 rounded-full border border-rose-200">
+                          {currentOrImpact.rowCount} Baris Material Terdampak
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2 text-xs">
+                        <div className="bg-white p-2 rounded border border-rose-100">
+                          <span className="text-slate-400 text-[10px] block">Jumlah Baris Transaksi</span>
+                          <span className="font-bold text-slate-800 font-mono">{currentOrImpact.rowCount} baris</span>
+                        </div>
+                        <div className="bg-white p-2 rounded border border-rose-100">
+                          <span className="text-slate-400 text-[10px] block">Tanggal Update Terdata</span>
+                          <span className="font-bold text-slate-800 font-mono text-[11px]">
+                            {currentOrImpact.updateDates.join(', ') || '-'}
+                          </span>
+                        </div>
+                        <div className="bg-white p-2 rounded border border-rose-100 col-span-2 sm:col-span-1">
+                          <span className="text-slate-400 text-[10px] block">Total Kebutuhan</span>
+                          <span className="font-bold text-slate-800 font-mono">
+                            {currentOrImpact.totalRequiredQty.toLocaleString('id-ID')} unit
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Preview Table */}
+                      <div className="space-y-1">
+                        <span className="text-[11px] font-bold text-slate-700 block">
+                          Daftar Baris Material yang Akan Dihapus:
+                        </span>
+                        <div className="max-h-36 overflow-y-auto border border-rose-200 rounded bg-white">
+                          <table className="w-full text-[11px]">
+                            <thead className="bg-rose-100/70 text-rose-900 text-[10px] sticky top-0">
+                              <tr>
+                                <th className="p-1.5 text-left">Kode</th>
+                                <th className="p-1.5 text-left">Nama Material</th>
+                                <th className="p-1.5 text-right">Kebutuhan</th>
+                                <th className="p-1.5 text-right">Diterima</th>
+                                <th className="p-1.5 text-center">Tanggal</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-rose-100">
+                              {currentOrImpact.rows.slice(0, 5).map((r) => (
+                                <tr key={r.id} className="hover:bg-rose-50/40">
+                                  <td className="p-1.5 font-mono text-slate-800">{r.materialCode}</td>
+                                  <td className="p-1.5 text-slate-700 truncate max-w-[150px]">{r.materialName}</td>
+                                  <td className="p-1.5 font-mono text-right text-slate-800">{r.requiredQty.toLocaleString('id-ID')}</td>
+                                  <td className="p-1.5 font-mono text-right text-slate-800">{r.receivedQty.toLocaleString('id-ID')}</td>
+                                  <td className="p-1.5 text-center text-slate-500 font-mono text-[10px]">{r.updateDate || '-'}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                          {currentOrImpact.rows.length > 5 && (
+                            <div className="p-1.5 text-center text-[10px] text-slate-500 bg-slate-50">
+                              ... dan {currentOrImpact.rows.length - 5} baris material lainnya.
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Safety Rules Checklist */}
+                      <div className="bg-emerald-50 border border-emerald-200 rounded p-2.5 text-[11px] text-emerald-900 space-y-1">
+                        <div className="flex items-center gap-1.5 font-semibold">
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                          <span>Jaminan Keamanan Data:</span>
+                        </div>
+                        <ul className="list-disc pl-4 space-y-0.5 text-emerald-800 text-[10px]">
+                          <li>Hanya transaksi milik <strong>{currentOrImpact.orNumber}</strong> yang akan dihapus.</li>
+                          <li>Data OR lainnya dan transaksi pada tanggal lainnya tetap aman 100%.</li>
+                          <li>Katalog Master Material utama dipertahankan jika digunakan oleh OR lain.</li>
+                        </ul>
+                      </div>
+
+                      {/* Proceed to confirmation button */}
+                      <div className="pt-2 flex justify-end">
+                        <button
+                          type="button"
+                          onClick={() => setIsConfirmingDelete(true)}
+                          className="px-4 py-2 text-xs font-bold bg-rose-600 hover:bg-rose-700 text-white rounded-md shadow-xs transition-colors flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          Lanjutkan ke Konfirmasi Hapus OR ({currentOrImpact.rowCount} Baris)
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* TAB 2: HAPUS BERDASARKAN TANGGAL UPDATE */}
+              {deleteMethod === 'BY_DATE' && (
+                <div className="space-y-4">
+                  <div className="p-3 bg-amber-50/60 border border-amber-200 rounded-lg text-xs text-amber-900 leading-relaxed">
+                    <p className="font-semibold flex items-center gap-1.5">
+                      <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0" />
+                      Ketentuan Hapus Berdasarkan Tanggal Update:
+                    </p>
+                    <p className="text-[11px] text-amber-800 mt-1">
+                      Penghapusan hanya mencakup transaksi yang memiliki Tanggal Update terpilih. Data transaksi pada tanggal lain untuk OR terkait dijamin tetap aman.
+                    </p>
+                  </div>
+
+                  {/* Date Select Dropdown */}
+                  <div className="space-y-2">
+                    <label className="block text-xs font-bold text-slate-700">
+                      Pilih Tanggal Update yang Akan Dihapus:
+                    </label>
+                    {availableUpdateDates.length === 0 ? (
+                      <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-xs text-slate-500 text-center">
+                        Belum ada transaksi material dengan Tanggal Update.
+                      </div>
+                    ) : (
+                      <select
+                        value={targetDeleteDate}
+                        onChange={(e) => setTargetDeleteDate(e.target.value)}
+                        className="w-full px-3 py-2 text-xs font-mono font-bold border border-slate-300 rounded-md bg-white focus:ring-1 focus:ring-rose-500 focus:outline-none text-slate-900"
+                      >
+                        <option value="">-- Pilih Tanggal Update --</option>
+                        {availableUpdateDates.map((dt) => {
+                          const impact = getDeletionImpactByDate(dt);
+                          return (
+                            <option key={dt} value={dt}>
+                              {dt} — ({impact.rowCount} baris transaksi material, {impact.affectedOrs.length} OR terdampak)
+                            </option>
+                          );
+                        })}
+                      </select>
+                    )}
+                  </div>
+
+                  {/* Impact Preview Card for Selected Date */}
+                  {currentDateImpact && (
+                    <div className="p-4 bg-rose-50/60 border border-rose-200 rounded-xl space-y-3">
+                      <div className="flex items-center justify-between border-b border-rose-200 pb-2">
+                        <div className="flex items-center gap-2">
+                          <span className="font-mono font-bold text-xs bg-rose-100 text-rose-800 px-2 py-0.5 rounded border border-rose-300">
+                            Tanggal: {currentDateImpact.updateDate}
+                          </span>
+                        </div>
+                        <span className="text-xs font-bold text-rose-700 bg-white px-2.5 py-0.5 rounded-full border border-rose-200">
+                          {currentDateImpact.rowCount} Baris Material Terdampak
+                        </span>
+                      </div>
+
+                      {/* Affected ORs list */}
+                      <div>
+                        <span className="text-[11px] font-bold text-slate-700 block mb-1">
+                          Nomor OR Terdampak pada Tanggal {currentDateImpact.updateDate}:
+                        </span>
+                        <div className="flex flex-wrap gap-2">
+                          {currentDateImpact.affectedOrs.map((o) => (
+                            <div
+                              key={o.orNumber}
+                              className="px-2.5 py-1 bg-white border border-rose-200 rounded-md text-xs space-x-1.5 shadow-2xs"
+                            >
+                              <span className="font-mono font-bold text-rose-900">{o.orNumber}</span>
+                              <span className="text-slate-500 font-medium">({o.style})</span>
+                              <span className="text-[10px] bg-rose-100 text-rose-800 px-1.5 py-0.2 rounded font-mono">
+                                {o.rowCount} baris
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
+                      {/* Preview Table */}
+                      <div className="space-y-1">
+                        <span className="text-[11px] font-bold text-slate-700 block">
+                          Preview Baris Material yang Akan Dihapus:
+                        </span>
+                        <div className="max-h-36 overflow-y-auto border border-rose-200 rounded bg-white">
+                          <table className="w-full text-[11px]">
+                            <thead className="bg-rose-100/70 text-rose-900 text-[10px] sticky top-0">
+                              <tr>
+                                <th className="p-1.5 text-left">OR</th>
+                                <th className="p-1.5 text-left">Kode</th>
+                                <th className="p-1.5 text-left">Nama Material</th>
+                                <th className="p-1.5 text-right">Kebutuhan</th>
+                                <th className="p-1.5 text-right">Diterima</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-rose-100">
+                              {currentDateImpact.rows.slice(0, 5).map((r) => (
+                                <tr key={r.id} className="hover:bg-rose-50/40">
+                                  <td className="p-1.5 font-mono font-bold text-rose-900">{r.orNumber}</td>
+                                  <td className="p-1.5 font-mono text-slate-800">{r.materialCode}</td>
+                                  <td className="p-1.5 text-slate-700 truncate max-w-[150px]">{r.materialName}</td>
+                                  <td className="p-1.5 font-mono text-right text-slate-800">{r.requiredQty.toLocaleString('id-ID')}</td>
+                                  <td className="p-1.5 font-mono text-right text-slate-800">{r.receivedQty.toLocaleString('id-ID')}</td>
+                                </tr>
+                              ))}
+                            </tbody>
+                          </table>
+                          {currentDateImpact.rows.length > 5 && (
+                            <div className="p-1.5 text-center text-[10px] text-slate-500 bg-slate-50">
+                              ... dan {currentDateImpact.rows.length - 5} baris material lainnya.
+                            </div>
+                          )}
+                        </div>
+                      </div>
+
+                      {/* Safety Rules Checklist */}
+                      <div className="bg-emerald-50 border border-emerald-200 rounded p-2.5 text-[11px] text-emerald-900 space-y-1">
+                        <div className="flex items-center gap-1.5 font-semibold">
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                          <span>Jaminan Keamanan Data:</span>
+                        </div>
+                        <ul className="list-disc pl-4 space-y-0.5 text-emerald-800 text-[10px]">
+                          <li>Hanya baris dengan Tanggal Update <strong>{currentDateImpact.updateDate}</strong> yang dihapus.</li>
+                          <li>Transaksi pada tanggal lain untuk OR tersebut tetap tersimpan utuh dan aman.</li>
+                        </ul>
+                      </div>
+
+                      {/* Proceed to confirmation button */}
+                      <div className="pt-2 flex justify-end">
+                        <button
+                          type="button"
+                          onClick={() => setIsConfirmingDelete(true)}
+                          className="px-4 py-2 text-xs font-bold bg-rose-600 hover:bg-rose-700 text-white rounded-md shadow-xs transition-colors flex items-center gap-1.5 cursor-pointer"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          Lanjutkan ke Konfirmasi Hapus Tanggal ({currentDateImpact.rowCount} Baris)
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
+
+              {/* TAB 3: AUDIT LOG RIWAYAT PENGHAPUSAN */}
+              {deleteMethod === 'AUDIT_LOG' && (
+                <div className="space-y-3">
+                  <div className="flex items-center justify-between text-xs text-slate-600">
+                    <span className="font-semibold text-slate-800">
+                      Log Audit Riwayat Penghapusan Transaksi Master Material
+                    </span>
+                    <span className="text-[11px] text-slate-400">
+                      Total: {deletionHistory.length} kali penghapusan
+                    </span>
+                  </div>
+
+                  {deletionHistory.length === 0 ? (
+                    <div className="p-8 text-center text-xs text-slate-400 border border-dashed border-slate-200 rounded-lg">
+                      Belum ada riwayat penghapusan data. Semua transaksi material masih utuh tersimpan.
+                    </div>
+                  ) : (
+                    <div className="border border-slate-200 rounded-lg overflow-hidden bg-white">
+                      <table className="w-full text-xs">
+                        <thead className="bg-slate-100 text-slate-700 text-[11px] border-b border-slate-200">
+                          <tr>
+                            <th className="p-2.5 text-left font-bold">Waktu (WIB)</th>
+                            <th className="p-2.5 text-left font-bold">Metode</th>
+                            <th className="p-2.5 text-left font-bold">Target / Kriteria</th>
+                            <th className="p-2.5 text-center font-bold">Baris Dihapus</th>
+                            <th className="p-2.5 text-left font-bold">OR Terdampak</th>
+                            <th className="p-2.5 text-left font-bold">Pengguna</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-100">
+                          {deletionHistory.map((item) => (
+                            <tr key={item.id} className="hover:bg-slate-50 transition-colors">
+                              <td className="p-2.5 font-mono text-[11px] text-slate-600">{item.timestamp}</td>
+                              <td className="p-2.5">
+                                <span className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                  item.method === 'BY_OR'
+                                    ? 'bg-rose-50 text-rose-700 border border-rose-200'
+                                    : 'bg-amber-50 text-amber-700 border border-amber-200'
+                                }`}>
+                                  {item.methodLabel}
+                                </span>
+                              </td>
+                              <td className="p-2.5 font-mono font-bold text-slate-800">
+                                {item.targetValue}
+                                {item.targetDetails && (
+                                  <span className="block font-sans font-normal text-[10px] text-slate-500">
+                                    {item.targetDetails}
+                                  </span>
+                                )}
+                              </td>
+                              <td className="p-2.5 text-center font-mono font-bold text-rose-600">
+                                -{item.deletedRowCount} baris
+                              </td>
+                              <td className="p-2.5 font-mono text-[11px] text-slate-700">
+                                {item.affectedOrs.join(', ') || '-'}
+                              </td>
+                              <td className="p-2.5 text-[11px] text-slate-500">{item.user}</td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Modal Footer */}
+            <div className="p-4 bg-slate-50 border-t border-slate-200 flex items-center justify-between text-xs text-slate-500">
+              <span>* Seluruh proses penghapusan dilindungi dialog konfirmasi keamanan bertahap.</span>
+              <button
+                type="button"
+                onClick={() => {
+                  setDeleteModalOpen(false);
+                  setIsConfirmingDelete(false);
+                  setDeleteNotice(null);
+                }}
+                className="px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-200 rounded-md cursor-pointer transition-colors"
+              >
+                Tutup Panel
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* DIALOG KONFIRMASI PENGHAPUSAN DATA (Two-Step Confirmation Modal) */}
+      {isConfirmingDelete && (
+        <div className="fixed inset-0 z-60 flex items-center justify-center bg-slate-950/70 backdrop-blur-xs p-4 animate-in fade-in duration-100">
+          <div className="bg-white rounded-xl shadow-2xl border-2 border-rose-500 w-full max-w-lg overflow-hidden animate-in zoom-in-95 duration-150">
+            {/* Header */}
+            <div className="p-4 bg-rose-600 text-white flex items-center gap-2.5">
+              <AlertTriangle className="w-5 h-5 text-white shrink-0 animate-bounce" />
+              <div>
+                <h3 className="text-sm font-bold">Konfirmasi Penghapusan Data Permanen</h3>
+                <p className="text-[11px] text-rose-100">
+                  Tindakan ini tidak dapat dibatalkan. Mohon periksa kembali detail sebelum melanjutkan.
+                </p>
+              </div>
+            </div>
+
+            {/* Body */}
+            <div className="p-5 space-y-4">
+              <div className="p-3.5 bg-rose-50 rounded-lg border border-rose-200 text-xs text-rose-950 space-y-2">
+                <div className="flex items-center justify-between border-b border-rose-200 pb-2">
+                  <span className="font-semibold text-rose-900">Metode Penghapusan:</span>
+                  <span className="font-bold">
+                    {deleteMethod === 'BY_OR' ? 'Hapus Berdasarkan Nomor OR' : 'Hapus Berdasarkan Tanggal Update'}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between border-b border-rose-200 pb-2">
+                  <span className="font-semibold text-rose-900">Target yang Dihapus:</span>
+                  <span className="font-mono font-bold text-rose-800 text-sm">
+                    {deleteMethod === 'BY_OR' ? targetDeleteOr : targetDeleteDate}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between border-b border-rose-200 pb-2">
+                  <span className="font-semibold text-rose-900">Keterangan Target:</span>
+                  <span className="font-medium text-slate-800 text-right max-w-xs truncate">
+                    {deleteMethod === 'BY_OR'
+                      ? currentOrImpact?.style || '-'
+                      : currentDateImpact?.affectedOrs.map((o) => o.orNumber).join(', ') || '-'}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between pt-1 text-sm">
+                  <span className="font-bold text-rose-900">Jumlah Baris Terdampak:</span>
+                  <span className="font-mono font-black text-rose-700">
+                    {deleteMethod === 'BY_OR' ? currentOrImpact?.rowCount : currentDateImpact?.rowCount} Baris Transaksi
+                  </span>
+                </div>
+              </div>
+
+              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-[11px] text-slate-600 space-y-1">
+                <p className="font-bold text-slate-800">Aturan Keamanan Sistem:</p>
+                <p>• Seluruh baris material yang sesuai dengan kriteria di atas akan dihapus permanen.</p>
+                <p>• Data di luar kriteria terpilih (OR lain / tanggal lain) dipastikan tetap aman.</p>
+                <p>• Dashboard, Rekap Material, dan Kalender akan langsung disinkronkan otomatis.</p>
+              </div>
+
+              <div className="p-2.5 bg-red-100 border border-red-300 rounded text-center text-xs font-bold text-red-900">
+                Peringatan: Tindakan ini permanen dan TIDAK DAPAT DIBATALKAN.
+              </div>
+            </div>
+
+            {/* Actions: Batal vs Ya, Hapus Data */}
+            <div className="p-4 bg-slate-100 border-t border-slate-200 flex items-center justify-end gap-3">
+              <button
+                type="button"
+                onClick={() => setIsConfirmingDelete(false)}
+                className="px-4 py-2 text-xs font-semibold text-slate-700 hover:bg-slate-200 rounded-md cursor-pointer transition-colors"
+              >
+                Batal
+              </button>
+              <button
+                type="button"
+                onClick={handleExecuteDelete}
+                className="px-5 py-2 text-xs font-bold bg-rose-600 hover:bg-rose-700 text-white rounded-md shadow-md transition-colors flex items-center gap-1.5 cursor-pointer"
+              >
+                <Trash2 className="w-4 h-4" />
+                Ya, Hapus Data
+              </button>
+            </div>
           </div>
         </div>
       )}

@@ -274,14 +274,18 @@ export const MaterialRiskAnalysisView: React.FC = () => {
             className="px-2.5 py-1 text-xs bg-slate-50 border border-slate-200 rounded-md text-slate-800 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
           >
             <option value="ALL">Semua Nomor OR ({uniqueOrs.length})</option>
-            {uniqueOrs.map((or) => {
-              const summary = getOrSummary(or);
-              return (
-                <option key={or} value={or}>
-                  {or} {summary?.style ? `— ${summary.style}` : ''}
-                </option>
-              );
-            })}
+            {uniqueOrs.length === 0 ? (
+              <option disabled value="">Belum ada Nomor OR</option>
+            ) : (
+              uniqueOrs.map((or) => {
+                const summary = getOrSummary(or);
+                return (
+                  <option key={or} value={or}>
+                    {or} {summary?.style ? `— ${summary.style}` : ''}
+                  </option>
+                );
+              })
+            )}
           </select>
 
           {(filterRisk !== 'ALL' || filterOr !== 'ALL') && (

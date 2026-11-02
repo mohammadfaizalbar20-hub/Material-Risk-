@@ -122,6 +122,12 @@ export const UploadExcelView: React.FC = () => {
       return;
     }
 
+    // Validation: Nomor OR input manual is strictly mandatory per PPIC rule
+    if (!orNumber.trim()) {
+      setErrorMessage('Nomor OR wajib diisi secara manual pada kolom input di atas! (Nomor PO pada berkas Excel bukan Nomor OR).');
+      return;
+    }
+
     setFileName(file.name);
     setIsProcessing(true);
     setStatusMessage('Membaca berkas Excel dan memproses kolom material...');
