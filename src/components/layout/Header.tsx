@@ -207,12 +207,10 @@ export const Header: React.FC = () => {
 
       {/* Right: Date info & Notification */}
       <div className="flex items-center gap-3">
-        {/* Date & Shift Badge */}
+        {/* Date Badge */}
         <div className="hidden sm:flex items-center gap-1.5 px-3 py-1.5 bg-slate-50 border border-slate-200 rounded-md text-xs text-slate-600">
           <Calendar className="w-3.5 h-3.5 text-slate-500" />
           <span className="font-medium">{todayFormatted}</span>
-          <span className="text-slate-300">·</span>
-          <span className="text-blue-700 font-medium">Shift 1</span>
         </div>
 
         {/* Notification Bell */}

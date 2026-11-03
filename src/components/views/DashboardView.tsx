@@ -1,6 +1,5 @@
 import React, { useState, useMemo } from 'react';
 import { usePpic } from '../../context/PpicContext';
-import { RiskBadge } from '../common/RiskBadge';
 import {
   calculateParetoAnalysis,
   calculateMaterialComparisonMetrics,
@@ -12,14 +11,12 @@ import {
   CheckCircle2,
   AlertTriangle,
   ArrowRight,
-  Sparkles,
-  Boxes,
-  FileSpreadsheet,
-  TrendingUp,
   Filter,
   BarChart3,
   PieChart,
-  Layers,
+  Search,
+  Hash,
+  X,
 } from 'lucide-react';
 
 export const DashboardView: React.FC = () => {
@@ -32,20 +29,35 @@ export const DashboardView: React.FC = () => {
     getOrSummary,
   } = usePpic();
 
-  const [selectedOrFilter, setSelectedOrFilter] = useState<string>('ALL');
+  // Manual Text Input Search for Nomor OR on Dashboard (NO dropdown!)
+  const [orSearchInput, setOrSearchInput] = useState<string>('');
   const [selectedPeriodFilter, setSelectedPeriodFilter] = useState<string>('ALL');
 
-  // Single Source of Truth for available ORs from Upload Excel
-  const availableOrs = registeredOrNumbers;
-
-  // Filtered requirements based on selected OR
+  // Filtered requirements based on typed OR (substring matching, case-insensitive)
+  // If empty, displays overall data like previous Dashboard behavior
   const filteredRequirements = useMemo(() => {
-    let list = materialRequirements;
-    if (selectedOrFilter !== 'ALL') {
-      list = list.filter((r) => r.orNumber === selectedOrFilter);
+    const q = orSearchInput.trim().toUpperCase();
+    if (!q) {
+      return materialRequirements;
     }
-    return list;
-  }, [materialRequirements, selectedOrFilter]);
+    return materialRequirements.filter((r) => r.orNumber.toUpperCase().includes(q));
+  }, [materialRequirements, orSearchInput]);
+
+  // Filtered production schedules for typed OR
+  const filteredSchedules = useMemo(() => {
+    const q = orSearchInput.trim().toUpperCase();
+    if (!q) {
+      return productionSchedules;
+    }
+    return productionSchedules.filter((s) => s.orNumber.toUpperCase().includes(q));
+  }, [productionSchedules, orSearchInput]);
+
+  // Matching registered ORs for style information preview badge
+  const matchingRegisteredOrs = useMemo(() => {
+    const q = orSearchInput.trim().toUpperCase();
+    if (!q) return [];
+    return registeredOrNumbers.filter((or) => or.toUpperCase().includes(q));
+  }, [registeredOrNumbers, orSearchInput]);
 
   // Actual Metrics calculated from filtered requirements
   const comparison = useMemo(() => {
@@ -113,14 +125,14 @@ export const DashboardView: React.FC = () => {
           <div className="flex flex-wrap items-center gap-2.5">
             <button
               onClick={() => setActiveMenu('Penjadwalan Produksi')}
-              className="px-3 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white rounded-md shadow-xs transition-colors flex items-center gap-1.5"
+              className="px-3 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-500 text-white rounded-md shadow-xs transition-colors flex items-center gap-1.5 cursor-pointer"
             >
               <CalendarClock className="w-3.5 h-3.5" />
               Kalender Gantt Produksi
             </button>
             <button
               onClick={() => setActiveMenu('Material Risk Analysis')}
-              className="px-3 py-2 text-xs font-semibold bg-red-600 hover:bg-red-700 text-white rounded-md shadow-xs transition-colors flex items-center gap-1.5"
+              className="px-3 py-2 text-xs font-semibold bg-red-600 hover:bg-red-700 text-white rounded-md shadow-xs transition-colors flex items-center gap-1.5 cursor-pointer"
             >
               <ShieldAlert className="w-3.5 h-3.5" />
               Tinjau Analisis Risiko
@@ -129,42 +141,56 @@ export const DashboardView: React.FC = () => {
         </div>
       </div>
 
-      {/* Filter Bar: Filter per OR dan Periode */}
+      {/* Filter Bar: Manual Text Input Search for OR dan Periode */}
       <div className="bg-white p-3.5 rounded-lg border border-slate-200 shadow-xs flex flex-wrap items-center justify-between gap-3">
         <div className="flex items-center gap-2 text-xs font-bold text-slate-800">
           <Filter className="w-4 h-4 text-blue-600" />
           <span>Filter Data Dashboard:</span>
         </div>
 
-        <div className="flex flex-wrap items-center gap-3">
-          {/* OR Filter */}
-          <div className="flex items-center gap-2">
-            <label className="text-xs font-medium text-slate-500">Nomor OR:</label>
-            <select
-              value={selectedOrFilter}
-              onChange={(e) => setSelectedOrFilter(e.target.value)}
-              className="px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded font-semibold text-slate-800 focus:outline-none focus:ring-1 focus:ring-blue-500"
-            >
-              <option value="ALL">
-                {availableOrs.length === 0
-                  ? 'Belum ada Nomor OR'
-                  : `Semua Nomor OR (${materialRequirements.length} item material)`}
-              </option>
-              {availableOrs.map((or) => {
-                const summary = getOrSummary(or);
-                return (
-                  <option key={or} value={or}>
-                    {or} {summary?.style ? `— ${summary.style}` : ''}
-                  </option>
-                );
-              })}
-            </select>
-            {selectedOrFilter !== 'ALL' && getOrSummary(selectedOrFilter)?.style && (
-              <span className="hidden lg:inline-flex items-center px-2 py-0.5 rounded text-[11px] font-medium bg-blue-50 text-blue-700 border border-blue-200">
-                Style: {getOrSummary(selectedOrFilter)?.style}
-              </span>
-            )}
+        <div className="flex flex-wrap items-center gap-3 flex-1 justify-end">
+          {/* Manual Text Input Search OR (Pure text input, NO dropdown!) */}
+          <div className="flex items-center gap-2 flex-1 min-w-[260px] max-w-sm">
+            <label className="text-xs font-bold text-slate-700 whitespace-nowrap flex items-center gap-1">
+              <Hash className="w-3.5 h-3.5 text-blue-600" />
+              Cari Nomor OR:
+            </label>
+            <div className="relative w-full">
+              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                value={orSearchInput}
+                onChange={(e) => setOrSearchInput(e.target.value)}
+                placeholder="Ketik Nomor OR (misal: OR-2026)..."
+                className="w-full pl-8 pr-7 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded font-mono font-semibold text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:bg-white"
+              />
+              {orSearchInput && (
+                <button
+                  type="button"
+                  onClick={() => setOrSearchInput('')}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                  title="Hapus pencarian OR"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
           </div>
+
+          {/* Active Style / Match Preview Badge */}
+          {orSearchInput.trim() && (
+            <div className="hidden lg:flex items-center gap-1.5">
+              {matchingRegisteredOrs.length === 1 && getOrSummary(matchingRegisteredOrs[0])?.style ? (
+                <span className="inline-flex items-center px-2 py-1 rounded text-[11px] font-medium bg-blue-50 text-blue-700 border border-blue-200">
+                  Style: {getOrSummary(matchingRegisteredOrs[0])?.style}
+                </span>
+              ) : (
+                <span className="inline-flex items-center px-2 py-1 rounded text-[11px] font-mono font-medium bg-slate-100 text-slate-700 border border-slate-200">
+                  {filteredRequirements.length} baris material cocok
+                </span>
+              )}
+            </div>
+          )}
 
           {/* Periode Filter */}
           <div className="flex items-center gap-2">
@@ -172,7 +198,7 @@ export const DashboardView: React.FC = () => {
             <select
               value={selectedPeriodFilter}
               onChange={(e) => setSelectedPeriodFilter(e.target.value)}
-              className="px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded font-semibold text-slate-800 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              className="px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded font-semibold text-slate-800 focus:outline-none focus:ring-1 focus:ring-blue-500 cursor-pointer"
             >
               <option value="ALL">Semua Periode</option>
               <option value="2026-11">Bulan November 2026</option>
@@ -180,13 +206,13 @@ export const DashboardView: React.FC = () => {
             </select>
           </div>
 
-          {(selectedOrFilter !== 'ALL' || selectedPeriodFilter !== 'ALL') && (
+          {(orSearchInput.trim() || selectedPeriodFilter !== 'ALL') && (
             <button
               onClick={() => {
-                setSelectedOrFilter('ALL');
+                setOrSearchInput('');
                 setSelectedPeriodFilter('ALL');
               }}
-              className="text-xs text-blue-600 hover:text-blue-800 font-semibold underline"
+              className="text-xs text-blue-600 hover:text-blue-800 font-semibold underline cursor-pointer"
             >
               Reset Filter
             </button>
@@ -262,7 +288,7 @@ export const DashboardView: React.FC = () => {
           </div>
         </div>
 
-        {/* Card 3: Jadwal SPK Terencana */}
+        {/* Card 3: Jadwal SPK Terencana (Filtered by typed OR) */}
         <div className="p-4 bg-white rounded-lg border border-slate-200 shadow-xs">
           <div className="flex items-center justify-between">
             <span className="text-xs font-medium text-slate-500">Jadwal Kalender Produksi</span>
@@ -270,14 +296,14 @@ export const DashboardView: React.FC = () => {
           </div>
           <div className="mt-2 flex items-baseline gap-2">
             <span className="text-2xl font-extrabold text-slate-900 tabular-nums">
-              {productionSchedules.length}
+              {filteredSchedules.length}
             </span>
             <span className="text-xs text-slate-500">batch OR</span>
           </div>
           <div className="mt-3 flex items-center justify-between text-xs text-slate-600 pt-2 border-t border-slate-100">
             <span>Total Target:</span>
             <strong className="text-slate-800 font-mono">
-              {productionSchedules.reduce((acc, s) => acc + s.target, 0).toLocaleString('id-ID')} unit
+              {filteredSchedules.reduce((acc, s) => acc + s.target, 0).toLocaleString('id-ID')} unit
             </strong>
           </div>
         </div>
@@ -324,61 +350,69 @@ export const DashboardView: React.FC = () => {
             </div>
           </div>
 
-          <div className="space-y-4">
-            {topMaterialsComparison.map((item) => {
-              const maxVal = Math.max(item.required, item.received, 1);
-              const reqPct = Math.round((item.required / maxVal) * 100);
-              const recPct = Math.round((item.received / maxVal) * 100);
-              const isFulfilled = item.received >= item.required;
-              const gap = item.required - item.received;
+          {topMaterialsComparison.length === 0 ? (
+            <div className="py-12 text-center text-xs text-slate-400">
+              {orSearchInput.trim()
+                ? `Tidak ada data material untuk Nomor OR "${orSearchInput}".`
+                : 'Belum ada data material yang tersimpan.'}
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {topMaterialsComparison.map((item) => {
+                const maxVal = Math.max(item.required, item.received, 1);
+                const reqPct = Math.round((item.required / maxVal) * 100);
+                const recPct = Math.round((item.received / maxVal) * 100);
+                const isFulfilled = item.received >= item.required;
+                const gap = item.required - item.received;
 
-              return (
-                <div key={item.code} className="space-y-1.5">
-                  <div className="flex items-center justify-between text-xs">
-                    <div>
-                      <span className="font-mono font-bold text-slate-900">{item.code}</span>
-                      <span className="text-slate-400 mx-1.5">·</span>
-                      <span className="text-slate-700 font-medium">{item.name}</span>
+                return (
+                  <div key={item.code} className="space-y-1.5">
+                    <div className="flex items-center justify-between text-xs">
+                      <div>
+                        <span className="font-mono font-bold text-slate-900">{item.code}</span>
+                        <span className="text-slate-400 mx-1.5">·</span>
+                        <span className="text-slate-700 font-medium">{item.name}</span>
+                      </div>
+                      <div className="text-right font-mono">
+                        <span className="text-slate-500">
+                          {item.received.toLocaleString('id-ID')} / {item.required.toLocaleString('id-ID')} {item.unit}
+                        </span>
+                        <span
+                          className={`ml-2 font-bold ${
+                            isFulfilled ? 'text-emerald-700' : 'text-red-600'
+                          }`}
+                        >
+                          {isFulfilled ? '✓ 100%' : `-${gap.toLocaleString('id-ID')} ${item.unit}`}
+                        </span>
+                      </div>
                     </div>
-                    <div className="text-right font-mono">
-                      <span className="text-slate-500">
-                        {item.received.toLocaleString('id-ID')} / {item.required.toLocaleString('id-ID')} {item.unit}
-                      </span>
-                      <span
-                        className={`ml-2 font-bold ${
-                          isFulfilled ? 'text-emerald-700' : 'text-red-600'
-                        }`}
-                      >
-                        {isFulfilled ? '✓ 100%' : `-${gap.toLocaleString('id-ID')} ${item.unit}`}
-                      </span>
+
+                    {/* Dual Bar */}
+                    <div className="space-y-1 bg-slate-50 p-1.5 rounded">
+                      {/* Bar Kebutuhan */}
+                      <div className="w-full bg-slate-200 h-2 rounded-full overflow-hidden">
+                        <div
+                          className="h-full bg-slate-500 rounded-full transition-all duration-500"
+                          style={{ width: `${reqPct}%` }}
+                          title={`Kebutuhan: ${item.required} ${item.unit}`}
+                        />
+                      </div>
+                      {/* Bar Diterima */}
+                      <div className="w-full bg-slate-200 h-2 rounded-full overflow-hidden">
+                        <div
+                          className={`h-full rounded-full transition-all duration-500 ${
+                            isFulfilled ? 'bg-emerald-500' : 'bg-emerald-600'
+                          }`}
+                          style={{ width: `${recPct}%` }}
+                          title={`Diterima: ${item.received} ${item.unit}`}
+                        />
+                      </div>
                     </div>
                   </div>
-
-                  {/* Dual Bar */}
-                  <div className="space-y-1 bg-slate-50 p-1.5 rounded">
-                    {/* Bar Kebutuhan */}
-                    <div className="w-full bg-slate-200 h-2 rounded-full overflow-hidden">
-                      <div
-                        className="h-full bg-slate-500 rounded-full transition-all duration-500"
-                        style={{ width: `${reqPct}%` }}
-                        title={`Kebutuhan: ${item.required} ${item.unit}`}
-                      />
-                    </div>
-                    {/* Bar Diterima */}
-                    <div className="w-full bg-slate-200 h-2 rounded-full overflow-hidden">
-                      <div
-                        className={`h-full rounded-full transition-all duration-500 ${
-                          isFulfilled ? 'bg-emerald-500' : 'bg-emerald-600'
-                        }`}
-                        style={{ width: `${recPct}%` }}
-                        title={`Diterima: ${item.received} ${item.unit}`}
-                      />
-                    </div>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
+                );
+              })}
+            </div>
+          )}
         </div>
 
         {/* Chart 2 (1 col): Grafik Status Material READY vs BELUM READY */}
@@ -464,7 +498,7 @@ export const DashboardView: React.FC = () => {
           <div className="pt-3 border-t border-slate-100 text-center">
             <button
               onClick={() => setActiveMenu('Material Risk Analysis')}
-              className="text-xs font-semibold text-blue-600 hover:text-blue-800 inline-flex items-center gap-1"
+              className="text-xs font-semibold text-blue-600 hover:text-blue-800 inline-flex items-center gap-1 cursor-pointer"
             >
               Buka Analisis Risiko Mendalam <ArrowRight className="w-3.5 h-3.5" />
             </button>
@@ -499,7 +533,9 @@ export const DashboardView: React.FC = () => {
 
         {paretoData.length === 0 ? (
           <div className="py-12 text-center text-xs text-slate-400">
-            Seluruh material pada filter ini sudah terpenuhi (Tidak ada kekurangan material).
+            {orSearchInput.trim()
+              ? `Tidak ditemukan kekurangan material untuk Nomor OR "${orSearchInput}".`
+              : 'Seluruh material pada filter ini sudah terpenuhi (Tidak ada kekurangan material).'}
           </div>
         ) : (
           <div>
