@@ -30,6 +30,20 @@ import {
   calculateMaterialComparisonMetrics,
   detectScheduleConflicts,
 } from '../utils/ppicCalculations';
+import {
+  getSupabaseCredentials,
+  getSupabaseClient,
+  saveCustomSupabaseCredentials,
+  clearCustomSupabaseCredentials,
+  testSupabaseConnection,
+  fetchAllPpicFromSupabase,
+  syncBatchExcelToSupabase,
+  deleteRequirementsFromSupabase,
+  logDeletionToSupabase,
+  saveScheduleToSupabase,
+  deleteScheduleFromSupabase,
+  seedLocalDataToSupabase,
+} from '../lib/supabase';
 
 export type AppMenu =
   | 'Dashboard'
@@ -193,6 +207,16 @@ interface PpicContextType {
     totalRows: number;
     uploadHistoryItems: UploadHistoryItem[];
   };
+
+  // Supabase Centralized Database State & Sync
+  supabaseConnected: boolean;
+  supabaseLoading: boolean;
+  supabaseSyncError: string | null;
+  lastSyncTimestamp: number | null;
+  syncWithSupabase: () => Promise<void>;
+  migrateLocalDataToSupabase: () => Promise<{ success: boolean; message: string }>;
+  updateSupabaseCredentials: (url: string, key: string) => Promise<{ success: boolean; message: string }>;
+  disconnectSupabase: () => void;
 }
 
 const PpicContext = createContext<PpicContextType | undefined>(undefined);
@@ -355,6 +379,180 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   }, [uploadHistory]);
 
+  // ---------------------------------------------------------------------------
+  // SUPABASE CENTRALIZED DATABASE & REALTIME SYNCHRONIZATION
+  // ---------------------------------------------------------------------------
+  const [supabaseConnected, setSupabaseConnected] = useState<boolean>(false);
+  const [supabaseLoading, setSupabaseLoading] = useState<boolean>(false);
+  const [supabaseSyncError, setSupabaseSyncError] = useState<string | null>(null);
+  const [lastSyncTimestamp, setLastSyncTimestamp] = useState<number | null>(null);
+
+  // Sync / pull fresh data from Supabase
+  const syncWithSupabase = async () => {
+    const creds = getSupabaseCredentials();
+    if (!creds.isConfigured) return;
+
+    setSupabaseLoading(true);
+    try {
+      const data = await fetchAllPpicFromSupabase();
+      if (data) {
+        if (data.materialRequirements.length > 0) {
+          setMaterialRequirements(data.materialRequirements);
+        }
+        if (data.uploadHistory.length > 0) {
+          setUploadHistory(data.uploadHistory);
+        }
+        if (data.productionSchedules.length > 0) {
+          setProductionSchedules(data.productionSchedules);
+        }
+        if (data.orStyleRelations.length > 0) {
+          setOrStyleRelations(data.orStyleRelations);
+        }
+        if (data.materials.length > 0) {
+          setMaterials(data.materials);
+        }
+        if (data.deletionHistory.length > 0) {
+          setDeletionHistory(data.deletionHistory);
+        }
+
+        setSupabaseConnected(true);
+        setSupabaseSyncError(null);
+        setLastSyncTimestamp(Date.now());
+      } else {
+        setSupabaseSyncError('Gagal memuat data dari database Supabase.');
+      }
+    } catch (err: any) {
+      setSupabaseSyncError(err.message || 'Koneksi ke database Supabase terputus.');
+    } finally {
+      setSupabaseLoading(false);
+    }
+  };
+
+  // Migrate offline/local data to Supabase (Safe migration)
+  const migrateLocalDataToSupabase = async () => {
+    setSupabaseLoading(true);
+    try {
+      const res = await seedLocalDataToSupabase({
+        materialRequirements,
+        uploadHistory,
+        productionSchedules,
+        orStyleRelations,
+        materials,
+      });
+
+      if (res.success) {
+        await syncWithSupabase();
+        setNotifications((prev) => [
+          {
+            id: `notif-${Date.now()}`,
+            type: 'info',
+            title: 'Migrasi Supabase Berhasil',
+            message: `${res.insertedCount} baris data berhasil disinkronkan ke database terpusat Supabase.`,
+            timestamp: 'Baru saja',
+            read: false,
+          },
+          ...prev,
+        ]);
+        return { success: true, message: res.message };
+      } else {
+        return { success: false, message: res.message };
+      }
+    } catch (err: any) {
+      return { success: false, message: err.message || 'Gagal melakukan migrasi' };
+    } finally {
+      setSupabaseLoading(false);
+    }
+  };
+
+  // Update Supabase credentials via Settings UI
+  const updateSupabaseCredentials = async (url: string, key: string) => {
+    saveCustomSupabaseCredentials(url, key);
+    const test = await testSupabaseConnection();
+    if (test.success) {
+      setSupabaseConnected(true);
+      setSupabaseSyncError(null);
+      await syncWithSupabase();
+      return { success: true, message: test.message };
+    } else {
+      setSupabaseConnected(false);
+      setSupabaseSyncError(test.message);
+      return { success: false, message: test.message };
+    }
+  };
+
+  const disconnectSupabase = () => {
+    clearCustomSupabaseCredentials();
+    setSupabaseConnected(false);
+    setSupabaseSyncError(null);
+  };
+
+  // Boot-time connect and Realtime Channel subscription
+  useEffect(() => {
+    let isMounted = true;
+    const creds = getSupabaseCredentials();
+
+    if (creds.isConfigured) {
+      setSupabaseLoading(true);
+      fetchAllPpicFromSupabase().then((data) => {
+        if (!isMounted) return;
+        if (data) {
+          if (data.materialRequirements.length > 0) setMaterialRequirements(data.materialRequirements);
+          if (data.uploadHistory.length > 0) setUploadHistory(data.uploadHistory);
+          if (data.productionSchedules.length > 0) setProductionSchedules(data.productionSchedules);
+          if (data.orStyleRelations.length > 0) setOrStyleRelations(data.orStyleRelations);
+          if (data.materials.length > 0) setMaterials(data.materials);
+          if (data.deletionHistory.length > 0) setDeletionHistory(data.deletionHistory);
+
+          setSupabaseConnected(true);
+          setSupabaseSyncError(null);
+          setLastSyncTimestamp(Date.now());
+        } else {
+          setSupabaseConnected(false);
+          setSupabaseSyncError('Tidak dapat terhubung ke tabel Supabase. Menggunakan data lokal.');
+        }
+        setSupabaseLoading(false);
+      }).catch((err) => {
+        if (!isMounted) return;
+        setSupabaseConnected(false);
+        setSupabaseSyncError(err.message || 'Gagal menghubungkan ke Supabase.');
+        setSupabaseLoading(false);
+      });
+    }
+
+    // Realtime channel subscription
+    const supabase = getSupabaseClient();
+    let channel: any = null;
+    if (supabase) {
+      channel = supabase
+        .channel('ppic-db-changes')
+        .on(
+          'postgres_changes',
+          { event: '*', schema: 'public' },
+          async () => {
+            if (!isMounted) return;
+            const fresh = await fetchAllPpicFromSupabase();
+            if (fresh && isMounted) {
+              setMaterialRequirements(fresh.materialRequirements);
+              setUploadHistory(fresh.uploadHistory);
+              setProductionSchedules(fresh.productionSchedules);
+              setOrStyleRelations(fresh.orStyleRelations);
+              setMaterials(fresh.materials);
+              setDeletionHistory(fresh.deletionHistory);
+              setLastSyncTimestamp(Date.now());
+            }
+          }
+        )
+        .subscribe();
+    }
+
+    return () => {
+      isMounted = false;
+      if (channel && supabase) {
+        supabase.removeChannel(channel);
+      }
+    };
+  }, []);
+
   // SINGLE SOURCE OF TRUTH FOR REGISTERED OR NUMBERS
   // Derived strictly from Excel uploads (uploadHistory and materialRequirements).
   // Ensures ONLY ORs that have been entered and saved via Upload Excel appear across the app.
@@ -457,6 +655,12 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       ...prev,
     ]);
 
+    // 5. Sync to Supabase
+    if (getSupabaseCredentials().isConfigured) {
+      deleteRequirementsFromSupabase({ by: 'or', value: clean, includeHistory });
+      logDeletionToSupabase(newRecord);
+    }
+
     return {
       success: true,
       deletedCount: rowCount,
@@ -504,6 +708,11 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       },
       ...prev,
     ]);
+
+    if (getSupabaseCredentials().isConfigured) {
+      deleteRequirementsFromSupabase({ by: 'id', value: id });
+      logDeletionToSupabase(newRecord);
+    }
 
     return {
       success: true,
@@ -557,6 +766,11 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       },
       ...prev,
     ]);
+
+    if (getSupabaseCredentials().isConfigured) {
+      deleteRequirementsFromSupabase({ by: 'ids', value: ids });
+      logDeletionToSupabase(newRecord);
+    }
 
     return {
       success: true,
@@ -619,6 +833,11 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       },
       ...prev,
     ]);
+
+    if (getSupabaseCredentials().isConfigured) {
+      deleteRequirementsFromSupabase({ by: 'style', value: cleanStyle });
+      logDeletionToSupabase(newRecord);
+    }
 
     return {
       success: true,
@@ -723,6 +942,11 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       ...prev,
     ]);
 
+    if (getSupabaseCredentials().isConfigured) {
+      deleteRequirementsFromSupabase({ by: 'uploadId', value: uploadId });
+      logDeletionToSupabase(newRecord);
+    }
+
     return {
       success: true,
       deletedCount: rowCount,
@@ -771,6 +995,11 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       };
       setDeletionHistory((prev) => [newRecord, ...prev]);
 
+      if (getSupabaseCredentials().isConfigured) {
+        deleteRequirementsFromSupabase({ by: 'updateDate', value: targetDate });
+        logDeletionToSupabase(newRecord);
+      }
+
       return {
         success: true,
         deletedCount: rowCount,
@@ -798,6 +1027,11 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
         user: 'Tim PPIC (Terautentikasi)',
       };
       setDeletionHistory((prev) => [newRecord, ...prev]);
+
+      if (getSupabaseCredentials().isConfigured) {
+        deleteRequirementsFromSupabase({ by: 'or', value: clean, includeHistory: true });
+        logDeletionToSupabase(newRecord);
+      }
 
       return {
         success: true,
@@ -897,6 +1131,11 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       },
       ...prev,
     ]);
+
+    if (getSupabaseCredentials().isConfigured) {
+      deleteRequirementsFromSupabase({ by: 'updateDate', value: cleanDate });
+      logDeletionToSupabase(newRecord);
+    }
 
     return {
       success: true,
@@ -1032,13 +1271,22 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // Automatically remember OR <-> Style relation
     saveOrStyleRelation(sch.orNumber, sch.style);
 
+    if (getSupabaseCredentials().isConfigured) {
+      saveScheduleToSupabase(newSch);
+    }
+
     return newSch;
   };
 
   const updateProductionSchedule = (id: string, updates: Partial<ProductionSchedule>) => {
-    setProductionSchedules((prev) =>
-      prev.map((s) => (s.id === id ? { ...s, ...updates } : s))
-    );
+    setProductionSchedules((prev) => {
+      const next = prev.map((s) => (s.id === id ? { ...s, ...updates } : s));
+      const target = next.find((s) => s.id === id);
+      if (target && getSupabaseCredentials().isConfigured) {
+        saveScheduleToSupabase(target);
+      }
+      return next;
+    });
     if (updates.orNumber && updates.style) {
       saveOrStyleRelation(updates.orNumber, updates.style);
     }
@@ -1046,6 +1294,9 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   const deleteProductionSchedule = (id: string) => {
     setProductionSchedules((prev) => prev.filter((s) => s.id !== id));
+    if (getSupabaseCredentials().isConfigured) {
+      deleteScheduleFromSupabase(id);
+    }
   };
 
   // Requirement CRUD
@@ -1248,7 +1499,35 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       ...prev,
     ]);
 
-    // 7. Direct automatic navigation to Master Data Material
+    // 7. Sync to Centralized Supabase Database if configured
+    if (getSupabaseCredentials().isConfigured) {
+      syncBatchExcelToSupabase({
+        uploadHistoryItem: newHistItem,
+        relation: {
+          id: `rel-${Date.now()}`,
+          orNumber: primaryOr,
+          style: primaryStyle,
+          createdAt: new Date().toISOString(),
+        },
+        requirements: newRequirements.map((r) => ({
+          ...r,
+          uploadId,
+          orNumber: primaryOr,
+          style: primaryStyle,
+          updateDate: effectiveUpdateDate,
+        })),
+        masterMaterials: newMasterMaterials,
+      }).then((res) => {
+        if (res.success) {
+          setLastSyncTimestamp(Date.now());
+          setSupabaseConnected(true);
+        } else {
+          console.warn('Background Supabase sync notice:', res.error);
+        }
+      });
+    }
+
+    // 8. Direct automatic navigation to Master Data Material
     setActiveMenu('Rekap Material');
   };
 
@@ -1352,6 +1631,16 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
         setSelectedScheduleId,
         selectedWorkOrderId: selectedScheduleId,
         setSelectedWorkOrderId: setSelectedScheduleId,
+
+        // Supabase Centralized Sync
+        supabaseConnected,
+        supabaseLoading,
+        supabaseSyncError,
+        lastSyncTimestamp,
+        syncWithSupabase,
+        migrateLocalDataToSupabase,
+        updateSupabaseCredentials,
+        disconnectSupabase,
       }}
     >
       {children}

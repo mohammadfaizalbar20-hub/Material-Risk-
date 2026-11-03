@@ -18,6 +18,8 @@ import {
   Eye,
   ArrowRight,
   ShieldAlert,
+  Search,
+  Hash,
 } from 'lucide-react';
 import { getIndonesianHolidayInfo, DayHolidayInfo } from '../../utils/indonesianHolidays';
 
@@ -42,7 +44,7 @@ export const ProductionScheduleView: React.FC = () => {
   const [currentYear, setCurrentYear] = useState<number>(2026);
   const [currentMonth, setCurrentMonth] = useState<number>(10); // 0-indexed: 10 = November
   const [selectedLineFilter, setSelectedLineFilter] = useState<string>('ALL');
-  const [selectedOrFilter, setSelectedOrFilter] = useState<string>('ALL');
+  const [orSearchInput, setOrSearchInput] = useState<string>('');
 
   // Modal states
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -316,6 +318,20 @@ export const ProductionScheduleView: React.FC = () => {
     return defaultLines.filter((l) => l === selectedLineFilter);
   }, [defaultLines, selectedLineFilter]);
 
+  // Total matching schedules based on line and typed OR / Style search
+  const totalVisibleSchedulesAcrossBoard = useMemo(() => {
+    return productionSchedules.filter((s) => {
+      if (selectedLineFilter !== 'ALL' && s.productionLine !== selectedLineFilter) return false;
+      if (orSearchInput.trim()) {
+        const q = orSearchInput.trim().toUpperCase();
+        const matchOr = s.orNumber.toUpperCase().includes(q);
+        const matchStyle = (s.style || '').toUpperCase().includes(q);
+        if (!matchOr && !matchStyle) return false;
+      }
+      return true;
+    });
+  }, [productionSchedules, selectedLineFilter, orSearchInput]);
+
   // Color generator for schedule blocks
   const getBlockColor = (sch: ProductionSchedule, hasConflict: boolean) => {
     if (hasConflict) {
@@ -432,8 +448,9 @@ export const ProductionScheduleView: React.FC = () => {
               setCurrentMonth(10);
             }}
             className="text-[11px] font-medium text-blue-600 hover:text-blue-800 ml-2"
+            title="Reset ke Nov 2026"
           >
-            Reset ke Nov 2026
+            Reset
           </button>
         </div>
 
@@ -467,31 +484,54 @@ export const ProductionScheduleView: React.FC = () => {
             </select>
           </div>
 
-          {/* OR Filter (Integrated with single source of truth) */}
-          <div className="flex items-center gap-1.5">
-            <span className="text-xs font-semibold text-slate-600">Filter OR:</span>
-            <select
-              value={selectedOrFilter}
-              onChange={(e) => setSelectedOrFilter(e.target.value)}
-              className="px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-md text-slate-800 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
-            >
-              <option value="ALL">Semua OR ({registeredOrNumbers.length})</option>
-              {registeredOrNumbers.length === 0 ? (
-                <option disabled value="">Belum ada Nomor OR</option>
-              ) : (
-                registeredOrNumbers.map((or) => {
-                  const summary = getOrSummary(or);
-                  return (
-                    <option key={or} value={or}>
-                      {or} {summary?.style ? `— ${summary.style}` : ''}
-                    </option>
-                  );
-                })
+          {/* OR Searchbar (Input Ketik Manual - Single Source of Truth from Upload Excel) */}
+          <div className="flex items-center gap-1.5 min-w-[240px] max-w-xs">
+            <span className="text-xs font-semibold text-slate-600 whitespace-nowrap flex items-center gap-1">
+              <Hash className="w-3.5 h-3.5 text-blue-600" />
+              Cari OR:
+            </span>
+            <div className="relative w-full">
+              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                value={orSearchInput}
+                onChange={(e) => setOrSearchInput(e.target.value)}
+                placeholder={registeredOrNumbers.length === 0 ? "Belum ada Nomor OR" : "Ketik Nomor OR / Style..."}
+                disabled={registeredOrNumbers.length === 0}
+                className="w-full pl-8 pr-7 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded-md font-mono font-semibold text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:bg-white"
+              />
+              {orSearchInput && (
+                <button
+                  type="button"
+                  onClick={() => setOrSearchInput('')}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
+                  title="Hapus pencarian"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
               )}
-            </select>
+            </div>
           </div>
         </div>
       </div>
+
+      {/* Message: Data tidak ditemukan when search query has no match */}
+      {orSearchInput.trim() && totalVisibleSchedulesAcrossBoard.length === 0 && (
+        <div className="p-4 bg-amber-50 border border-amber-300 rounded-lg text-xs text-amber-900 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+            <div>
+              <span className="font-bold">Data tidak ditemukan:</span> Tidak ada jadwal produksi yang cocok dengan kata kunci &ldquo;{orSearchInput}&rdquo;.
+            </div>
+          </div>
+          <button
+            onClick={() => setOrSearchInput('')}
+            className="text-xs text-blue-700 hover:text-blue-900 font-semibold underline cursor-pointer shrink-0 ml-3"
+          >
+            Tampilkan Seluruh Data
+          </button>
+        </div>
+      )}
 
       {/* Production Planning Board (Horizontal Gantt Calendar with Fixed Sticky Line Column & Holiday Markings) */}
       <div className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
@@ -560,7 +600,12 @@ export const ProductionScheduleView: React.FC = () => {
 
                 // Filter schedules that touch this active month and match selected OR
                 const visibleSchedules = lineSchedules.filter((s) => {
-                  if (selectedOrFilter !== 'ALL' && s.orNumber !== selectedOrFilter) return false;
+                  if (orSearchInput.trim()) {
+                    const q = orSearchInput.trim().toUpperCase();
+                    const matchOr = s.orNumber.toUpperCase().includes(q);
+                    const matchStyle = (s.style || '').toUpperCase().includes(q);
+                    if (!matchOr && !matchStyle) return false;
+                  }
                   const sStart = new Date(s.productionDate);
                   const sEnd = new Date(s.finishDate);
                   const mStart = new Date(currentYear, currentMonth, 1);
@@ -935,22 +980,11 @@ export const ProductionScheduleView: React.FC = () => {
                   <input
                     type="text"
                     required
-                    list="orOptionsList"
                     value={formData.orNumber}
                     onChange={(e) => handleOrChange(e.target.value)}
-                    placeholder="Contoh: OR-2026-001"
+                    placeholder="Ketik Nomor OR (Contoh: OR-2026-001)"
                     className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md font-mono uppercase focus:outline-hidden focus:ring-2 focus:ring-blue-500"
                   />
-                  <datalist id="orOptionsList">
-                    {registeredOrNumbers.map((or) => {
-                      const summary = getOrSummary(or);
-                      return (
-                        <option key={or} value={or}>
-                          {summary?.style ? `${or} (${summary.style})` : or}
-                        </option>
-                      );
-                    })}
-                  </datalist>
 
                   {/* Quick OR selector chips */}
                   {registeredOrNumbers.length > 0 ? (

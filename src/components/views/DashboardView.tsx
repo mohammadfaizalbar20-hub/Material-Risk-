@@ -157,7 +157,8 @@ export const DashboardView: React.FC = () => {
                 type="text"
                 value={orSearchInput}
                 onChange={(e) => setOrSearchInput(e.target.value)}
-                placeholder="Ketik Nomor OR (misal: OR-2026)..."
+                placeholder={registeredOrNumbers.length === 0 ? "Belum ada Nomor OR" : "Ketik Nomor OR (misal: OR-2026)..."}
+                disabled={registeredOrNumbers.length === 0}
                 className="w-full pl-8 pr-7 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded font-mono font-semibold text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:bg-white"
               />
               {orSearchInput && (
@@ -215,6 +216,24 @@ export const DashboardView: React.FC = () => {
           )}
         </div>
       </div>
+
+      {/* Message: Data tidak ditemukan when typed search yields no records */}
+      {orSearchInput.trim() && filteredRequirements.length === 0 && (
+        <div className="p-4 bg-amber-50 border border-amber-300 rounded-lg text-xs text-amber-900 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+            <div>
+              <span className="font-bold">Data tidak ditemukan:</span> Tidak ada data Nomor OR atau material yang sesuai dengan kata kunci &ldquo;{orSearchInput}&rdquo;.
+            </div>
+          </div>
+          <button
+            onClick={() => setOrSearchInput('')}
+            className="text-xs text-blue-700 hover:text-blue-900 font-semibold underline cursor-pointer shrink-0 ml-3"
+          >
+            Tampilkan Seluruh Data
+          </button>
+        </div>
+      )}
 
       {/* 4 Core Summary Cards */}
       <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">

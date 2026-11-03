@@ -19,6 +19,8 @@ import {
   Tag,
   Hash,
   AlertCircle,
+  Search,
+  X,
 } from 'lucide-react';
 import { RiskLevel } from '../../types/ppic';
 
@@ -34,29 +36,40 @@ export const MaterialRiskAnalysisView: React.FC = () => {
 
   const [activeTab, setActiveTab] = useState<'or' | 'material'>('or');
   const [filterRisk, setFilterRisk] = useState<string>('ALL');
-  const [filterOr, setFilterOr] = useState<string>('ALL');
+  const [orSearchInput, setOrSearchInput] = useState<string>('');
   const [expandedOrNumber, setExpandedOrNumber] = useState<string | null>(null);
 
   // Single Source of Truth for unique ORs from Upload Excel
   const uniqueOrs = registeredOrNumbers;
 
-  // Filtered OR Summaries
+  // Filtered OR Summaries (Supports partial typing on No. OR and Style)
   const filteredOrSummaries = useMemo(() => {
     return orRiskSummaries.filter((item) => {
       if (filterRisk !== 'ALL' && item.highestRiskCategory !== filterRisk) return false;
-      if (filterOr !== 'ALL' && item.orNumber !== filterOr) return false;
+      if (orSearchInput.trim()) {
+        const q = orSearchInput.trim().toUpperCase();
+        const matchOr = item.orNumber.toUpperCase().includes(q);
+        const matchStyle = (item.style || '').toUpperCase().includes(q);
+        if (!matchOr && !matchStyle) return false;
+      }
       return true;
     });
-  }, [orRiskSummaries, filterRisk, filterOr]);
+  }, [orRiskSummaries, filterRisk, orSearchInput]);
 
-  // Filtered Material Assessments
+  // Filtered Material Assessments (Supports partial typing on No. OR, Style, Material Code/Name)
   const filteredMaterialAssessments = useMemo(() => {
     return materialRiskAssessments.filter((item) => {
       if (filterRisk !== 'ALL' && item.riskCategory !== filterRisk) return false;
-      if (filterOr !== 'ALL' && item.orNumber !== filterOr) return false;
+      if (orSearchInput.trim()) {
+        const q = orSearchInput.trim().toUpperCase();
+        const matchOr = item.orNumber.toUpperCase().includes(q);
+        const matchMatCode = item.materialCode.toUpperCase().includes(q);
+        const matchMatName = item.materialName.toUpperCase().includes(q);
+        if (!matchOr && !matchMatCode && !matchMatName) return false;
+      }
       return true;
     });
-  }, [materialRiskAssessments, filterRisk, filterOr]);
+  }, [materialRiskAssessments, filterRisk, orSearchInput]);
 
   // Risk counts
   const riskCounts = useMemo(() => {
@@ -264,39 +277,43 @@ export const MaterialRiskAnalysisView: React.FC = () => {
           </button>
         </div>
 
-        {/* OR Filter & Reset */}
-        <div className="flex items-center gap-2">
-          <Filter className="w-3.5 h-3.5 text-slate-400" />
-          <span className="text-xs font-semibold text-slate-600">Filter OR:</span>
-          <select
-            value={filterOr}
-            onChange={(e) => setFilterOr(e.target.value)}
-            className="px-2.5 py-1 text-xs bg-slate-50 border border-slate-200 rounded-md text-slate-800 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
-          >
-            <option value="ALL">Semua Nomor OR ({uniqueOrs.length})</option>
-            {uniqueOrs.length === 0 ? (
-              <option disabled value="">Belum ada Nomor OR</option>
-            ) : (
-              uniqueOrs.map((or) => {
-                const summary = getOrSummary(or);
-                return (
-                  <option key={or} value={or}>
-                    {or} {summary?.style ? `— ${summary.style}` : ''}
-                  </option>
-                );
-              })
+        {/* OR Searchbar (Input Ketik Manual - Single Source of Truth from Upload Excel) */}
+        <div className="flex items-center gap-2 flex-1 sm:max-w-xs">
+          <span className="text-xs font-semibold text-slate-600 whitespace-nowrap flex items-center gap-1">
+            <Hash className="w-3.5 h-3.5 text-blue-600" />
+            Cari OR:
+          </span>
+          <div className="relative w-full">
+            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+            <input
+              type="text"
+              value={orSearchInput}
+              onChange={(e) => setOrSearchInput(e.target.value)}
+              placeholder={uniqueOrs.length === 0 ? "Belum ada Nomor OR" : "Ketik Nomor OR (misal: OR-2026)..."}
+              disabled={uniqueOrs.length === 0}
+              className="w-full pl-8 pr-7 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded-md font-mono font-semibold text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:bg-white"
+            />
+            {orSearchInput && (
+              <button
+                type="button"
+                onClick={() => setOrSearchInput('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
+                title="Hapus pencarian"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
             )}
-          </select>
+          </div>
 
-          {(filterRisk !== 'ALL' || filterOr !== 'ALL') && (
+          {(filterRisk !== 'ALL' || orSearchInput.trim()) && (
             <button
               onClick={() => {
                 setFilterRisk('ALL');
-                setFilterOr('ALL');
+                setOrSearchInput('');
               }}
-              className="text-xs text-blue-600 font-semibold hover:underline ml-2"
+              className="text-xs text-blue-600 font-semibold hover:underline ml-1 whitespace-nowrap cursor-pointer"
             >
-              Reset Filter
+              Reset
             </button>
           )}
         </div>
@@ -307,7 +324,10 @@ export const MaterialRiskAnalysisView: React.FC = () => {
         <div className="space-y-4">
           {filteredOrSummaries.length === 0 ? (
             <div className="p-8 text-center bg-white rounded-lg border border-slate-200 text-slate-500 text-xs">
-              Tidak ada data penilaian risiko untuk filter yang dipilih.
+              <div className="font-bold text-slate-700 text-sm mb-1">Data tidak ditemukan</div>
+              {uniqueOrs.length === 0
+                ? "Belum ada Nomor OR terdaftar dari menu Upload Excel."
+                : `Tidak ada data penilaian risiko OR yang sesuai dengan kata kunci "${orSearchInput}".`}
             </div>
           ) : (
             filteredOrSummaries.map((summary) => {
@@ -508,7 +528,17 @@ export const MaterialRiskAnalysisView: React.FC = () => {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {filteredMaterialAssessments.map((item, idx) => {
+                {filteredMaterialAssessments.length === 0 ? (
+                  <tr>
+                    <td colSpan={11} className="py-12 text-center text-slate-500 text-xs">
+                      <div className="font-bold text-slate-700 text-sm mb-1">Data tidak ditemukan</div>
+                      {uniqueOrs.length === 0
+                        ? "Belum ada Nomor OR terdaftar dari menu Upload Excel."
+                        : `Tidak ada detail penilaian material yang cocok dengan kata kunci "${orSearchInput}".`}
+                    </td>
+                  </tr>
+                ) : (
+                  filteredMaterialAssessments.map((item, idx) => {
                   const isCritical = item.riskCategory === 'CRITICAL';
                   const isHigh = item.riskCategory === 'HIGH';
 
@@ -596,7 +626,7 @@ export const MaterialRiskAnalysisView: React.FC = () => {
                       </td>
                     </tr>
                   );
-                })}
+                }))}
               </tbody>
             </table>
           </div>

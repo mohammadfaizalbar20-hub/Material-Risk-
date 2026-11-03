@@ -1,4 +1,4 @@
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
 import { usePpic } from '../../context/PpicContext';
 import { RiskBadge } from '../common/RiskBadge';
 import { MarkdownRenderer } from '../common/MarkdownRenderer';
@@ -19,6 +19,9 @@ import {
   CheckCircle2,
   Lock,
   MessageSquare,
+  Search,
+  X,
+  Hash,
 } from 'lucide-react';
 
 interface ChatMessage {
@@ -96,6 +99,18 @@ Berdasarkan data stok aktual dan jadwal OR yang tersimpan di sistem:
   const [inputMessage, setInputMessage] = useState('');
   const [loading, setLoading] = useState(false);
   const [copiedId, setCopiedId] = useState<string | null>(null);
+  const [chatSearchQuery, setChatSearchQuery] = useState('');
+
+  // Filter messages based on typed keyword or No. OR
+  const displayedMessages = useMemo(() => {
+    if (!chatSearchQuery.trim()) return messages;
+    const q = chatSearchQuery.trim().toLowerCase();
+    return messages.filter(
+      (m) =>
+        m.text.toLowerCase().includes(q) ||
+        m.senderName.toLowerCase().includes(q)
+    );
+  }, [messages, chatSearchQuery]);
 
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -259,7 +274,29 @@ Silakan sampaikan pertanyaan atau pilih rekomendasi cepat!`,
           </div>
         </div>
 
-        <div className="flex items-center gap-2 self-start md:self-auto shrink-0">
+        <div className="flex flex-wrap items-center gap-2 self-start md:self-auto shrink-0">
+          {/* Searchbar Percakapan / Topik OR (Input Ketik Manual) */}
+          <div className="relative min-w-[220px]">
+            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+            <input
+              type="text"
+              value={chatSearchQuery}
+              onChange={(e) => setChatSearchQuery(e.target.value)}
+              placeholder="Cari pesan / Nomor OR (misal: OR-2026)..."
+              className="w-full pl-8 pr-7 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded-md font-medium text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
+            />
+            {chatSearchQuery && (
+              <button
+                type="button"
+                onClick={() => setChatSearchQuery('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
+                title="Hapus pencarian"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
+          </div>
+
           {/* Mode Switcher */}
           <div className="flex items-center bg-slate-100 p-1 rounded-lg border border-slate-200 text-xs">
             <button
@@ -303,7 +340,13 @@ Silakan sampaikan pertanyaan atau pilih rekomendasi cepat!`,
         <div className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden flex flex-col min-h-[580px] md:h-[640px]">
           {/* Messages Scroll Area */}
           <div className="flex-1 p-4 md:p-6 overflow-y-auto space-y-5 bg-slate-50/50">
-            {messages.map((msg) => {
+            {displayedMessages.length === 0 ? (
+              <div className="p-12 text-center text-slate-500 text-xs">
+                <div className="font-bold text-slate-700 text-sm mb-1">Data tidak ditemukan</div>
+                Tidak ada riwayat percakapan yang cocok dengan kata kunci &ldquo;{chatSearchQuery}&rdquo;.
+              </div>
+            ) : (
+              displayedMessages.map((msg: ChatMessage) => {
               const isUser = msg.sender === 'user';
               return (
                 <div
@@ -376,7 +419,7 @@ Silakan sampaikan pertanyaan atau pilih rekomendasi cepat!`,
                   </div>
                 </div>
               );
-            })}
+            }))}
 
             {/* Loading Indicator */}
             {loading && (

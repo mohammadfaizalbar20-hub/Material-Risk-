@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useMemo } from 'react';
 import { usePpic } from '../../context/PpicContext';
 import * as XLSX from 'xlsx';
 import {
@@ -20,6 +20,8 @@ import {
   History,
   Clock,
   Layers,
+  Search,
+  X,
 } from 'lucide-react';
 import { parseExcelRowsToMaterials } from '../../utils/excelMaterialParser';
 
@@ -58,6 +60,20 @@ export const UploadExcelView: React.FC = () => {
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  // Riwayat Upload Search Input (Typed manual search - Single source of truth)
+  const [historySearchInput, setHistorySearchInput] = useState<string>('');
+
+  const filteredUploadHistory = useMemo(() => {
+    if (!historySearchInput.trim()) return uploadHistory;
+    const q = historySearchInput.trim().toUpperCase();
+    return uploadHistory.filter((hist) =>
+      hist.orNumber.toUpperCase().includes(q) ||
+      (hist.style && hist.style.toUpperCase().includes(q)) ||
+      (hist.fileName && hist.fileName.toUpperCase().includes(q)) ||
+      (hist.updateDate && hist.updateDate.includes(q))
+    );
+  }, [uploadHistory, historySearchInput]);
 
   // Handle changes to OR Number with auto-fill for Style
   const handleOrChange = (value: string) => {
@@ -523,19 +539,11 @@ export const UploadExcelView: React.FC = () => {
               <div className="relative">
                 <input
                   type="text"
-                  list="registeredOrDatalist"
                   value={orNumber}
                   onChange={(e) => handleOrChange(e.target.value)}
-                  placeholder="Ketik / pilih OR (Contoh: OR-2026-001)"
+                  placeholder="Ketik Nomor OR (Contoh: OR-2026-001)"
                   className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 font-mono uppercase bg-white font-medium"
                 />
-                <datalist id="registeredOrDatalist">
-                  {registeredOrNumbers.map((or) => (
-                    <option key={or} value={or}>
-                      {getStyleForOr(or) ? `${or} (${getStyleForOr(or)})` : or}
-                    </option>
-                  ))}
-                </datalist>
               </div>
               <p className="text-[11px] text-slate-400 mt-1">
                 Mendukung pencarian sebagian teks. OR yang dipilih otomatis mengisi Style.
@@ -934,8 +942,33 @@ export const UploadExcelView: React.FC = () => {
             </div>
           </div>
 
-          <div className="text-[11px] text-slate-500">
-            Riwayat tidak ditimpa saat ada upload baru
+          <div className="flex flex-wrap items-center gap-3">
+            {/* Searchbar Riwayat Upload (Input Ketik Manual) */}
+            <div className="relative min-w-[240px]">
+              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+              <input
+                type="text"
+                value={historySearchInput}
+                onChange={(e) => setHistorySearchInput(e.target.value)}
+                placeholder={uploadHistory.length === 0 ? "Belum ada Nomor OR" : "Cari No. OR / Style riwayat..."}
+                disabled={uploadHistory.length === 0}
+                className="w-full pl-8 pr-7 py-1 text-xs bg-white border border-slate-300 rounded-md font-mono font-semibold text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500"
+              />
+              {historySearchInput && (
+                <button
+                  type="button"
+                  onClick={() => setHistorySearchInput('')}
+                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
+                  title="Hapus pencarian"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              )}
+            </div>
+
+            <div className="text-[11px] text-slate-500 hidden md:block">
+              Riwayat tidak ditimpa saat ada upload baru
+            </div>
           </div>
         </div>
 
@@ -957,11 +990,18 @@ export const UploadExcelView: React.FC = () => {
               {uploadHistory.length === 0 ? (
                 <tr>
                   <td colSpan={8} className="py-8 text-center text-slate-400 text-xs">
-                    Belum ada riwayat proses upload. Silakan unggah berkas Excel.
+                    Belum ada riwayat proses upload. Belum ada Nomor OR. Silakan unggah berkas Excel.
+                  </td>
+                </tr>
+              ) : filteredUploadHistory.length === 0 ? (
+                <tr>
+                  <td colSpan={8} className="py-8 text-center text-slate-500 text-xs">
+                    <div className="font-bold text-slate-700 text-sm mb-1">Data tidak ditemukan</div>
+                    Tidak ada riwayat upload yang cocok dengan kata kunci &ldquo;{historySearchInput}&rdquo;.
                   </td>
                 </tr>
               ) : (
-                uploadHistory.map((hist) => (
+                filteredUploadHistory.map((hist) => (
                   <tr key={hist.id} className="hover:bg-slate-50 transition-colors">
                     <td className="py-2.5 px-3.5 font-mono font-bold text-blue-700 whitespace-nowrap">
                       <div className="inline-flex items-center gap-1.5 px-2 py-0.5 bg-blue-50 border border-blue-200 rounded">
