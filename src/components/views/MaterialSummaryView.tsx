@@ -72,6 +72,9 @@ export const MaterialSummaryView: React.FC = () => {
   // Checkbox selection state for batch deletion
   const [selectedRowIds, setSelectedRowIds] = useState<Set<string>>(new Set());
 
+  // Expandable Style detail state
+  const [expandedStyleRowId, setExpandedStyleRowId] = useState<string | null>(null);
+
   // Modal states for Add / Edit
   const [addReqModalOpen, setAddReqModalOpen] = useState<boolean>(false);
   const [editingReq, setEditingReq] = useState<MaterialItemRequirement | null>(null);
@@ -1093,7 +1096,7 @@ export const MaterialSummaryView: React.FC = () => {
                     {/* 2. No. OR */}
                     <th className="py-3 px-3.5 whitespace-nowrap">No. OR</th>
                     {/* 3. Style */}
-                    <th className="py-3 px-3.5 min-w-[140px]">Style</th>
+                    <th className="py-3 px-3.5 w-44 min-w-[130px] max-w-[170px]">Style</th>
                     {/* 4. Kode Material */}
                     <th className="py-3 px-3.5 whitespace-nowrap">Kode Material</th>
                     {/* 5. Nama Material */}
@@ -1172,8 +1175,35 @@ export const MaterialSummaryView: React.FC = () => {
                           </td>
 
                           {/* 3. Style */}
-                          <td className="py-3 px-3.5 text-slate-800 font-medium">
-                            {row.style || '-'}
+                          <td className="py-3 px-3.5 text-slate-800 font-medium w-44 min-w-[130px] max-w-[170px]">
+                            <div
+                              onClick={() => setExpandedStyleRowId(expandedStyleRowId === row.id ? null : row.id)}
+                              className="group cursor-pointer select-text"
+                              title={row.style ? `Klik atau arahkan kursor untuk melihat Style lengkap:\n${row.style}` : '-'}
+                            >
+                              <div
+                                className={`text-xs break-words leading-tight transition-all ${
+                                  expandedStyleRowId === row.id ? '' : 'line-clamp-2'
+                                }`}
+                                style={
+                                  expandedStyleRowId === row.id
+                                    ? undefined
+                                    : {
+                                        display: '-webkit-box',
+                                        WebkitLineClamp: 2,
+                                        WebkitBoxOrient: 'vertical',
+                                        overflow: 'hidden',
+                                      }
+                                }
+                              >
+                                {row.style || '-'}
+                              </div>
+                              {row.style && row.style.length > 25 && (
+                                <span className="text-[10px] text-blue-600 opacity-0 group-hover:opacity-100 transition-opacity block font-normal mt-0.5">
+                                  {expandedStyleRowId === row.id ? 'Tutup detail' : 'Lihat detail'}
+                                </span>
+                              )}
+                            </div>
                           </td>
 
                           {/* 4. Kode Material */}
