@@ -110,10 +110,6 @@ export const DashboardView: React.FC = () => {
       <div className="p-5 bg-gradient-to-r from-slate-900 via-blue-950 to-slate-900 text-white rounded-xl shadow-xs border border-slate-800">
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
           <div>
-            <div className="inline-flex items-center gap-2 px-2.5 py-0.5 rounded bg-blue-500/20 text-blue-300 border border-blue-400/30 text-xs font-semibold mb-2">
-              <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
-              PPIC Command Center · Plant Cikarang 1
-            </div>
             <h2 className="text-lg md:text-xl font-bold tracking-tight">
               Dashboard Analisis Kebutuhan Material & Kesiapan Produksi
             </h2>
