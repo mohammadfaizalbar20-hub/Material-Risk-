@@ -1,7 +1,7 @@
 import React, { useState, useEffect } from 'react';
 import { usePpic } from '../../context/PpicContext';
 import { RiskBadge } from '../common/RiskBadge';
-import { getSupabaseCredentials } from '../../lib/supabase';
+import { getSupabaseCredentials, getSupabaseLiveCounts, cleanSupabaseUrl } from '../../lib/supabase';
 import {
   Settings,
   Shield,
@@ -23,6 +23,11 @@ import {
   Copy,
   Check,
   Code,
+  Eye,
+  EyeOff,
+  ArrowLeftRight,
+  Share2,
+  Layers,
 } from 'lucide-react';
 
 export const SettingsView: React.FC = () => {
@@ -48,6 +53,75 @@ export const SettingsView: React.FC = () => {
   const [isMigrating, setIsMigrating] = useState(false);
   const [showSqlGuide, setShowSqlGuide] = useState(false);
   const [copiedSql, setCopiedSql] = useState(false);
+  const [showAnonKey, setShowAnonKey] = useState(false);
+
+  const isUrlActuallyKey =
+    supabaseUrlInput.trim().startsWith('sb_publishable_') ||
+    supabaseUrlInput.trim().startsWith('eyJ');
+
+  const isKeyActuallyUrl =
+    supabaseAnonKeyInput.trim().startsWith('http://') ||
+    supabaseAnonKeyInput.trim().startsWith('https://');
+
+  const handleSwapCredentials = () => {
+    const tempUrl = supabaseUrlInput;
+    setSupabaseUrlInput(supabaseAnonKeyInput);
+    setSupabaseAnonKeyInput(tempUrl);
+    setSupabaseActionStatus({
+      type: 'info',
+      message: 'Posisi URL dan Key berhasil ditukar. Pastikan URL diawali https:// dan Key diawali sb_publishable_ lalu klik Simpan & Uji Koneksi.',
+    });
+  };
+
+  const [cloudStats, setCloudStats] = useState<{
+    requirementsCount: number;
+    historyCount: number;
+    relationsCount: number;
+    schedulesCount: number;
+    materialsCount: number;
+  } | null>(null);
+  const [copiedShareLink, setCopiedShareLink] = useState(false);
+
+  const refreshCloudStats = async () => {
+    const res = await getSupabaseLiveCounts();
+    if (res.connected) {
+      setCloudStats({
+        requirementsCount: res.requirementsCount,
+        historyCount: res.historyCount,
+        relationsCount: res.relationsCount,
+        schedulesCount: res.schedulesCount,
+        materialsCount: res.materialsCount,
+      });
+    }
+  };
+
+  useEffect(() => {
+    if (supabaseConnected) {
+      refreshCloudStats();
+    }
+  }, [supabaseConnected, lastSyncTimestamp]);
+
+  const handleCopyShareLink = () => {
+    const cleanUrl = supabaseUrlInput.trim();
+    const cleanKey = supabaseAnonKeyInput.trim();
+    if (!cleanUrl || !cleanKey) {
+      setSupabaseActionStatus({
+        type: 'error',
+        message: 'Mohon masukkan dan simpan Project URL serta Anon Key terlebih dahulu.',
+      });
+      return;
+    }
+    const currentOrigin = window.location.origin;
+    const currentPath = window.location.pathname;
+    const shareUrl = `${currentOrigin}${currentPath}#sb_url=${encodeURIComponent(cleanUrl)}&sb_key=${encodeURIComponent(cleanKey)}`;
+    navigator.clipboard.writeText(shareUrl);
+    setCopiedShareLink(true);
+    setSupabaseActionStatus({
+      type: 'success',
+      message: 'Tautan Akses Cepat Berhasil Disalin! Buka tautan ini di laptop atau device lain, maka database Supabase akan langsung terhubung secara otomatis tanpa perlu input manual.',
+    });
+    setTimeout(() => setCopiedShareLink(false), 3500);
+  };
 
   useEffect(() => {
     const creds = getSupabaseCredentials();
@@ -199,6 +273,65 @@ export const SettingsView: React.FC = () => {
           </div>
         </div>
 
+        {/* Realtime Supabase Cloud Data Stats */}
+        {supabaseConnected && (
+          <div className="p-4 bg-emerald-50/70 border border-emerald-200 rounded-lg text-xs space-y-2.5">
+            <div className="flex items-center justify-between flex-wrap gap-2">
+              <div className="flex items-center gap-2 text-emerald-950 font-bold">
+                <Layers className="w-4 h-4 text-emerald-600" />
+                <span>Status Data di Cloud Online (Supabase):</span>
+              </div>
+              <button
+                type="button"
+                onClick={handleCopyShareLink}
+                className="px-2.5 py-1.5 bg-emerald-700 hover:bg-emerald-800 text-white rounded text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors"
+                title="Bagikan tautan ini ke laptop lain agar langsung terhubung tanpa input manual"
+              >
+                {copiedShareLink ? <Check className="w-3.5 h-3.5 text-emerald-200" /> : <Share2 className="w-3.5 h-3.5" />}
+                <span>{copiedShareLink ? 'Tautan Terhubung Tersalin!' : 'Bagikan Link ke Laptop Lain'}</span>
+              </button>
+            </div>
+
+            {cloudStats ? (
+              cloudStats.requirementsCount === 0 ? (
+                <div className="p-3 bg-amber-50 border border-amber-300 rounded text-amber-900 flex items-start gap-2.5 shadow-xs">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <div>
+                    <strong className="font-bold text-amber-950">Database Supabase online saat ini masih kosong (0 baris material).</strong>
+                    <p className="mt-1 text-amber-800 leading-relaxed">
+                      Hal ini menjelaskan mengapa ketika Anda membuka aplikasi di laptop/device lain, data tampil kosong. Klik tombol hijau <strong>"Migrasikan Data Lokal ke Supabase"</strong> di bawah ini agar seluruh data kebutuhan material, nomor OR, dan jadwal dari laptop ini dikirim ke server Supabase.
+                    </p>
+                  </div>
+                </div>
+              ) : (
+                <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 pt-1 text-[11px]">
+                  <div className="bg-white p-2.5 rounded border border-emerald-100 shadow-2xs">
+                    <span className="text-slate-500 block text-[10px]">Detail Kebutuhan Material:</span>
+                    <strong className="text-sm font-bold text-emerald-800">{cloudStats.requirementsCount} Baris</strong>
+                  </div>
+                  <div className="bg-white p-2.5 rounded border border-emerald-100 shadow-2xs">
+                    <span className="text-slate-500 block text-[10px]">Riwayat Upload Excel:</span>
+                    <strong className="text-sm font-bold text-slate-800">{cloudStats.historyCount} Batch</strong>
+                  </div>
+                  <div className="bg-white p-2.5 rounded border border-emerald-100 shadow-2xs">
+                    <span className="text-slate-500 block text-[10px]">Nomor OR Terdaftar:</span>
+                    <strong className="text-sm font-bold text-slate-800">{cloudStats.relationsCount} OR</strong>
+                  </div>
+                  <div className="bg-white p-2.5 rounded border border-emerald-100 shadow-2xs">
+                    <span className="text-slate-500 block text-[10px]">Jadwal Produksi (Gantt):</span>
+                    <strong className="text-sm font-bold text-slate-800">{cloudStats.schedulesCount} Item</strong>
+                  </div>
+                </div>
+              )
+            ) : (
+              <span className="text-slate-500 text-[11px] flex items-center gap-1.5 py-1">
+                <RefreshCw className="w-3.5 h-3.5 animate-spin text-emerald-600" />
+                Memeriksa data di cloud Supabase...
+              </span>
+            )}
+          </div>
+        )}
+
         {/* Section 2: User Profile PPIC */}
         <div className="bg-white rounded-lg border border-slate-200 shadow-xs p-5 space-y-4">
           <div className="flex items-center gap-2 pb-3 border-b border-slate-100">
@@ -343,39 +476,99 @@ export const SettingsView: React.FC = () => {
           </div>
         )}
 
+        {/* Warning if user pasted API Key into Project URL */}
+        {(isUrlActuallyKey || isKeyActuallyUrl) && (
+          <div className="p-4 bg-amber-50 border border-amber-300 rounded-lg text-xs text-amber-900 flex flex-wrap items-center justify-between gap-3 shadow-xs">
+            <div className="flex items-start gap-2.5 max-w-xl">
+              <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+              <div>
+                <strong className="font-bold text-amber-950">Terdeteksi Posisi Input Tertukar:</strong>
+                <p className="mt-1 text-amber-800 leading-relaxed">
+                  {isUrlActuallyKey && (
+                    <span>
+                      Kolom <strong>Project URL</strong> terisi API Key (<code className="font-mono bg-amber-100 px-1 rounded">{supabaseUrlInput.slice(0, 20)}...</code>). Project URL harus berupa link seperti <code className="font-mono bg-amber-100 px-1 rounded">https://xyzcompany.supabase.co</code>.
+                    </span>
+                  )}
+                  {isKeyActuallyUrl && (
+                    <span className="block mt-0.5">
+                      Kolom <strong>Anon Key</strong> terisi tautan URL.
+                    </span>
+                  )}
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleSwapCredentials}
+              className="px-3.5 py-2 bg-amber-600 hover:bg-amber-700 text-white rounded text-xs font-semibold flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors shrink-0"
+            >
+              <ArrowLeftRight className="w-3.5 h-3.5" />
+              Tukar Posisi URL & Key
+            </button>
+          </div>
+        )}
+
         {/* Credentials Form */}
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
           <div>
-            <label className="block text-xs font-semibold text-slate-700 mb-1 flex items-center gap-1.5">
-              <Globe className="w-3.5 h-3.5 text-blue-600" />
-              Supabase Project URL:
-            </label>
+            <div className="flex items-center justify-between mb-1">
+              <label className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+                <Globe className="w-3.5 h-3.5 text-blue-600" />
+                Supabase Project URL:
+              </label>
+              <span className="text-[10px] text-slate-400 font-mono">Format: https://*.supabase.co</span>
+            </div>
             <input
               type="text"
               value={supabaseUrlInput}
               onChange={(e) => setSupabaseUrlInput(e.target.value)}
               placeholder="https://xyzcompany.supabase.co"
-              className="w-full px-3 py-1.5 text-xs font-mono border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 bg-slate-50 focus:bg-white"
+              className={`w-full px-3 py-2 text-xs font-mono border rounded focus:ring-1 focus:ring-blue-500 bg-slate-50 focus:bg-white ${
+                isUrlActuallyKey ? 'border-amber-400 bg-amber-50/30' : 'border-slate-300'
+              }`}
             />
-            <p className="text-[11px] text-slate-400 mt-1">
-              Dapat dikonfigurasi melalui <code className="bg-slate-100 px-1 py-0.5 rounded text-slate-700">VITE_SUPABASE_URL</code> di Vercel atau input di sini.
+            <p className="text-[11px] text-slate-500 mt-1.5">
+              Cari di dashboard Supabase: <strong>Project Settings &rarr; Data API &rarr; Project URL</strong>.
             </p>
           </div>
 
           <div>
-            <label className="block text-xs font-semibold text-slate-700 mb-1 flex items-center gap-1.5">
-              <Key className="w-3.5 h-3.5 text-blue-600" />
-              Supabase Anon / Publishable Key:
-            </label>
-            <input
-              type="password"
-              value={supabaseAnonKeyInput}
-              onChange={(e) => setSupabaseAnonKeyInput(e.target.value)}
-              placeholder="eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9..."
-              className="w-full px-3 py-1.5 text-xs font-mono border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 bg-slate-50 focus:bg-white"
-            />
-            <p className="text-[11px] text-slate-400 mt-1">
-              Gunakan kunci publik (Anon Key). Jangan pernah memasukkan <code className="text-red-600 font-semibold">service_role</code> secret.
+            <div className="flex items-center justify-between mb-1">
+              <label className="text-xs font-semibold text-slate-700 flex items-center gap-1.5">
+                <Key className="w-3.5 h-3.5 text-blue-600" />
+                Supabase Anon / Publishable Key:
+              </label>
+              <button
+                type="button"
+                onClick={() => setShowAnonKey(!showAnonKey)}
+                className="text-[11px] text-blue-600 hover:text-blue-800 flex items-center gap-1 cursor-pointer"
+              >
+                {showAnonKey ? (
+                  <>
+                    <EyeOff className="w-3 h-3" />
+                    <span>Sembunyikan</span>
+                  </>
+                ) : (
+                  <>
+                    <Eye className="w-3 h-3" />
+                    <span>Lihat Kunci</span>
+                  </>
+                )}
+              </button>
+            </div>
+            <div className="relative">
+              <input
+                type={showAnonKey ? 'text' : 'password'}
+                value={supabaseAnonKeyInput}
+                onChange={(e) => setSupabaseAnonKeyInput(e.target.value)}
+                placeholder="sb_publishable_... atau eyJhbGciOi..."
+                className={`w-full pl-3 pr-8 py-2 text-xs font-mono border rounded focus:ring-1 focus:ring-blue-500 bg-slate-50 focus:bg-white ${
+                  isKeyActuallyUrl ? 'border-amber-400 bg-amber-50/30' : 'border-slate-300'
+                }`}
+              />
+            </div>
+            <p className="text-[11px] text-slate-500 mt-1.5">
+              Cari di dashboard Supabase: <strong>Project Settings &rarr; Data API &rarr; anon (public)</strong>.
             </p>
           </div>
         </div>
@@ -386,15 +579,43 @@ export const SettingsView: React.FC = () => {
             <button
               type="button"
               onClick={async () => {
-                if (!supabaseUrlInput.trim() || !supabaseAnonKeyInput.trim()) {
+                const normalizedUrl = cleanSupabaseUrl(supabaseUrlInput);
+                const cleanKey = supabaseAnonKeyInput.trim();
+
+                if (!supabaseUrlInput.trim() || !cleanKey) {
                   setSupabaseActionStatus({
                     type: 'error',
                     message: 'Mohon isi Project URL dan Anon Key terlebih dahulu.',
                   });
                   return;
                 }
+
+                if (supabaseUrlInput.trim().startsWith('sb_publishable_') || supabaseUrlInput.trim().startsWith('eyJ')) {
+                  setSupabaseActionStatus({
+                    type: 'error',
+                    message: 'Kolom "Project URL" terisi API Key. Project URL harus berupa link seperti "https://[id-proyek].supabase.co". Klik tombol "Tukar Posisi URL & Key" di atas jika tertukar.',
+                  });
+                  return;
+                }
+
+                if (!normalizedUrl.startsWith('https://') && !normalizedUrl.startsWith('http://')) {
+                  setSupabaseActionStatus({
+                    type: 'error',
+                    message: 'Project URL harus diawali dengan https:// (contoh: https://xyzcompany.supabase.co).',
+                  });
+                  return;
+                }
+
+                // If user didn't write https://, update the field in UI to show the full URL
+                if (normalizedUrl !== supabaseUrlInput.trim()) {
+                  setSupabaseUrlInput(normalizedUrl);
+                }
+
                 setSupabaseActionStatus({ type: 'info', message: 'Menguji koneksi ke Supabase...' });
-                const res = await updateSupabaseCredentials(supabaseUrlInput, supabaseAnonKeyInput);
+                const res = await updateSupabaseCredentials(normalizedUrl, cleanKey);
+                if (res.success) {
+                  await refreshCloudStats();
+                }
                 setSupabaseActionStatus({
                   type: res.success ? 'success' : 'error',
                   message: res.message,
@@ -412,6 +633,7 @@ export const SettingsView: React.FC = () => {
                 onClick={async () => {
                   setSupabaseActionStatus({ type: 'info', message: 'Menyinkronkan data dengan Supabase...' });
                   await syncWithSupabase();
+                  await refreshCloudStats();
                   setSupabaseActionStatus({
                     type: 'success',
                     message: 'Data berhasil disinkronkan dengan database pusat Supabase!',
@@ -441,6 +663,9 @@ export const SettingsView: React.FC = () => {
                   setSupabaseActionStatus({ type: 'info', message: 'Sedang memigrasikan data ke Supabase...' });
                   const res = await migrateLocalDataToSupabase();
                   setIsMigrating(false);
+                  if (res.success) {
+                    await refreshCloudStats();
+                  }
                   setSupabaseActionStatus({
                     type: res.success ? 'success' : 'error',
                     message: res.message,

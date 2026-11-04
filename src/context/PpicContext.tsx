@@ -466,9 +466,9 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   // Update Supabase credentials via Settings UI
   const updateSupabaseCredentials = async (url: string, key: string) => {
-    saveCustomSupabaseCredentials(url, key);
-    const test = await testSupabaseConnection();
+    const test = await testSupabaseConnection(url, key);
     if (test.success) {
+      saveCustomSupabaseCredentials(url, key);
       setSupabaseConnected(true);
       setSupabaseSyncError(null);
       await syncWithSupabase();

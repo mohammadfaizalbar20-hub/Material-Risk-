@@ -13,21 +13,153 @@ import {
 const STORAGE_SUPABASE_URL_KEY = 'ppic_supabase_url_custom';
 const STORAGE_SUPABASE_ANON_KEY = 'ppic_supabase_anon_key_custom';
 
+/**
+ * Normalizes any date representation (ISO string, DD/MM/YYYY, DD-MM-YYYY, or missing)
+ * into standard PostgreSQL DATE format (YYYY-MM-DD).
+ * Guarantees that null/undefined values never trigger NOT-NULL database constraint errors.
+ */
+export function safeDbDate(val?: string | null): string {
+  if (!val || typeof val !== 'string' || !val.trim()) {
+    return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
+  }
+  const clean = val.trim();
+  if (/^\d{4}-\d{2}-\d{2}$/.test(clean)) {
+    return clean;
+  }
+  if (/^\d{4}-\d{2}-\d{2}T/.test(clean)) {
+    return clean.slice(0, 10);
+  }
+  const dmyMatch = clean.match(/^(\d{1,2})[/-](\d{1,2})[/-](\d{4})$/);
+  if (dmyMatch) {
+    const day = dmyMatch[1].padStart(2, '0');
+    const month = dmyMatch[2].padStart(2, '0');
+    const year = dmyMatch[3];
+    return `${year}-${month}-${day}`;
+  }
+  const parsed = new Date(clean);
+  if (!isNaN(parsed.getTime())) {
+    return parsed.toISOString().slice(0, 10);
+  }
+  return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
+}
+
+/**
+ * Validates whether a string is a well-formed HTTP/HTTPS URL and not an API key
+ */
+export function isValidSupabaseUrl(urlString?: string | null): boolean {
+  if (!urlString || typeof urlString !== 'string') return false;
+  const clean = urlString.trim();
+  if (!clean) return false;
+  // If it's accidentally an API key or has forbidden formats
+  if (clean.startsWith('sb_publishable_') || clean.startsWith('eyJ') || clean.includes(' ') || clean.length < 10) {
+    return false;
+  }
+  if (!clean.startsWith('http://') && !clean.startsWith('https://')) {
+    return false;
+  }
+  try {
+    const parsed = new URL(clean);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:';
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Normalizes input URL by trimming, stripping trailing slashes,
+ * and auto-prepending https:// if the user entered domain.supabase.co
+ */
+export function cleanSupabaseUrl(urlString?: string | null): string {
+  if (!urlString || typeof urlString !== 'string') return '';
+  let clean = urlString.trim().replace(/\/+$/, '');
+  if (!clean) return '';
+  // Don't modify if it's obviously an API key
+  if (clean.startsWith('sb_publishable_') || clean.startsWith('eyJ')) {
+    return clean;
+  }
+  if (!clean.startsWith('http://') && !clean.startsWith('https://')) {
+    if (clean.includes('.supabase.co') || clean.includes('.supabase.in') || clean.includes('localhost')) {
+      clean = `https://${clean}`;
+    }
+  }
+  return clean;
+}
+
+/**
+ * Validates whether a key looks like a valid anon/publishable key and not a URL
+ */
+export function isValidSupabaseAnonKey(key?: string | null): boolean {
+  if (!key || typeof key !== 'string') return false;
+  const clean = key.trim();
+  if (clean.length < 10) return false;
+  if (clean.startsWith('http://') || clean.startsWith('https://')) return false;
+  return true;
+}
+
+/**
+ * Automatically extracts credentials from URL hash if shared via quick-link:
+ * e.g. https://domain.app/#sb_url=https://...&sb_key=sb_publishable_...
+ * Enables instant 1-click configuration on other devices/laptops without manual typing.
+ */
+export function tryExtractCredentialsFromUrl(): { url: string; anonKey: string } | null {
+  try {
+    if (typeof window === 'undefined') return null;
+    const hash = window.location.hash;
+    if (hash && (hash.includes('sb_url=') || hash.includes('supabase_url='))) {
+      const params = new URLSearchParams(hash.replace(/^#/, ''));
+      const rawUrl = decodeURIComponent(params.get('sb_url') || params.get('supabase_url') || '').trim();
+      const rawKey = decodeURIComponent(params.get('sb_key') || params.get('supabase_key') || '').trim();
+      const url = cleanSupabaseUrl(rawUrl);
+      const anonKey = rawKey;
+      if (isValidSupabaseUrl(url) && isValidSupabaseAnonKey(anonKey)) {
+        saveCustomSupabaseCredentials(url, anonKey);
+        // Clean URL hash without reloading page
+        window.history.replaceState(null, '', window.location.pathname + window.location.search);
+        return { url, anonKey };
+      }
+    }
+  } catch (e) {
+    console.warn('Failed to parse credentials from URL hash', e);
+  }
+  return null;
+}
+
 export function getSupabaseCredentials(): { url: string; anonKey: string; isConfigured: boolean; source: 'env' | 'settings' | 'none' } {
-  const envUrl = (import.meta.env.VITE_SUPABASE_URL || '').trim();
+  // Check URL hash first (allows instant multi-device link sharing)
+  const fromHash = tryExtractCredentialsFromUrl();
+  if (fromHash && isValidSupabaseUrl(fromHash.url) && isValidSupabaseAnonKey(fromHash.anonKey)) {
+    return { url: fromHash.url, anonKey: fromHash.anonKey, isConfigured: true, source: 'settings' };
+  }
+
+  const envUrl = cleanSupabaseUrl((import.meta.env.VITE_SUPABASE_URL || '').trim());
   const envKey = (import.meta.env.VITE_SUPABASE_ANON_KEY || '').trim();
 
   // If provided in env and not dummy placeholders
-  if (envUrl && envKey && !envUrl.includes('your-project-id') && !envKey.includes('your-anon-publishable-key')) {
+  if (
+    isValidSupabaseUrl(envUrl) &&
+    isValidSupabaseAnonKey(envKey) &&
+    !envUrl.includes('your-project-id') &&
+    !envKey.includes('your-anon-publishable-key')
+  ) {
     return { url: envUrl, anonKey: envKey, isConfigured: true, source: 'env' };
   }
 
   // Check custom storage (configured via UI in Pengaturan)
   try {
-    const customUrl = (localStorage.getItem(STORAGE_SUPABASE_URL_KEY) || '').trim();
-    const customKey = (localStorage.getItem(STORAGE_SUPABASE_ANON_KEY) || '').trim();
-    if (customUrl && customKey) {
+    const rawCustomUrl = (localStorage.getItem(STORAGE_SUPABASE_URL_KEY) || '').trim();
+    const rawCustomKey = (localStorage.getItem(STORAGE_SUPABASE_ANON_KEY) || '').trim();
+    const customUrl = cleanSupabaseUrl(rawCustomUrl);
+    const customKey = rawCustomKey;
+
+    if (isValidSupabaseUrl(customUrl) && isValidSupabaseAnonKey(customKey)) {
       return { url: customUrl, anonKey: customKey, isConfigured: true, source: 'settings' };
+    }
+
+    // If values exist in storage but are invalid (e.g. user pasted key in URL field),
+    // return them for the UI form to display, but mark isConfigured: false so the app
+    // never attempts to initialize an invalid client or throw URL validation exceptions.
+    if (rawCustomUrl || rawCustomKey) {
+      return { url: rawCustomUrl, anonKey: rawCustomKey, isConfigured: false, source: 'settings' };
     }
   } catch {
     // Ignore storage errors
@@ -38,8 +170,13 @@ export function getSupabaseCredentials(): { url: string; anonKey: string; isConf
 
 export function saveCustomSupabaseCredentials(url: string, anonKey: string): void {
   try {
-    localStorage.setItem(STORAGE_SUPABASE_URL_KEY, url.trim());
-    localStorage.setItem(STORAGE_SUPABASE_ANON_KEY, anonKey.trim());
+    const cleanUrl = cleanSupabaseUrl(url);
+    const cleanKey = (anonKey || '').trim();
+    localStorage.setItem(STORAGE_SUPABASE_URL_KEY, cleanUrl);
+    localStorage.setItem(STORAGE_SUPABASE_ANON_KEY, cleanKey);
+    // Invalidate cached client
+    cachedClient = null;
+    lastCredsHash = '';
   } catch (e) {
     console.error('Failed to save Supabase credentials to storage', e);
   }
@@ -49,6 +186,8 @@ export function clearCustomSupabaseCredentials(): void {
   try {
     localStorage.removeItem(STORAGE_SUPABASE_URL_KEY);
     localStorage.removeItem(STORAGE_SUPABASE_ANON_KEY);
+    cachedClient = null;
+    lastCredsHash = '';
   } catch (e) {
     console.error('Failed to clear Supabase credentials', e);
   }
@@ -59,18 +198,20 @@ let lastCredsHash = '';
 
 export function getSupabaseClient(): SupabaseClient | null {
   const { url, anonKey, isConfigured } = getSupabaseCredentials();
-  if (!isConfigured || !url || !anonKey) {
+  const validUrl = cleanSupabaseUrl(url);
+
+  if (!isConfigured || !isValidSupabaseUrl(validUrl) || !isValidSupabaseAnonKey(anonKey)) {
     cachedClient = null;
     return null;
   }
 
-  const hash = `${url}_${anonKey}`;
+  const hash = `${validUrl}_${anonKey}`;
   if (cachedClient && lastCredsHash === hash) {
     return cachedClient;
   }
 
   try {
-    cachedClient = createClient(url, anonKey, {
+    cachedClient = createClient(validUrl, anonKey, {
       auth: {
         persistSession: true,
         autoRefreshToken: true,
@@ -84,7 +225,7 @@ export function getSupabaseClient(): SupabaseClient | null {
     lastCredsHash = hash;
     return cachedClient;
   } catch (e) {
-    console.error('Failed to initialize Supabase client:', e);
+    console.warn('Supabase client could not be initialized:', e);
     cachedClient = null;
     return null;
   }
@@ -127,7 +268,7 @@ export function mapModelToDbRequirement(model: MaterialItemRequirement): any {
     received_qty: model.receivedQty,
     unit_price: model.unitPrice || 0,
     supplier_name: model.supplierName || null,
-    update_date: model.updateDate,
+    update_date: safeDbDate(model.updateDate),
   };
 }
 
@@ -151,8 +292,8 @@ export function mapModelToDbSchedule(model: ProductionSchedule): any {
     or_number: model.orNumber,
     style: model.style,
     production_line: model.productionLine,
-    production_date: model.productionDate,
-    finish_date: model.finishDate,
+    production_date: safeDbDate(model.productionDate),
+    finish_date: safeDbDate(model.finishDate),
     target: model.target,
     status: model.status || 'Terjadwal',
     notes: model.notes || null,
@@ -179,9 +320,9 @@ export function mapModelToDbUploadHistory(model: UploadHistoryItem): any {
     or_number: model.orNumber,
     style: model.style,
     file_name: model.fileName,
-    update_date: model.updateDate,
-    upload_time: model.uploadTime,
-    row_count: model.rowCount,
+    update_date: safeDbDate(model.updateDate),
+    upload_time: model.uploadTime || new Date().toLocaleTimeString('id-ID'),
+    row_count: model.rowCount || 0,
     status: model.status || 'Sukses',
     notes: model.notes || null,
   };
@@ -272,24 +413,67 @@ export function mapModelToDbDeletion(model: DeletionHistoryItem): any {
 // SUPABASE API SERVICE FUNCTIONS
 // ---------------------------------------------------------------------------
 
-export async function testSupabaseConnection(): Promise<{ success: boolean; message: string; tableCount?: number }> {
-  const supabase = getSupabaseClient();
-  if (!supabase) {
+export async function testSupabaseConnection(
+  overrideUrl?: string,
+  overrideKey?: string
+): Promise<{ success: boolean; message: string; tableCount?: number }> {
+  const creds = getSupabaseCredentials();
+  const rawUrl = (overrideUrl !== undefined ? overrideUrl : creds.url || '').trim();
+  const rawKey = (overrideKey !== undefined ? overrideKey : creds.anonKey || '').trim();
+
+  const url = cleanSupabaseUrl(rawUrl);
+  const anonKey = rawKey;
+
+  if (!rawUrl || !anonKey) {
     return {
       success: false,
-      message: 'Supabase belum dikonfigurasi. Masukkan VITE_SUPABASE_URL dan VITE_SUPABASE_ANON_KEY.',
+      message: 'Supabase belum dikonfigurasi. Masukkan Supabase Project URL dan Anon Key.',
+    };
+  }
+
+  // Check if URL is accidentally an API key (e.g. starts with sb_publishable_ or eyJ)
+  if (rawUrl.startsWith('sb_publishable_') || rawUrl.startsWith('eyJ')) {
+    return {
+      success: false,
+      message: `Kolom "Project URL" terisi API Key (${rawUrl.slice(0, 18)}...). Project URL harus berupa tautan seperti "https://[id-proyek].supabase.co". Klik tombol "Tukar Posisi URL & Key" di atas jika tertukar.`,
+    };
+  }
+
+  // Check if Key is accidentally a URL
+  if (anonKey.startsWith('http://') || anonKey.startsWith('https://')) {
+    return {
+      success: false,
+      message: 'Kolom "Anon Key" terisi URL. Masukkan Publishable Anon Key (diawali sb_publishable_... atau eyJ...).',
+    };
+  }
+
+  // Check valid URL format
+  if (!isValidSupabaseUrl(url)) {
+    return {
+      success: false,
+      message: 'Format Project URL tidak valid. URL harus diawali dengan https:// (contoh: https://xyzcompany.supabase.co).',
+    };
+  }
+
+  let testClient: SupabaseClient;
+  try {
+    testClient = createClient(url, anonKey);
+  } catch (err: any) {
+    return {
+      success: false,
+      message: `Gagal menginisialisasi klien Supabase: ${err?.message || 'Format URL/Key tidak valid'}`,
     };
   }
 
   try {
-    const { count, error } = await supabase
+    const { count, error } = await testClient
       .from('material_requirements')
       .select('*', { count: 'exact', head: true });
 
     if (error) {
       return {
         success: false,
-        message: `Koneksi gagal: ${error.message} (Pastikan script schema.sql sudah dijalankan di Supabase SQL Editor).`,
+        message: `Koneksi gagal: ${error.message} (Pastikan script SQL Supabase sudah dijalankan di Supabase SQL Editor).`,
       };
     }
 
@@ -301,7 +485,7 @@ export async function testSupabaseConnection(): Promise<{ success: boolean; mess
   } catch (err: any) {
     return {
       success: false,
-      message: `Terjadi kesalahan saat menguji koneksi: ${err.message || String(err)}`,
+      message: `Gagal menghubungi server Supabase: ${err?.message || String(err)}`,
     };
   }
 }
@@ -324,10 +508,13 @@ export async function fetchAllPpicFromSupabase(): Promise<{
       supabase.from('production_schedules').select('*').order('production_date', { ascending: true }),
       supabase.from('or_style_relations').select('*').order('created_at', { ascending: false }),
       supabase.from('master_materials').select('*').order('name', { ascending: true }),
-      supabase.from('deletion_history').select('*').order('deleted_at', { ascending: false }),
+      supabase.from('deletion_history').select('*').order('created_at', { ascending: false }),
     ]);
 
-    if (reqRes.error) throw reqRes.error;
+    if (reqRes.error) {
+      console.error('Error fetching material_requirements:', reqRes.error);
+      throw reqRes.error;
+    }
 
     return {
       materialRequirements: (reqRes.data || []).map(mapDbRequirementToModel),
@@ -340,6 +527,45 @@ export async function fetchAllPpicFromSupabase(): Promise<{
   } catch (e) {
     console.error('Error fetching data from Supabase:', e);
     return null;
+  }
+}
+
+export async function getSupabaseLiveCounts(): Promise<{
+  connected: boolean;
+  requirementsCount: number;
+  historyCount: number;
+  relationsCount: number;
+  schedulesCount: number;
+  materialsCount: number;
+  error?: string;
+}> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    return { connected: false, requirementsCount: 0, historyCount: 0, relationsCount: 0, schedulesCount: 0, materialsCount: 0 };
+  }
+  try {
+    const [reqRes, histRes, relRes, schRes, matRes] = await Promise.all([
+      supabase.from('material_requirements').select('id', { count: 'exact', head: true }),
+      supabase.from('upload_history').select('id', { count: 'exact', head: true }),
+      supabase.from('or_style_relations').select('id', { count: 'exact', head: true }),
+      supabase.from('production_schedules').select('id', { count: 'exact', head: true }),
+      supabase.from('master_materials').select('id', { count: 'exact', head: true }),
+    ]);
+
+    if (reqRes.error) {
+      return { connected: false, requirementsCount: 0, historyCount: 0, relationsCount: 0, schedulesCount: 0, materialsCount: 0, error: reqRes.error.message };
+    }
+
+    return {
+      connected: true,
+      requirementsCount: reqRes.count || 0,
+      historyCount: histRes.count || 0,
+      relationsCount: relRes.count || 0,
+      schedulesCount: schRes.count || 0,
+      materialsCount: matRes.count || 0,
+    };
+  } catch (e: any) {
+    return { connected: false, requirementsCount: 0, historyCount: 0, relationsCount: 0, schedulesCount: 0, materialsCount: 0, error: e.message || String(e) };
   }
 }
 
@@ -547,41 +773,63 @@ export async function seedLocalDataToSupabase(data: {
   productionSchedules: ProductionSchedule[];
   orStyleRelations: OrStyleRelation[];
   materials: Material[];
-}): Promise<{ success: boolean; message: string; insertedCount: number }> {
+}): Promise<{ success: boolean; message: string; insertedCount: number; details?: any }> {
   const supabase = getSupabaseClient();
-  if (!supabase) return { success: false, message: 'Supabase belum terkonfigurasi', insertedCount: 0 };
+  if (!supabase) return { success: false, message: 'Supabase belum terkonfigurasi. Pastikan Project URL dan Anon Key sudah diisi.', insertedCount: 0 };
 
   try {
     let totalInserted = 0;
 
-    // 1. Relations
+    // 1. Relations: deduplicate by or_number to prevent ON CONFLICT DO UPDATE batch collisions
     if (data.orStyleRelations.length > 0) {
-      const relRows = data.orStyleRelations.map((r) => {
+      const relMap = new Map<string, any>();
+      for (const r of data.orStyleRelations) {
+        if (!r.orNumber?.trim()) continue;
         const row = mapModelToDbRelation(r);
         delete row.id;
-        return row;
-      });
-      await supabase.from('or_style_relations').upsert(relRows, { onConflict: 'or_number' });
+        relMap.set(r.orNumber.trim().toUpperCase(), row);
+      }
+      const relRows = Array.from(relMap.values());
+      if (relRows.length > 0) {
+        const { error } = await supabase.from('or_style_relations').upsert(relRows, { onConflict: 'or_number' });
+        if (error) {
+          console.error('Error upserting relations:', error);
+          throw new Error(`Gagal menyimpan relasi OR: ${error.message}`);
+        }
+      }
     }
 
-    // 2. Upload History
+    // 2. Upload History: deduplicate or insert safely
     if (data.uploadHistory.length > 0) {
       const histRows = data.uploadHistory.map((h) => {
         const row = mapModelToDbUploadHistory(h);
-        delete row.id;
+        delete row.id; // Let Supabase generate valid UUID
         return row;
       });
-      await supabase.from('upload_history').insert(histRows);
+      const { error } = await supabase.from('upload_history').insert(histRows);
+      if (error) {
+        console.error('Error inserting upload history:', error);
+        throw new Error(`Gagal menyimpan riwayat upload: ${error.message}`);
+      }
     }
 
-    // 3. Materials
+    // 3. Materials: deduplicate by code
     if (data.materials.length > 0) {
-      const matRows = data.materials.map((m) => {
+      const matMap = new Map<string, any>();
+      for (const m of data.materials) {
+        if (!m.code?.trim()) continue;
         const row = mapModelToDbMaterial(m);
         delete row.id;
-        return row;
-      });
-      await supabase.from('master_materials').upsert(matRows, { onConflict: 'code' });
+        matMap.set(m.code.trim().toUpperCase(), row);
+      }
+      const matRows = Array.from(matMap.values());
+      if (matRows.length > 0) {
+        const { error } = await supabase.from('master_materials').upsert(matRows, { onConflict: 'code' });
+        if (error) {
+          console.error('Error upserting master materials:', error);
+          throw new Error(`Gagal menyimpan master material: ${error.message}`);
+        }
+      }
     }
 
     // 4. Schedules
@@ -591,10 +839,14 @@ export async function seedLocalDataToSupabase(data: {
         delete row.id;
         return row;
       });
-      await supabase.from('production_schedules').insert(schRows);
+      const { error } = await supabase.from('production_schedules').insert(schRows);
+      if (error) {
+        console.error('Error inserting production schedules:', error);
+        throw new Error(`Gagal menyimpan jadwal produksi: ${error.message}`);
+      }
     }
 
-    // 5. Requirements in chunks
+    // 5. Requirements in chunks with strict date normalization and error check
     if (data.materialRequirements.length > 0) {
       const reqRows = data.materialRequirements.map((r) => {
         const row = mapModelToDbRequirement(r);
@@ -605,15 +857,24 @@ export async function seedLocalDataToSupabase(data: {
       const chunkSize = 100;
       for (let i = 0; i < reqRows.length; i += chunkSize) {
         const chunk = reqRows.slice(i, i + chunkSize);
-        await supabase.from('material_requirements').insert(chunk);
+        const { error: chunkErr } = await supabase.from('material_requirements').insert(chunk);
+        if (chunkErr) {
+          console.error('Error inserting material requirements chunk:', chunkErr);
+          throw new Error(`Gagal menyimpan detail material: ${chunkErr.message}`);
+        }
         totalInserted += chunk.length;
       }
     }
 
+    // Verify row count directly from Supabase
+    const { count: verifiedCount } = await supabase
+      .from('material_requirements')
+      .select('*', { count: 'exact', head: true });
+
     return {
       success: true,
-      message: `Migrasi data awal ke Supabase berhasil! ${totalInserted} baris kebutuhan material telah dimigrasikan.`,
-      insertedCount: totalInserted,
+      message: `Migrasi data ke Supabase berhasil! Tersimpan ${verifiedCount || totalInserted} baris material di cloud online. Semua device tim sekarang dapat melihat data yang sama.`,
+      insertedCount: verifiedCount || totalInserted,
     };
   } catch (err: any) {
     console.error('Failed to seed local data to Supabase:', err);
