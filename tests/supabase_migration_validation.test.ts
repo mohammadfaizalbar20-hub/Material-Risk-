@@ -7,7 +7,12 @@ import {
   safeDbDate,
   isValidUuid,
   generateUuid,
+  mapModelToDbRelation,
 } from '../src/lib/supabase.ts';
+import {
+  PPIC_SUPABASE_SCHEMA_SQL,
+  PPIC_SUPABASE_MIGRATION_WIDEN_TEXT_SQL,
+} from '../src/lib/supabaseSchemaSql.ts';
 
 test('1. cleanSupabaseUrl removes /rest/v1 and trailing slashes', () => {
   assert.equal(
@@ -64,4 +69,35 @@ test('4. UUID helper validates and generates RFC4122 v4 UUIDs', () => {
   assert.equal(isValidUuid('hist-1'), false);
   assert.equal(isValidUuid('upload-1730000000-123'), false);
   assert.equal(isValidUuid('550e8400-e29b-41d4-a716-446655440000'), true);
+});
+
+test('5. Long style strings (> 255 chars) are preserved without truncation', () => {
+  const longStyle = 'JACKET WATERPROOF REFLECTIVE HOODED WITH REMOVABLE FLEECE LINER - SPECIFICATION EXPORT TO JAPAN - FABRIC 100% POLYESTER TASLAN 210T PU COATING 5000MM WP BREATHABLE FINISH - COLORWAY NAVY BLUE / REFLECTIVE NEON ACCENT - RUNNING SIZES XS S M L XL XXL 3XL - ORDER BATCH 2026-PPIC-FULL-RUN';
+  assert.ok(longStyle.length > 255, `Expected length > 255, got ${longStyle.length}`);
+
+  const row = mapModelToDbRelation({
+    id: generateUuid(),
+    orNumber: 'OR-2026-999',
+    style: longStyle,
+    createdAt: '2026-11-04',
+  });
+
+  // Verify that neither style nor OR number was truncated
+  assert.equal(row.style, longStyle);
+  assert.equal(row.style.length, longStyle.length);
+  assert.equal(row.or_number, 'OR-2026-999');
+});
+
+test('6. Schema SQL and Migration Script use TEXT for unrestricted string lengths', () => {
+  // Ensure schema.sql does NOT declare VARCHAR(255) for style or or_number in or_style_relations
+  assert.match(
+    PPIC_SUPABASE_SCHEMA_SQL,
+    /or_style_relations\s*\(\s*id UUID PRIMARY KEY DEFAULT gen_random_uuid\(\),\s*or_number TEXT NOT NULL UNIQUE,\s*style TEXT NOT NULL/i
+  );
+
+  // Ensure migration script includes ALTER TABLE commands for all core tables
+  assert.match(PPIC_SUPABASE_MIGRATION_WIDEN_TEXT_SQL, /ALTER TABLE IF EXISTS public\.or_style_relations ALTER COLUMN style TYPE TEXT/);
+  assert.match(PPIC_SUPABASE_MIGRATION_WIDEN_TEXT_SQL, /ALTER TABLE IF EXISTS public\.material_requirements ALTER COLUMN style TYPE TEXT/);
+  assert.match(PPIC_SUPABASE_MIGRATION_WIDEN_TEXT_SQL, /ALTER TABLE IF EXISTS public\.upload_history ALTER COLUMN style TYPE TEXT/);
+  assert.match(PPIC_SUPABASE_MIGRATION_WIDEN_TEXT_SQL, /ALTER TABLE IF EXISTS public\.production_schedules ALTER COLUMN style TYPE TEXT/);
 });

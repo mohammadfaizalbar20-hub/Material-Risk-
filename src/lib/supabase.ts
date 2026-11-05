@@ -917,11 +917,30 @@ export async function seedLocalDataToSupabase(data: {
       const relMap = new Map<string, any>();
       for (const r of data.orStyleRelations) {
         if (!r.orNumber?.trim()) continue;
-        const row = mapModelToDbRelation(r);
-        if (!isValidUuid(row.id)) {
-          delete row.id;
+        let cleanOr = r.orNumber.trim();
+        let cleanStyle = (r.style || '').trim();
+
+        // Deteksi jika nilai OR dan Style tertukar saat input/unggah (misal Style panjang masuk ke kolom OR)
+        if (
+          cleanOr.length > 50 &&
+          cleanStyle.length > 0 &&
+          cleanStyle.length <= 50 &&
+          /^(OR|PO|SO|WO|MO)[-_0-9]/i.test(cleanStyle) &&
+          !/^(OR|PO|SO|WO|MO)[-_0-9]/i.test(cleanOr)
+        ) {
+          const temp = cleanOr;
+          cleanOr = cleanStyle.toUpperCase();
+          cleanStyle = temp;
+        } else {
+          cleanOr = cleanOr.toUpperCase();
         }
-        relMap.set(r.orNumber.trim().toUpperCase(), row);
+
+        const row = {
+          id: isValidUuid(r.id) ? r.id : undefined,
+          or_number: cleanOr,
+          style: cleanStyle || `Style ${cleanOr}`,
+        };
+        relMap.set(cleanOr, row);
       }
       const relRows = Array.from(relMap.values());
       if (relRows.length > 0) {
@@ -937,6 +956,22 @@ export async function seedLocalDataToSupabase(data: {
             (relErr as any)?.code === '42P01' ||
             (relErr as any)?.code === 'PGRST106' ||
             (relErr as any)?.code === 'PGRST205';
+
+          const isLengthErr = relErr.message?.toLowerCase().includes('value too long') ||
+            relErr.message?.toLowerCase().includes('character varying');
+
+          if (isLengthErr) {
+            const longStyleRow = relRows.find((row) => (row.style || '').length > 255);
+            const longOrRow = relRows.find((row) => (row.or_number || '').length > 255);
+            const offendingCol = longStyleRow ? 'style' : (longOrRow ? 'or_number' : 'style / or_number');
+            const sampleLen = longStyleRow ? longStyleRow.style.length : (longOrRow ? longOrRow.or_number.length : 256);
+            const sampleVal = longStyleRow ? longStyleRow.style : (longOrRow ? longOrRow.or_number : '');
+            const sampleOr = longStyleRow ? longStyleRow.or_number : (longOrRow ? longOrRow.or_number : '');
+
+            throw new Error(
+              `[Tabel: or_style_relations | Kolom: ${offendingCol} | Operasi: Upsert Relasi OR] ${relErr.message}. Kolom pada database Supabase Anda saat ini masih dibatasi tipe VARCHAR(255), sedangkan terdapat data lokal sepanjang ${sampleLen} karakter (OR: "${sampleOr}", nilai: "${sampleVal.slice(0, 40)}..."). Silakan jalankan script SQL migrasi "Pembaruan Kolom ke TEXT" di Supabase SQL Editor (dapat disalin 1-klik di tab Pengaturan) agar seluruh teks panjang tersimpan 100% utuh tanpa dipotong.`
+            );
+          }
 
           throw new Error(
             `[Tabel: or_style_relations | Operasi: Upsert Relasi OR] ${relErr.message}${
@@ -1039,7 +1074,27 @@ export async function seedLocalDataToSupabase(data: {
 
       // Map rows with valid UUIDs, normalized dates, and mapped upload_id foreign keys
       const reqRows = data.materialRequirements.map((r) => {
+        let cleanOr = (r.orNumber || '').trim();
+        let cleanStyle = (r.style || '').trim();
+
+        // Deteksi jika OR dan Style tertukar pada baris material
+        if (
+          cleanOr.length > 50 &&
+          cleanStyle.length > 0 &&
+          cleanStyle.length <= 50 &&
+          /^(OR|PO|SO|WO|MO)[-_0-9]/i.test(cleanStyle) &&
+          !/^(OR|PO|SO|WO|MO)[-_0-9]/i.test(cleanOr)
+        ) {
+          const temp = cleanOr;
+          cleanOr = cleanStyle.toUpperCase();
+          cleanStyle = temp;
+        } else {
+          cleanOr = cleanOr.toUpperCase();
+        }
+
         const row = mapModelToDbRequirement(r);
+        row.or_number = cleanOr;
+        row.style = cleanStyle || `Style ${cleanOr}`;
         row.id = isValidUuid(r.id) ? r.id : generateUuid();
         if (r.uploadId && uploadIdMap.has(r.uploadId)) {
           row.upload_id = uploadIdMap.get(r.uploadId);
@@ -1062,6 +1117,18 @@ export async function seedLocalDataToSupabase(data: {
           const isMissing = chunkErr.message?.toLowerCase().includes('invalid path') ||
             chunkErr.message?.toLowerCase().includes('does not exist') ||
             (chunkErr as any)?.code === '42P01';
+
+          const isLengthErr = chunkErr.message?.toLowerCase().includes('value too long') ||
+            chunkErr.message?.toLowerCase().includes('character varying');
+
+          if (isLengthErr) {
+            throw new Error(
+              `[Tabel: material_requirements | Operasi: Insert Batch ${Math.floor(i / chunkSize) + 1}] ${
+                chunkErr.message
+              }. Kolom pada database Supabase Anda saat ini masih bertipe VARCHAR(255). Jalankan script SQL migrasi "Pembaruan Kolom ke TEXT" di Supabase SQL Editor (tersedia tombol salin 1-klik di tab Pengaturan) agar seluruh nama material dan style panjang tersimpan utuh.`
+            );
+          }
+
           throw new Error(
             `[Tabel: material_requirements | Operasi: Insert Batch ${Math.floor(i / chunkSize) + 1}] ${
               chunkErr.message

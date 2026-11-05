@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { usePpic } from '../../context/PpicContext';
 import { RiskBadge } from '../common/RiskBadge';
 import { getSupabaseCredentials, getSupabaseLiveCounts, cleanSupabaseUrl } from '../../lib/supabase';
-import { PPIC_SUPABASE_SCHEMA_SQL } from '../../lib/supabaseSchemaSql';
+import { PPIC_SUPABASE_SCHEMA_SQL, PPIC_SUPABASE_MIGRATION_WIDEN_TEXT_SQL } from '../../lib/supabaseSchemaSql';
 import {
   Settings,
   Shield,
@@ -54,6 +54,7 @@ export const SettingsView: React.FC = () => {
   const [isMigrating, setIsMigrating] = useState(false);
   const [showSqlGuide, setShowSqlGuide] = useState(false);
   const [copiedSql, setCopiedSql] = useState(false);
+  const [copiedAlterSql, setCopiedAlterSql] = useState(false);
   const [showAnonKey, setShowAnonKey] = useState(false);
 
   const isUrlActuallyKey =
@@ -443,7 +444,7 @@ export const SettingsView: React.FC = () => {
         {/* Action Status Notice */}
         {supabaseActionStatus && (
           <div
-            className={`p-3.5 rounded-lg text-xs flex items-center justify-between gap-2 border ${
+            className={`p-3.5 rounded-lg text-xs space-y-2 border ${
               supabaseActionStatus.type === 'success'
                 ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
                 : supabaseActionStatus.type === 'error'
@@ -451,22 +452,45 @@ export const SettingsView: React.FC = () => {
                 : 'bg-blue-50 border-blue-200 text-blue-800'
             }`}
           >
-            <div className="flex items-center gap-2">
-              {supabaseActionStatus.type === 'success' ? (
-                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-              ) : supabaseActionStatus.type === 'error' ? (
-                <AlertTriangle className="w-4 h-4 text-red-600 shrink-0" />
-              ) : (
-                <RefreshCw className="w-4 h-4 text-blue-600 animate-spin shrink-0" />
-              )}
-              <span>{supabaseActionStatus.message}</span>
+            <div className="flex items-start justify-between gap-2">
+              <div className="flex items-start gap-2">
+                {supabaseActionStatus.type === 'success' ? (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                ) : supabaseActionStatus.type === 'error' ? (
+                  <AlertTriangle className="w-4 h-4 text-red-600 shrink-0 mt-0.5" />
+                ) : (
+                  <RefreshCw className="w-4 h-4 text-blue-600 animate-spin shrink-0 mt-0.5" />
+                )}
+                <div className="whitespace-pre-line leading-relaxed">{supabaseActionStatus.message}</div>
+              </div>
+              <button
+                onClick={() => setSupabaseActionStatus(null)}
+                className="text-slate-400 hover:text-slate-600 text-xs font-bold shrink-0 ml-2 cursor-pointer"
+              >
+                Tutup
+              </button>
             </div>
-            <button
-              onClick={() => setSupabaseActionStatus(null)}
-              className="text-slate-400 hover:text-slate-600 text-xs font-bold"
-            >
-              Tutup
-            </button>
+
+            {/* Quick action button if character varying / VARCHAR(255) error occurs */}
+            {supabaseActionStatus.message.includes('VARCHAR(255)') && (
+              <div className="pt-2 border-t border-red-200 flex flex-wrap items-center justify-between gap-2">
+                <span className="text-[11px] text-red-950 font-medium">
+                  Perbaiki batas karakter pada database: Salin perintah SQL di bawah dan jalankan di Supabase SQL Editor.
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard.writeText(PPIC_SUPABASE_MIGRATION_WIDEN_TEXT_SQL);
+                    setCopiedAlterSql(true);
+                    setTimeout(() => setCopiedAlterSql(false), 2500);
+                  }}
+                  className="px-3 py-1.5 bg-red-700 hover:bg-red-800 text-white rounded text-[11px] font-semibold flex items-center gap-1.5 shadow-xs cursor-pointer transition-colors"
+                >
+                  {copiedAlterSql ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedAlterSql ? 'Query ALTER TABLE Tersalin!' : 'Salin Script ALTER TABLE (to TEXT)'}</span>
+                </button>
+              </div>
+            )}
           </div>
         )}
 
@@ -726,21 +750,38 @@ export const SettingsView: React.FC = () => {
         {showSqlGuide && (
           <div className="p-4 bg-slate-900 text-slate-200 rounded-lg text-xs space-y-3">
             <div className="flex items-center justify-between text-slate-300 flex-wrap gap-2">
-              <span className="font-semibold text-white">Script Skema Database (Jalankan di Supabase SQL Editor):</span>
-              <button
-                onClick={() => {
-                  navigator.clipboard.writeText(PPIC_SUPABASE_SCHEMA_SQL);
-                  setCopiedSql(true);
-                  setTimeout(() => setCopiedSql(false), 2000);
-                }}
-                className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors"
-              >
-                {copiedSql ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Copy className="w-3.5 h-3.5" />}
-                <span>{copiedSql ? 'Skema SQL Berhasil Tersalin!' : 'Salin Seluruh Skema SQL (1-Klik)'}</span>
-              </button>
+              <span className="font-semibold text-white">Script Skema & Pembaruan Database (Jalankan di Supabase SQL Editor):</span>
+              <div className="flex flex-wrap items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard.writeText(PPIC_SUPABASE_MIGRATION_WIDEN_TEXT_SQL);
+                    setCopiedAlterSql(true);
+                    setTimeout(() => setCopiedAlterSql(false), 2000);
+                  }}
+                  className="px-3 py-1.5 bg-amber-600 hover:bg-amber-700 text-white rounded text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors"
+                >
+                  {copiedAlterSql ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedAlterSql ? 'ALTER TABLE Tersalin!' : 'Salin ALTER TABLE ke TEXT'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
+                    navigator.clipboard.writeText(PPIC_SUPABASE_SCHEMA_SQL);
+                    setCopiedSql(true);
+                    setTimeout(() => setCopiedSql(false), 2000);
+                  }}
+                  className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors"
+                >
+                  {copiedSql ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedSql ? 'Skema Lengkap Tersalin!' : 'Salin Seluruh Skema SQL (1-Klik)'}</span>
+                </button>
+              </div>
             </div>
             <p className="text-[11px] text-slate-400 leading-relaxed">
-              Jika tabel belum dibuat di Supabase Anda, buka <strong>Supabase Dashboard &rarr; SQL Editor</strong>, buat <strong>New Query</strong>, klik tombol <strong>Salin Seluruh Skema SQL</strong> di atas, lalu tempel (paste) dan klik <strong>Run</strong> untuk membuat ke-5 tabel lengkap (<code>or_style_relations</code>, <code>upload_history</code>, <code>material_requirements</code>, <code>production_schedules</code>, <code>master_materials</code>), indeks, Row Level Security (RLS), dan publikasi realtime.
+              &bull; <strong>Tombol &quot;Salin ALTER TABLE ke TEXT&quot;</strong>: Gunakan jika database Supabase Anda sudah dibuat sebelumnya namun mengalami kendala <em>&quot;value too long for type character varying(255)&quot;</em>. Script ini memperbarui seluruh kolom menjadi <code>TEXT</code> secara non-destruktif tanpa menghapus data yang ada.<br />
+              &bull; <strong>Tombol &quot;Salin Seluruh Skema SQL&quot;</strong>: Gunakan jika baru pertama kali menyiapkan database Supabase baru untuk membuat ke-5 tabel lengkap beserta indeks dan aturan RLS.
             </p>
           </div>
         )}
