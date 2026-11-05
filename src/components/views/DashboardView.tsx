@@ -1,9 +1,14 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { usePpic } from '../../context/PpicContext';
 import {
   calculateParetoAnalysis,
   calculateMaterialComparisonMetrics,
 } from '../../utils/ppicCalculations';
+import { ParetoItem } from '../../types/ppic';
+import {
+  fetchDashboardSummaryFromSupabase,
+  DashboardSummaryData,
+} from '../../lib/supabase';
 import {
   CalendarClock,
   ShieldAlert,
@@ -17,6 +22,7 @@ import {
   Search,
   Hash,
   X,
+  Zap,
 } from 'lucide-react';
 
 export const DashboardView: React.FC = () => {
@@ -33,8 +39,28 @@ export const DashboardView: React.FC = () => {
   const [orSearchInput, setOrSearchInput] = useState<string>('');
   const [selectedPeriodFilter, setSelectedPeriodFilter] = useState<string>('ALL');
 
+  // Server-side fast aggregation cache (for millions of rows)
+  const [serverSummary, setServerSummary] = useState<DashboardSummaryData | null>(null);
+
+  useEffect(() => {
+    let isMounted = true;
+    const loadServerSummary = async () => {
+      const res = await fetchDashboardSummaryFromSupabase({
+        orQuery: orSearchInput.trim() || undefined,
+        dateFrom: selectedPeriodFilter === '2026-11' ? '2026-11-01' : undefined,
+        dateTo: selectedPeriodFilter === '2026-11' ? '2026-11-30' : undefined,
+      });
+      if (isMounted && res) {
+        setServerSummary(res);
+      }
+    };
+    loadServerSummary();
+    return () => {
+      isMounted = false;
+    };
+  }, [orSearchInput, selectedPeriodFilter]);
+
   // Filtered requirements based on typed OR (substring matching, case-insensitive)
-  // If empty, displays overall data like previous Dashboard behavior
   const filteredRequirements = useMemo(() => {
     const q = orSearchInput.trim().toUpperCase();
     if (!q) {
@@ -59,19 +85,59 @@ export const DashboardView: React.FC = () => {
     return registeredOrNumbers.filter((or) => or.toUpperCase().includes(q));
   }, [registeredOrNumbers, orSearchInput]);
 
-  // Actual Metrics calculated from filtered requirements
+  // Actual Metrics calculated from server aggregation or local fallback
   const comparison = useMemo(() => {
+    if (serverSummary && serverSummary.totalRows > 0) {
+      const readyPct = Math.round((serverSummary.readyRows / serverSummary.totalRows) * 100);
+      return {
+        totalRequired: serverSummary.totalRequired,
+        totalReceived: serverSummary.totalReceived,
+        shortageTotal: serverSummary.totalDeficit,
+        fulfillmentRatio: serverSummary.fulfillmentRate,
+        readyCount: serverSummary.readyRows,
+        notReadyCount: serverSummary.notReadyRows,
+        totalCount: serverSummary.totalRows,
+        readyPercentage: readyPct,
+        notReadyPercentage: 100 - readyPct,
+      };
+    }
     return calculateMaterialComparisonMetrics(filteredRequirements);
-  }, [filteredRequirements]);
+  }, [serverSummary, filteredRequirements]);
 
-  // Pareto Chart items from filtered requirements
-  const paretoData = useMemo(() => {
+  // Pareto Chart items from server aggregation or local fallback
+  const paretoData: ParetoItem[] = useMemo(() => {
+    if (serverSummary && serverSummary.paretoItems && serverSummary.paretoItems.length > 0) {
+      const totalDeficitSum = serverSummary.paretoItems.reduce((acc, it) => acc + it.totalDeficit, 0);
+      let cumulative = 0;
+      return serverSummary.paretoItems.map((item) => {
+        cumulative += item.totalDeficit;
+        const contrib = totalDeficitSum > 0 ? (item.totalDeficit / totalDeficitSum) * 100 : 0;
+        const cumPercent = totalDeficitSum > 0 ? (cumulative / totalDeficitSum) * 100 : 0;
+        return {
+          materialCode: item.materialCode,
+          materialName: item.materialName,
+          unit: (item.unit || 'Unit') as any,
+          shortageQty: item.totalDeficit,
+          shortageValue: item.totalDeficit * 25000,
+          contributionPercent: Math.round(contrib * 10) / 10,
+          cumulativePercent: Math.round(cumPercent * 10) / 10,
+        };
+      });
+    }
     return calculateParetoAnalysis(filteredRequirements);
-  }, [filteredRequirements]);
+  }, [serverSummary, filteredRequirements]);
 
   // Top materials for Kebutuhan vs Diterima bar chart
   const topMaterialsComparison = useMemo(() => {
-    // Group requirements by materialCode
+    if (serverSummary && serverSummary.topMaterials && serverSummary.topMaterials.length > 0) {
+      return serverSummary.topMaterials.map((m) => ({
+        code: m.materialCode,
+        name: m.materialName,
+        unit: m.unit,
+        required: m.required,
+        received: m.received,
+      }));
+    }
     const map = new Map<string, { code: string; name: string; unit: string; required: number; received: number }>();
     for (const req of filteredRequirements) {
       const existing = map.get(req.materialCode) || {
@@ -85,11 +151,10 @@ export const DashboardView: React.FC = () => {
       existing.received += req.receivedQty;
       map.set(req.materialCode, existing);
     }
-    // Take top 6 by required
     return Array.from(map.values())
       .sort((a, b) => b.required - a.required)
       .slice(0, 6);
-  }, [filteredRequirements]);
+  }, [serverSummary, filteredRequirements]);
 
   // Critical items
   const criticalItems = materialRiskAssessments.filter(

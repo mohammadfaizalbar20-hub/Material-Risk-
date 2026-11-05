@@ -1,8 +1,18 @@
 import React, { useState, useEffect } from 'react';
 import { usePpic } from '../../context/PpicContext';
 import { RiskBadge } from '../common/RiskBadge';
-import { getSupabaseCredentials, getSupabaseLiveCounts, cleanSupabaseUrl } from '../../lib/supabase';
-import { PPIC_SUPABASE_SCHEMA_SQL, PPIC_SUPABASE_MIGRATION_WIDEN_TEXT_SQL } from '../../lib/supabaseSchemaSql';
+import {
+  getSupabaseCredentials,
+  getSupabaseLiveCounts,
+  cleanSupabaseUrl,
+  fetchDatabaseStorageStatsFromSupabase,
+  DatabaseStorageStats,
+} from '../../lib/supabase';
+import {
+  PPIC_SUPABASE_SCHEMA_SQL,
+  PPIC_SUPABASE_MIGRATION_WIDEN_TEXT_SQL,
+  PPIC_SUPABASE_HIGH_VOLUME_SCALE_SQL,
+} from '../../lib/supabaseSchemaSql';
 import {
   Settings,
   Shield,
@@ -55,7 +65,11 @@ export const SettingsView: React.FC = () => {
   const [showSqlGuide, setShowSqlGuide] = useState(false);
   const [copiedSql, setCopiedSql] = useState(false);
   const [copiedAlterSql, setCopiedAlterSql] = useState(false);
+  const [copiedScaleSql, setCopiedScaleSql] = useState(false);
   const [showAnonKey, setShowAnonKey] = useState(false);
+
+  const [storageStats, setStorageStats] = useState<DatabaseStorageStats | null>(null);
+  const [isLoadingStorage, setIsLoadingStorage] = useState(false);
 
   const isUrlActuallyKey =
     supabaseUrlInput.trim().startsWith('sb_publishable_') ||
@@ -97,9 +111,19 @@ export const SettingsView: React.FC = () => {
     }
   };
 
+  const refreshStorageStats = async () => {
+    setIsLoadingStorage(true);
+    const stats = await fetchDatabaseStorageStatsFromSupabase();
+    if (stats) {
+      setStorageStats(stats);
+    }
+    setIsLoadingStorage(false);
+  };
+
   useEffect(() => {
     if (supabaseConnected) {
       refreshCloudStats();
+      refreshStorageStats();
     }
   }, [supabaseConnected, lastSyncTimestamp]);
 
@@ -331,6 +355,110 @@ export const SettingsView: React.FC = () => {
                 Memeriksa data di cloud Supabase...
               </span>
             )}
+
+            {/* Realtime Storage Capacity & Growth Monitoring (Scale: 20k rows/day) */}
+            <div className="pt-3 border-t border-emerald-200/80 space-y-3">
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <div className="flex items-center gap-1.5 text-slate-800 font-bold text-xs">
+                  <Database className="w-3.5 h-3.5 text-blue-600" />
+                  <span>Monitoring Kapasitas & Skalabilitas Database (Target: 20.000 Baris/Hari):</span>
+                </div>
+                <button
+                  type="button"
+                  onClick={refreshStorageStats}
+                  disabled={isLoadingStorage}
+                  className="text-[11px] text-blue-600 hover:text-blue-800 font-semibold flex items-center gap-1 cursor-pointer"
+                >
+                  <RefreshCw className={`w-3 h-3 ${isLoadingStorage ? 'animate-spin' : ''}`} />
+                  <span>Perbarui Metrik Penyimpanan</span>
+                </button>
+              </div>
+
+              {/* Warning Alert if >= 70%, 85%, or 95% */}
+              {storageStats?.warningMessage && (
+                <div
+                  className={`p-3 rounded-lg border text-xs flex items-start gap-2 ${
+                    storageStats.warningLevel === 'EMERGENCY_95'
+                      ? 'bg-rose-100 border-rose-400 text-rose-950 font-bold animate-pulse'
+                      : storageStats.warningLevel === 'CRITICAL_85'
+                      ? 'bg-amber-100 border-amber-400 text-amber-950 font-semibold'
+                      : 'bg-yellow-50 border-yellow-300 text-yellow-900'
+                  }`}
+                >
+                  <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-rose-600" />
+                  <div>
+                    <div className="font-bold">
+                      {storageStats.warningLevel === 'EMERGENCY_95'
+                        ? 'PERINGATAN BAHAYA (95%+ KUOTA PENUH)'
+                        : storageStats.warningLevel === 'CRITICAL_85'
+                        ? 'PERINGATAN KRITIS (85%+ KAPASITAS)'
+                        : 'PERINGATAN AWAL (70%+ KAPASITAS)'}
+                    </div>
+                    <p className="mt-0.5 text-[11px] leading-relaxed">
+                      {storageStats.warningMessage}
+                    </p>
+                  </div>
+                </div>
+              )}
+
+              {/* Gauge Bar */}
+              <div className="bg-white p-3.5 rounded-xl border border-emerald-200/90 shadow-2xs space-y-2">
+                <div className="flex items-center justify-between text-xs">
+                  <span className="font-semibold text-slate-700">
+                    Penggunaan Kuota Free Tier Supabase (500 MB)
+                  </span>
+                  <span className="font-mono font-bold text-slate-900">
+                    {storageStats ? `${storageStats.freeTierUsagePercent}% (${storageStats.databaseSizePretty} / 500 MB)` : '0% (0 MB / 500 MB)'}
+                  </span>
+                </div>
+                <div className="w-full bg-slate-100 rounded-full h-3 overflow-hidden border border-slate-200">
+                  <div
+                    className={`h-full rounded-full transition-all duration-500 ${
+                      (storageStats?.freeTierUsagePercent || 0) >= 95
+                        ? 'bg-rose-600'
+                        : (storageStats?.freeTierUsagePercent || 0) >= 85
+                        ? 'bg-orange-500'
+                        : (storageStats?.freeTierUsagePercent || 0) >= 70
+                        ? 'bg-amber-500'
+                        : 'bg-emerald-500'
+                    }`}
+                    style={{ width: `${Math.max(2, Math.min(100, storageStats?.freeTierUsagePercent || 2))}%` }}
+                  />
+                </div>
+                <div className="flex items-center justify-between text-[11px] text-slate-500 pt-0.5">
+                  <span>0 MB</span>
+                  <span className="text-amber-600 font-medium">Ambang Waspada: 350 MB (70%)</span>
+                  <span className="text-rose-600 font-medium">Batas: 500 MB (100%)</span>
+                </div>
+              </div>
+
+              {/* 3 Metrics Cards: Pertumbuhan Harian, Bulanan, & Sisa Hari */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs">
+                <div className="bg-white p-3 rounded-lg border border-slate-200">
+                  <span className="text-[10px] text-slate-500 block">Estimasi Pertumbuhan Harian:</span>
+                  <strong className="text-sm font-mono font-bold text-slate-900 block mt-0.5">
+                    {storageStats?.dailyGrowthEstPretty || '+7.0 MB / hari'}
+                  </strong>
+                  <span className="text-[10px] text-slate-400">Asumsi 20.000 baris baru/hari</span>
+                </div>
+
+                <div className="bg-white p-3 rounded-lg border border-slate-200">
+                  <span className="text-[10px] text-slate-500 block">Estimasi Pertumbuhan Bulanan:</span>
+                  <strong className="text-sm font-mono font-bold text-blue-700 block mt-0.5">
+                    {storageStats?.monthlyGrowthEstPretty || '+210 MB / bulan'}
+                  </strong>
+                  <span className="text-[10px] text-slate-400">Asumsi 600.000 baris baru/bulan</span>
+                </div>
+
+                <div className="bg-white p-3 rounded-lg border border-slate-200">
+                  <span className="text-[10px] text-slate-500 block">Estimasi Sisa Waktu Free Tier:</span>
+                  <strong className="text-sm font-mono font-bold text-emerald-700 block mt-0.5">
+                    {storageStats ? `${storageStats.daysRemainingEst} Hari Operasional` : '~70 Hari'}
+                  </strong>
+                  <span className="text-[10px] text-slate-400">Sebelum perlu paket Supabase Pro (8 GB)</span>
+                </div>
+              </div>
+            </div>
           </div>
         )}
 
@@ -755,6 +883,20 @@ export const SettingsView: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => {
+                    navigator.clipboard.writeText(PPIC_SUPABASE_HIGH_VOLUME_SCALE_SQL);
+                    setCopiedScaleSql(true);
+                    setTimeout(() => setCopiedScaleSql(false), 2000);
+                  }}
+                  className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors"
+                  title="Salin skrip indeks komposit B-Tree dan RPC agregasi server-side untuk performa sub-detik"
+                >
+                  {copiedScaleSql ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedScaleSql ? 'Skrip Skala 20k/Hari Tersalin!' : 'Salin Indeks Skala 20k/Hari (1-Klik)'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
                     navigator.clipboard.writeText(PPIC_SUPABASE_MIGRATION_WIDEN_TEXT_SQL);
                     setCopiedAlterSql(true);
                     setTimeout(() => setCopiedAlterSql(false), 2000);
@@ -780,8 +922,9 @@ export const SettingsView: React.FC = () => {
               </div>
             </div>
             <p className="text-[11px] text-slate-400 leading-relaxed">
-              &bull; <strong>Tombol &quot;Salin ALTER TABLE ke TEXT&quot;</strong>: Gunakan jika database Supabase Anda sudah dibuat sebelumnya namun mengalami kendala <em>&quot;value too long for type character varying(255)&quot;</em>. Script ini memperbarui seluruh kolom menjadi <code>TEXT</code> secara non-destruktif tanpa menghapus data yang ada.<br />
-              &bull; <strong>Tombol &quot;Salin Seluruh Skema SQL&quot;</strong>: Gunakan jika baru pertama kali menyiapkan database Supabase baru untuk membuat ke-5 tabel lengkap beserta indeks dan aturan RLS.
+              &bull; <strong>Tombol &quot;Salin Indeks Skala 20k/Hari&quot;</strong>: Mengoptimalkan database PostgreSQL dengan indeks komposit B-Tree pada kolom (<code>or_number</code>, <code>update_date</code>, <code>upload_id</code>) dan mengaktifkan RPC agregasi server-side agar query tetap berkecepatan milidetik pada jutaan baris data.<br />
+              &bull; <strong>Tombol &quot;Salin ALTER TABLE ke TEXT&quot;</strong>: Memperbarui seluruh kolom teks menjadi <code>TEXT</code> secara non-destruktif tanpa batas 255 karakter.<br />
+              &bull; <strong>Tombol &quot;Salin Seluruh Skema SQL&quot;</strong>: Membuat 5 tabel lengkap dari awal untuk database Supabase baru.
             </p>
           </div>
         )}

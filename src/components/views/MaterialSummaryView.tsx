@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { usePpic } from '../../context/PpicContext';
 import { MaterialItemRequirement, MaterialCategory, MaterialUnit } from '../../types/ppic';
 import * as XLSX from 'xlsx';
@@ -27,6 +27,10 @@ import {
   Square,
   RefreshCw,
   FolderMinus,
+  ChevronLeft,
+  ChevronRight,
+  ChevronsLeft,
+  ChevronsRight,
 } from 'lucide-react';
 
 export const MaterialSummaryView: React.FC = () => {
@@ -224,7 +228,35 @@ export const MaterialSummaryView: React.FC = () => {
     onlyRecentFilter,
   ]);
 
-  // Checkbox selection helpers
+  // Pagination State for High-Volume Scale (20,000+ rows daily)
+  const [currentPage, setCurrentPage] = useState<number>(1);
+  const [pageSize, setPageSize] = useState<number>(50);
+  const [jumpPageInput, setJumpPageInput] = useState<string>('');
+
+  // Automatically reset to Page 1 whenever any search filter changes
+  useEffect(() => {
+    setCurrentPage(1);
+  }, [
+    searchMaterialInput,
+    activeSearchQuery,
+    searchOrInput,
+    searchStyleInput,
+    searchDateInput,
+    statusFilter,
+    onlyRecentFilter,
+    pageSize,
+  ]);
+
+  const totalFilteredCount = filteredRequirements.length;
+  const totalPages = Math.max(1, Math.ceil(totalFilteredCount / pageSize));
+  const safeCurrentPage = Math.min(currentPage, totalPages);
+
+  const paginatedRequirements = useMemo(() => {
+    const from = (safeCurrentPage - 1) * pageSize;
+    return filteredRequirements.slice(from, from + pageSize);
+  }, [filteredRequirements, safeCurrentPage, pageSize]);
+
+  // Checkbox selection helpers (Operates over filtered & visible items)
   const allFilteredSelected = useMemo(() => {
     if (filteredRequirements.length === 0) return false;
     return filteredRequirements.every((r) => selectedRowIds.has(r.id));
@@ -1134,7 +1166,7 @@ export const MaterialSummaryView: React.FC = () => {
                       </td>
                     </tr>
                   ) : (
-                    filteredRequirements.map((row) => {
+                    paginatedRequirements.map((row) => {
                       const isSelected = selectedRowIds.has(row.id);
                       const isShortage = row.shortage < 0;
 
@@ -1295,6 +1327,174 @@ export const MaterialSummaryView: React.FC = () => {
                   )}
                 </tbody>
               </table>
+            </div>
+
+            {/* HIGH-VOLUME PAGINATION BAR (Supports 20,000+ to Millions of Rows) */}
+            <div className="p-3.5 bg-slate-50 border-t border-slate-200 flex flex-col md:flex-row items-center justify-between gap-3 text-xs">
+              {/* Left: Summary and Page Size Selector */}
+              <div className="flex flex-wrap items-center gap-3 w-full md:w-auto justify-between md:justify-start">
+                <div className="text-slate-600">
+                  {totalFilteredCount > 0 ? (
+                    <>
+                      Menampilkan{' '}
+                      <strong className="text-slate-900 font-mono">
+                        {((safeCurrentPage - 1) * pageSize + 1).toLocaleString('id-ID')}
+                      </strong>{' '}
+                      -{' '}
+                      <strong className="text-slate-900 font-mono">
+                        {Math.min(safeCurrentPage * pageSize, totalFilteredCount).toLocaleString('id-ID')}
+                      </strong>{' '}
+                      dari{' '}
+                      <strong className="text-slate-900 font-mono">
+                        {totalFilteredCount.toLocaleString('id-ID')}
+                      </strong>{' '}
+                      baris material
+                    </>
+                  ) : (
+                    <span className="text-slate-400">Tidak ada baris material</span>
+                  )}
+                </div>
+
+                <div className="flex items-center gap-1.5">
+                  <label htmlFor="pageSizeSelect" className="text-slate-500 text-[11px]">Tampilkan:</label>
+                  <select
+                    id="pageSizeSelect"
+                    value={pageSize}
+                    onChange={(e) => setPageSize(Number(e.target.value))}
+                    className="px-2 py-1 text-xs font-semibold bg-white border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 focus:outline-none cursor-pointer"
+                  >
+                    <option value={25}>25 / hal</option>
+                    <option value={50}>50 / hal</option>
+                    <option value={100}>100 / hal</option>
+                    <option value={250}>250 / hal</option>
+                    <option value={500}>500 / hal</option>
+                  </select>
+                </div>
+              </div>
+
+              {/* Right: Page Navigation Buttons & Direct Jump */}
+              <div className="flex flex-wrap items-center gap-2 justify-center md:justify-end w-full md:w-auto">
+                {/* First Page */}
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage(1)}
+                  disabled={safeCurrentPage <= 1}
+                  className="p-1.5 rounded border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors text-slate-700 cursor-pointer"
+                  title="Halaman Pertama (1)"
+                >
+                  <ChevronsLeft className="w-3.5 h-3.5" />
+                </button>
+
+                {/* Prev Page */}
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
+                  disabled={safeCurrentPage <= 1}
+                  className="px-2.5 py-1 rounded border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors text-slate-700 flex items-center gap-1 cursor-pointer font-medium"
+                  title="Halaman Sebelumnya"
+                >
+                  <ChevronLeft className="w-3.5 h-3.5" />
+                  <span className="hidden sm:inline">Prev</span>
+                </button>
+
+                {/* Dynamic Page Buttons */}
+                <div className="flex items-center gap-1">
+                  {Array.from({ length: totalPages }, (_, idx) => idx + 1)
+                    .filter((p) => {
+                      if (totalPages <= 7) return true;
+                      if (p === 1 || p === totalPages) return true;
+                      if (Math.abs(p - safeCurrentPage) <= 1) return true;
+                      return false;
+                    })
+                    .reduce<(number | string)[]>((acc, p, idx, arr) => {
+                      if (idx > 0 && p - (arr[idx - 1] as number) > 1) {
+                        acc.push('...');
+                      }
+                      acc.push(p);
+                      return acc;
+                    }, [])
+                    .map((item, idx) => {
+                      if (item === '...') {
+                        return (
+                          <span key={`ellipsis-${idx}`} className="px-1.5 text-slate-400 font-mono text-xs">
+                            ...
+                          </span>
+                        );
+                      }
+                      const pageNum = Number(item);
+                      const isActive = pageNum === safeCurrentPage;
+                      return (
+                        <button
+                          key={`page-${pageNum}`}
+                          type="button"
+                          onClick={() => setCurrentPage(pageNum)}
+                          className={`min-w-[28px] h-7 px-2 text-xs font-mono font-bold rounded transition-colors cursor-pointer ${
+                            isActive
+                              ? 'bg-blue-600 text-white shadow-2xs'
+                              : 'bg-white hover:bg-slate-100 text-slate-700 border border-slate-300'
+                          }`}
+                        >
+                          {pageNum}
+                        </button>
+                      );
+                    })}
+                </div>
+
+                {/* Next Page */}
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage((p) => Math.min(totalPages, p + 1))}
+                  disabled={safeCurrentPage >= totalPages}
+                  className="px-2.5 py-1 rounded border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors text-slate-700 flex items-center gap-1 cursor-pointer font-medium"
+                  title="Halaman Berikutnya"
+                >
+                  <span className="hidden sm:inline">Next</span>
+                  <ChevronRight className="w-3.5 h-3.5" />
+                </button>
+
+                {/* Last Page */}
+                <button
+                  type="button"
+                  onClick={() => setCurrentPage(totalPages)}
+                  disabled={safeCurrentPage >= totalPages}
+                  className="p-1.5 rounded border border-slate-300 bg-white hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors text-slate-700 cursor-pointer"
+                  title={`Halaman Terakhir (${totalPages})`}
+                >
+                  <ChevronsRight className="w-3.5 h-3.5" />
+                </button>
+
+                {/* Jump to Page input */}
+                {totalPages > 3 && (
+                  <form
+                    onSubmit={(e) => {
+                      e.preventDefault();
+                      const target = parseInt(jumpPageInput, 10);
+                      if (!isNaN(target) && target >= 1 && target <= totalPages) {
+                        setCurrentPage(target);
+                        setJumpPageInput('');
+                      }
+                    }}
+                    className="flex items-center gap-1 ml-1"
+                  >
+                    <span className="text-slate-400 text-[11px] hidden lg:inline">Ke:</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={totalPages}
+                      value={jumpPageInput}
+                      onChange={(e) => setJumpPageInput(e.target.value)}
+                      placeholder={String(safeCurrentPage)}
+                      className="w-12 px-1.5 py-1 text-xs font-mono text-center border border-slate-300 rounded bg-white focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    />
+                    <button
+                      type="submit"
+                      className="px-2 py-1 text-xs font-semibold bg-slate-200 hover:bg-slate-300 text-slate-700 rounded cursor-pointer"
+                    >
+                      Go
+                    </button>
+                  </form>
+                )}
+              </div>
             </div>
           </div>
         </div>

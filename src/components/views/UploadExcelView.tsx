@@ -61,6 +61,22 @@ export const UploadExcelView: React.FC = () => {
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
+  // Real-time animated batch upload progress (Supports 20,000+ rows daily)
+  const [batchProgress, setBatchProgress] = useState<{
+    currentBatch: number;
+    totalBatches: number;
+    rowsInserted: number;
+    totalRows: number;
+    percent: number;
+    currentChunkRows: number;
+    statusText: string;
+  } | null>(null);
+  const [batchErrorDetails, setBatchErrorDetails] = useState<{
+    failedBatch?: number;
+    failingRange?: string;
+    error?: string;
+  } | null>(null);
+
   // Riwayat Upload Search Input (Typed manual search - Single source of truth)
   const [historySearchInput, setHistorySearchInput] = useState<string>('');
 
@@ -256,31 +272,54 @@ export const UploadExcelView: React.FC = () => {
     setErrorMessage(null);
   };
 
-  // Tahap 4 & 5: Konfirmasi dan Penyimpanan Atomik ke Database
-  const handleConfirmAndSave = () => {
+  // Tahap 4 & 5: Konfirmasi dan Penyimpanan Atomik ke Database (Batch Scale-Ready)
+  const handleConfirmAndSave = async () => {
     if (!previewData) return;
 
     setIsProcessing(true);
-    setStatusMessage('Menyimpan transaksi material dan memperbarui Master Data...');
+    setErrorMessage(null);
+    setBatchErrorDetails(null);
+    setStatusMessage('Memulai penyimpanan batch data ke database...');
 
     try {
-      autoSaveExcelMaterials({
+      const res = await autoSaveExcelMaterials({
         newRequirements: previewData.parsedResult.requirements,
         newMasterMaterials: previewData.parsedResult.newMasterMaterials,
         newRelations: previewData.parsedResult.relations,
         updateDate: previewData.updateDate,
         fileName: previewData.fileName,
+        skipMenuRedirect: true,
+        onProgress: (info) => {
+          setBatchProgress(info);
+          setStatusMessage(info.statusText);
+        },
       });
 
-      const savedCount = previewData.rows.length;
-      const savedOr = previewData.orNumber;
-      const savedDate = previewData.updateDate;
+      if (res.success) {
+        const savedCount = previewData.rows.length;
+        const savedOr = previewData.orNumber;
+        const savedDate = previewData.updateDate;
 
-      setPreviewData(null);
-      setIsProcessing(false);
-      setStatusMessage(
-        `Sukses! ${savedCount} baris material untuk ${savedOr} berhasil disimpan ke Master Data Material (Tanggal Update: ${savedDate}).`
-      );
+        setStatusMessage(
+          `Sukses! Seluruh ${savedCount.toLocaleString('id-ID')} baris material untuk ${savedOr} berhasil disimpan ke database (Tanggal Update: ${savedDate}).`
+        );
+
+        // Smooth transition to Rekap Material
+        setTimeout(() => {
+          setPreviewData(null);
+          setBatchProgress(null);
+          setIsProcessing(false);
+          setActiveMenu('Rekap Material');
+        }, 1200);
+      } else {
+        setIsProcessing(false);
+        setBatchErrorDetails({
+          error: res.error,
+        });
+        setErrorMessage(
+          `Gagal menyimpan seluruh batch data: ${res.error || 'Terjadi kesalahan sistem'}. Anda dapat mencoba ulang penyimpanan.`
+        );
+      }
     } catch (err: any) {
       console.error(err);
       setIsProcessing(false);
@@ -1045,6 +1084,118 @@ export const UploadExcelView: React.FC = () => {
           </table>
         </div>
       </div>
+
+      {/* REAL-TIME BATCH UPLOAD PROGRESS MODAL (Scale: 20,000+ daily rows) */}
+      {(batchProgress || (isProcessing && previewData)) && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+          <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-lg w-full p-6 space-y-5 animate-in fade-in zoom-in-95 duration-200">
+            <div className="flex items-start justify-between">
+              <div>
+                <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded text-[11px] font-bold bg-blue-50 text-blue-700 border border-blue-200 mb-1">
+                  <RefreshCw className={`w-3.5 h-3.5 ${batchProgress?.percent !== 100 ? 'animate-spin text-blue-600' : 'text-emerald-600'}`} />
+                  High-Volume Batch Engine (500 baris/batch)
+                </div>
+                <h3 className="text-base font-bold text-slate-900">
+                  {batchProgress?.percent === 100
+                    ? 'Penyimpanan Selesai Sepenuhnya!'
+                    : 'Menyimpan Data Material ke Database...'}
+                </h3>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  Setiap batch diverifikasi atomik dengan 3x percobaan ulang otomatis demi integritas data jutaan baris.
+                </p>
+              </div>
+            </div>
+
+            {/* Target OR & Date summary */}
+            {previewData && (
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 grid grid-cols-3 gap-2 text-xs">
+                <div>
+                  <span className="text-[10px] text-slate-400 block">No. OR</span>
+                  <span className="font-mono font-bold text-slate-900">{previewData.orNumber}</span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-400 block">Tanggal Update</span>
+                  <span className="font-mono font-bold text-blue-700">{previewData.updateDate}</span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-400 block">Total Data</span>
+                  <span className="font-mono font-bold text-slate-900">
+                    {previewData.rows.length.toLocaleString('id-ID')} baris
+                  </span>
+                </div>
+              </div>
+            )}
+
+            {/* Animated Progress Bar */}
+            <div className="space-y-2">
+              <div className="flex items-center justify-between text-xs font-semibold">
+                <span className="text-slate-700">
+                  {batchProgress
+                    ? `Batch ${batchProgress.currentBatch} dari ${batchProgress.totalBatches}`
+                    : 'Mempersiapkan batch...'}
+                </span>
+                <span className="font-mono text-blue-600 text-sm font-bold">
+                  {batchProgress ? `${batchProgress.percent}%` : '0%'}
+                </span>
+              </div>
+              <div className="w-full bg-slate-100 rounded-full h-3 overflow-hidden border border-slate-200">
+                <div
+                  className="bg-gradient-to-r from-blue-600 via-indigo-600 to-emerald-500 h-full transition-all duration-300 rounded-full"
+                  style={{ width: `${batchProgress ? batchProgress.percent : 5}%` }}
+                />
+              </div>
+              <div className="flex items-center justify-between text-[11px] text-slate-500">
+                <span>
+                  {batchProgress
+                    ? `${batchProgress.rowsInserted.toLocaleString('id-ID')} / ${batchProgress.totalRows.toLocaleString('id-ID')} baris tersimpan`
+                    : 'Menginisialisasi koneksi...'}
+                </span>
+                <span className="text-slate-400">Ukuran batch: 500 baris</span>
+              </div>
+            </div>
+
+            {/* Live Status Text */}
+            <div className="p-3 bg-blue-50/70 border border-blue-200 rounded-xl text-xs text-blue-900 flex items-center gap-2.5">
+              <RefreshCw className={`w-4 h-4 shrink-0 text-blue-600 ${batchProgress?.percent !== 100 ? 'animate-spin' : ''}`} />
+              <span className="font-medium text-[11px]">
+                {batchProgress?.statusText || statusMessage || 'Sedang memproses batch...'}
+              </span>
+            </div>
+
+            {/* Batch Error Diagnostics with Retry */}
+            {batchErrorDetails && (
+              <div className="p-3.5 bg-rose-50 border border-rose-300 rounded-xl space-y-2 text-xs">
+                <div className="flex items-start gap-2 text-rose-900 font-bold">
+                  <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                  <span>Gangguan Pada Batch Penyimpanan</span>
+                </div>
+                <p className="text-[11px] text-rose-700 leading-relaxed">
+                  {batchErrorDetails.error}
+                </p>
+                <div className="pt-2 flex items-center justify-end gap-2">
+                  <button
+                    onClick={() => {
+                      setBatchProgress(null);
+                      setBatchErrorDetails(null);
+                      setIsProcessing(false);
+                    }}
+                    className="px-3 py-1.5 text-xs text-slate-700 hover:bg-slate-200 rounded-md transition-colors"
+                  >
+                    Tutup
+                  </button>
+                  <button
+                    onClick={handleConfirmAndSave}
+                    className="px-3.5 py-1.5 text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 rounded-md transition-colors flex items-center gap-1.5"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    Coba Ulang Penyimpanan
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   );
 };

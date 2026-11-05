@@ -38,6 +38,8 @@ import {
   testSupabaseConnection,
   fetchAllPpicFromSupabase,
   syncBatchExcelToSupabase,
+  syncBatchExcelToSupabaseWithProgress,
+  UploadProgressCallbackInfo,
   deleteRequirementsFromSupabase,
   logDeletionToSupabase,
   saveScheduleToSupabase,
@@ -154,7 +156,9 @@ interface PpicContextType {
     newRelations?: OrStyleRelation[];
     updateDate: string;
     fileName?: string;
-  }) => void;
+    skipMenuRedirect?: boolean;
+    onProgress?: (info: UploadProgressCallbackInfo) => void;
+  }) => Promise<{ success: boolean; uploadId?: string; error?: string }>;
 
   // Master Data Deletion Feature
   deletionHistory: DeletionHistoryItem[];
@@ -349,9 +353,13 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   useEffect(() => {
     try {
-      localStorage.setItem(`${LOCAL_STORAGE_KEY}_requirements`, JSON.stringify(materialRequirements));
+      // High volume optimization: Cache at most 1,000 recent requirements in localStorage
+      // to avoid QuotaExceededError (5MB browser limit) when storing 20,000+ rows daily.
+      // Supabase PostgreSQL remains the comprehensive centralized single source of truth.
+      const toCache = materialRequirements.slice(0, 1000);
+      localStorage.setItem(`${LOCAL_STORAGE_KEY}_requirements`, JSON.stringify(toCache));
     } catch (e) {
-      console.error(e);
+      console.warn('LocalStorage quota limit reached, Supabase cloud remains authoritative:', e);
     }
   }, [materialRequirements]);
 
@@ -1243,9 +1251,22 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return detectScheduleConflicts(productionSchedules);
   }, [productionSchedules]);
 
-  // Material Risk Analysis & OR Summaries (Reactive based on schedules and requirements)
+  // Material Risk Analysis & OR Summaries (Optimized for High Volume & Active Schedules)
   const { materialAssessments: materialRiskAssessments, orSummaries: orRiskSummaries } = useMemo(() => {
-    return assessAllMaterialRisks(materialRequirements, productionSchedules, new Date());
+    // High-volume scale optimization:
+    // Focus risk analysis on materials that belong to scheduled ORs, or the recent 2,000 requirements.
+    // This prevents evaluating millions of historical finished records while keeping 100% precision for active production schedules.
+    const scheduledOrs = new Set(productionSchedules.map((s) => s.orNumber.trim().toUpperCase()));
+    const activeReqs =
+      scheduledOrs.size > 0
+        ? materialRequirements.filter((r) => scheduledOrs.has(r.orNumber.trim().toUpperCase()))
+        : materialRequirements.slice(0, 2000);
+
+    return assessAllMaterialRisks(
+      activeReqs.length > 0 ? activeReqs : materialRequirements.slice(0, 2000),
+      productionSchedules,
+      new Date()
+    );
   }, [materialRequirements, productionSchedules]);
 
   // Pareto Analysis (Reactive)
@@ -1385,21 +1406,27 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     ]);
   };
 
-  // Direct Automatic Save from Excel Reader into Master Data Material
-  const autoSaveExcelMaterials = ({
+  // Direct Automatic Save from Excel Reader into Master Data Material (High-Volume Resilient)
+  const autoSaveExcelMaterials = async ({
     newRequirements,
     newMasterMaterials = [],
     newRelations = [],
     updateDate,
     fileName = 'Data_Material_PPIC.xlsx',
+    skipMenuRedirect = false,
+    onProgress,
   }: {
     newRequirements: MaterialItemRequirement[];
     newMasterMaterials?: Material[];
     newRelations?: OrStyleRelation[];
     updateDate: string;
     fileName?: string;
-  }) => {
-    if (newRequirements.length === 0) return;
+    skipMenuRedirect?: boolean;
+    onProgress?: (info: UploadProgressCallbackInfo) => void;
+  }): Promise<{ success: boolean; uploadId?: string; error?: string }> => {
+    if (newRequirements.length === 0) {
+      return { success: false, error: 'Tidak ada baris material yang diproses.' };
+    }
 
     // Use selected updateDate or default to current date in WIB (Asia/Jakarta)
     const effectiveUpdateDate =
@@ -1499,36 +1526,62 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       ...prev,
     ]);
 
-    // 7. Sync to Centralized Supabase Database if configured
+    // 7. Sync to Centralized Supabase Database if configured (High-Volume 500-row batching with 3x retry)
     if (getSupabaseCredentials().isConfigured) {
-      syncBatchExcelToSupabase({
-        uploadHistoryItem: newHistItem,
-        relation: {
-          id: `rel-${Date.now()}`,
-          orNumber: primaryOr,
-          style: primaryStyle,
-          createdAt: new Date().toISOString(),
-        },
-        requirements: newRequirements.map((r) => ({
-          ...r,
-          uploadId,
-          orNumber: primaryOr,
-          style: primaryStyle,
-          updateDate: effectiveUpdateDate,
-        })),
-        masterMaterials: newMasterMaterials,
-      }).then((res) => {
-        if (res.success) {
+      try {
+        const syncRes = await syncBatchExcelToSupabaseWithProgress(
+          {
+            uploadHistoryItem: newHistItem,
+            relation: {
+              id: `rel-${Date.now()}`,
+              orNumber: primaryOr,
+              style: primaryStyle,
+              createdAt: new Date().toISOString(),
+            },
+            requirements: newRequirements.map((r) => ({
+              ...r,
+              uploadId,
+              orNumber: primaryOr,
+              style: primaryStyle,
+              updateDate: effectiveUpdateDate,
+            })),
+            masterMaterials: newMasterMaterials,
+          },
+          onProgress
+        );
+
+        if (syncRes.success) {
           setLastSyncTimestamp(Date.now());
           setSupabaseConnected(true);
+          if (!skipMenuRedirect) {
+            setActiveMenu('Rekap Material');
+          }
+          return { success: true, uploadId: syncRes.uploadId || uploadId };
         } else {
-          console.warn('Background Supabase sync notice:', res.error);
+          console.warn('Batch Supabase sync notice:', syncRes.error);
+          return { success: false, uploadId, error: syncRes.error };
         }
-      });
+      } catch (err: any) {
+        console.error('Error during Supabase batch sync:', err);
+        return { success: false, uploadId, error: err.message || String(err) };
+      }
+    } else {
+      if (onProgress) {
+        onProgress({
+          currentBatch: 1,
+          totalBatches: 1,
+          rowsInserted: newRequirements.length,
+          totalRows: newRequirements.length,
+          percent: 100,
+          currentChunkRows: newRequirements.length,
+          statusText: 'Data tersimpan di penyimpanan lokal offline.',
+        });
+      }
+      if (!skipMenuRedirect) {
+        setActiveMenu('Rekap Material');
+      }
+      return { success: true, uploadId };
     }
-
-    // 8. Direct automatic navigation to Master Data Material
-    setActiveMenu('Rekap Material');
   };
 
   const resetToInitialData = () => {

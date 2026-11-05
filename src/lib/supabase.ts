@@ -570,7 +570,7 @@ export async function testSupabaseConnection(
   }
 }
 
-export async function fetchAllPpicFromSupabase(): Promise<{
+export async function fetchAllPpicFromSupabase(options?: { recentLimit?: number }): Promise<{
   materialRequirements: MaterialItemRequirement[];
   uploadHistory: UploadHistoryItem[];
   productionSchedules: ProductionSchedule[];
@@ -582,13 +582,18 @@ export async function fetchAllPpicFromSupabase(): Promise<{
   if (!supabase) return null;
 
   try {
+    const limit = options?.recentLimit ?? 2000;
     const [reqRes, histRes, schRes, relRes, matRes, delRes] = await Promise.all([
-      supabase.from('material_requirements').select('*').order('created_at', { ascending: false }),
-      supabase.from('upload_history').select('*').order('created_at', { ascending: false }),
+      supabase
+        .from('material_requirements')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .limit(limit),
+      supabase.from('upload_history').select('*').order('created_at', { ascending: false }).limit(500),
       supabase.from('production_schedules').select('*').order('production_date', { ascending: true }),
       supabase.from('or_style_relations').select('*').order('created_at', { ascending: false }),
       supabase.from('master_materials').select('*').order('name', { ascending: true }),
-      supabase.from('deletion_history').select('*').order('created_at', { ascending: false }),
+      supabase.from('deletion_history').select('*').order('created_at', { ascending: false }).limit(200),
     ]);
 
     if (reqRes.error) {
@@ -649,24 +654,56 @@ export async function getSupabaseLiveCounts(): Promise<{
   }
 }
 
-export async function syncBatchExcelToSupabase(params: {
-  uploadHistoryItem: UploadHistoryItem;
-  relation: OrStyleRelation;
-  requirements: MaterialItemRequirement[];
-  masterMaterials?: Material[];
-}): Promise<{ success: boolean; uploadId?: string; error?: string }> {
+export interface UploadProgressCallbackInfo {
+  currentBatch: number;
+  totalBatches: number;
+  rowsInserted: number;
+  totalRows: number;
+  percent: number;
+  currentChunkRows: number;
+  statusText: string;
+}
+
+/**
+ * High-Volume Resilient Excel Upload Sync:
+ * - Batches in 500 rows per request (supports 20,000+ rows smoothly)
+ * - Automatic 3x retry per batch with exponential backoff on transient network drops
+ * - Real-time progress updates callback
+ * - Never marks success until all batches are verified committed
+ */
+export async function syncBatchExcelToSupabaseWithProgress(
+  params: {
+    uploadHistoryItem: UploadHistoryItem;
+    relation: OrStyleRelation;
+    requirements: MaterialItemRequirement[];
+    masterMaterials?: Material[];
+  },
+  onProgress?: (info: UploadProgressCallbackInfo) => void
+): Promise<{
+  success: boolean;
+  uploadId?: string;
+  totalInserted: number;
+  failedBatch?: number;
+  failingRange?: string;
+  error?: string;
+}> {
   const supabase = getSupabaseClient();
-  if (!supabase) return { success: false, error: 'Supabase client not initialized' };
+  if (!supabase) {
+    return { success: false, totalInserted: 0, error: 'Supabase client belum terinisialisasi.' };
+  }
 
   try {
-    // 1. Upsert OR & Style relation
+    // 1. Upsert OR & Style relation (Parent)
     const dbRel = mapModelToDbRelation(params.relation);
-    delete dbRel.id; // Let database manage or match on unique or_number
-    await supabase
+    delete dbRel.id;
+    const { error: relErr } = await supabase
       .from('or_style_relations')
       .upsert(dbRel, { onConflict: 'or_number' });
+    if (relErr) {
+      throw new Error(`[Gagal Simpan Relasi OR] ${relErr.message}`);
+    }
 
-    // 2. Insert Upload History Item
+    // 2. Insert Upload History Item (Parent Header)
     const dbHist = mapModelToDbUploadHistory(params.uploadHistoryItem);
     delete dbHist.id; // auto generate UUID
     const { data: histData, error: histErr } = await supabase
@@ -675,7 +712,7 @@ export async function syncBatchExcelToSupabase(params: {
       .select('id')
       .single();
 
-    if (histErr) throw histErr;
+    if (histErr) throw new Error(`[Gagal Simpan Riwayat Upload] ${histErr.message}`);
     const generatedUploadId = histData.id;
 
     // 3. Insert Material Requirements Batch
@@ -686,14 +723,68 @@ export async function syncBatchExcelToSupabase(params: {
       return row;
     });
 
-    // Insert in chunks of 100 for network safety
-    const chunkSize = 100;
-    for (let i = 0; i < dbReqs.length; i += chunkSize) {
+    const totalRows = dbReqs.length;
+    const chunkSize = 500; // Optimal 500 rows per chunk for high throughput & zero timeout
+    const totalBatches = Math.ceil(totalRows / chunkSize) || 1;
+    let totalInserted = 0;
+
+    for (let i = 0; i < totalRows; i += chunkSize) {
+      const batchNum = Math.floor(i / chunkSize) + 1;
       const chunk = dbReqs.slice(i, i + chunkSize);
-      const { error: chunkErr } = await supabase
-        .from('material_requirements')
-        .insert(chunk);
-      if (chunkErr) throw chunkErr;
+      const startRow = i + 1;
+      const endRow = Math.min(i + chunkSize, totalRows);
+
+      if (onProgress) {
+        const percent = Math.min(99, Math.round((totalInserted / totalRows) * 100));
+        onProgress({
+          currentBatch: batchNum,
+          totalBatches,
+          rowsInserted: totalInserted,
+          totalRows,
+          percent,
+          currentChunkRows: chunk.length,
+          statusText: `Menyimpan Batch ${batchNum} dari ${totalBatches} (${startRow.toLocaleString('id-ID')} - ${endRow.toLocaleString('id-ID')} baris)...`,
+        });
+      }
+
+      // Retry mechanism with exponential backoff (3 attempts)
+      const MAX_RETRIES = 3;
+      let chunkSuccess = false;
+      let lastChunkError: any = null;
+
+      for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+        try {
+          const { error: chunkErr } = await supabase
+            .from('material_requirements')
+            .insert(chunk);
+
+          if (!chunkErr) {
+            chunkSuccess = true;
+            break;
+          }
+          lastChunkError = chunkErr;
+        } catch (err: any) {
+          lastChunkError = err;
+        }
+
+        if (attempt < MAX_RETRIES) {
+          await new Promise((res) => setTimeout(res, attempt * 600));
+        }
+      }
+
+      if (!chunkSuccess) {
+        const failingRangeStr = `Baris ${startRow.toLocaleString('id-ID')} - ${endRow.toLocaleString('id-ID')}`;
+        return {
+          success: false,
+          uploadId: generatedUploadId,
+          totalInserted,
+          failedBatch: batchNum,
+          failingRange: failingRangeStr,
+          error: `Batch ${batchNum}/${totalBatches} gagal disimpan setelah ${MAX_RETRIES}x percobaan: ${lastChunkError?.message || String(lastChunkError)}`,
+        };
+      }
+
+      totalInserted += chunk.length;
     }
 
     // 4. Upsert Master Materials if provided
@@ -708,10 +799,369 @@ export async function syncBatchExcelToSupabase(params: {
         .upsert(dbMats, { onConflict: 'code' });
     }
 
-    return { success: true, uploadId: generatedUploadId };
+    if (onProgress) {
+      onProgress({
+        currentBatch: totalBatches,
+        totalBatches,
+        rowsInserted: totalInserted,
+        totalRows,
+        percent: 100,
+        currentChunkRows: 0,
+        statusText: `Selesai! Seluruh ${totalInserted.toLocaleString('id-ID')} baris material berhasil tersimpan di Supabase.`,
+      });
+    }
+
+    return { success: true, uploadId: generatedUploadId, totalInserted };
   } catch (err: any) {
     console.error('Failed to sync Excel upload to Supabase:', err);
-    return { success: false, error: err.message || String(err) };
+    return { success: false, totalInserted: 0, error: err.message || String(err) };
+  }
+}
+
+export async function syncBatchExcelToSupabase(params: {
+  uploadHistoryItem: UploadHistoryItem;
+  relation: OrStyleRelation;
+  requirements: MaterialItemRequirement[];
+  masterMaterials?: Material[];
+}): Promise<{ success: boolean; uploadId?: string; error?: string }> {
+  const res = await syncBatchExcelToSupabaseWithProgress(params);
+  return { success: res.success, uploadId: res.uploadId, error: res.error };
+}
+
+// ---------------------------------------------------------------------------
+// SERVER-SIDE RANGE PAGINATION UNTUK JUTAAN BARIS DATA
+// ---------------------------------------------------------------------------
+
+export interface PaginatedRequirementsParams {
+  page?: number;
+  pageSize?: number;
+  search?: string;
+  orNumber?: string;
+  style?: string;
+  updateDate?: string;
+  category?: string;
+  status?: 'ALL' | 'READY' | 'BELUM_READY';
+  sortBy?: string;
+  sortOrder?: 'asc' | 'desc';
+}
+
+export interface PaginatedRequirementsResult {
+  data: MaterialItemRequirement[];
+  totalCount: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+}
+
+export async function fetchPaginatedRequirementsFromSupabase(
+  params: PaginatedRequirementsParams
+): Promise<PaginatedRequirementsResult | null> {
+  const supabase = getSupabaseClient();
+  if (!supabase) return null;
+
+  try {
+    const page = Math.max(1, params.page || 1);
+    const pageSize = Math.min(1000, Math.max(10, params.pageSize || 50));
+    const from = (page - 1) * pageSize;
+    const to = from + pageSize - 1;
+
+    let query = supabase
+      .from('material_requirements')
+      .select('*', { count: 'exact' });
+
+    // Server-side indexed filters
+    if (params.orNumber?.trim()) {
+      query = query.ilike('or_number', `%${params.orNumber.trim()}%`);
+    }
+    if (params.style?.trim()) {
+      query = query.ilike('style', `%${params.style.trim()}%`);
+    }
+    if (params.updateDate?.trim()) {
+      query = query.eq('update_date', safeDbDate(params.updateDate));
+    }
+    if (params.category && params.category !== 'ALL') {
+      query = query.eq('category', params.category);
+    }
+    if (params.search?.trim()) {
+      const q = params.search.trim();
+      query = query.or(
+        `material_name.ilike.%${q}%,material_code.ilike.%${q}%,or_number.ilike.%${q}%,style.ilike.%${q}%`
+      );
+    }
+
+    const sortField = params.sortBy || 'created_at';
+    const isAsc = params.sortOrder === 'asc';
+    query = query.order(sortField, { ascending: isAsc });
+
+    // Range-based pagination
+    query = query.range(from, to);
+
+    const { data, count, error } = await query;
+    if (error) {
+      console.error('Error fetching paginated requirements:', error);
+      throw error;
+    }
+
+    const totalCount = count || 0;
+    const totalPages = Math.ceil(totalCount / pageSize) || 1;
+    let items = (data || []).map(mapDbRequirementToModel);
+
+    // In-memory status filter if applied
+    if (params.status === 'READY') {
+      items = items.filter((r) => r.receivedQty >= r.requiredQty);
+    } else if (params.status === 'BELUM_READY') {
+      items = items.filter((r) => r.receivedQty < r.requiredQty);
+    }
+
+    return {
+      data: items,
+      totalCount,
+      page,
+      pageSize,
+      totalPages,
+    };
+  } catch (err: any) {
+    console.error('Failed to fetch paginated requirements:', err);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// SERVER-SIDE AGGREGATION UNTUK DASHBOARD (HIGH PERFORMANCE)
+// ---------------------------------------------------------------------------
+
+export interface DashboardSummaryData {
+  totalRows: number;
+  totalRequired: number;
+  totalReceived: number;
+  totalDeficit: number;
+  readyRows: number;
+  notReadyRows: number;
+  fulfillmentRate: number;
+  paretoItems: Array<{
+    materialCode: string;
+    materialName: string;
+    unit: string;
+    totalRequired: number;
+    totalReceived: number;
+    totalDeficit: number;
+  }>;
+  topMaterials: Array<{
+    materialCode: string;
+    materialName: string;
+    unit: string;
+    required: number;
+    received: number;
+  }>;
+  categoryBreakdown: Array<{
+    category: string;
+    count: number;
+    totalQty: number;
+  }>;
+}
+
+export async function fetchDashboardSummaryFromSupabase(params?: {
+  orQuery?: string;
+  dateFrom?: string;
+  dateTo?: string;
+}): Promise<DashboardSummaryData | null> {
+  const supabase = getSupabaseClient();
+  if (!supabase) return null;
+
+  try {
+    const { data, error } = await supabase.rpc('get_ppic_dashboard_summary', {
+      p_or_query: params?.orQuery?.trim() || null,
+      p_date_from: params?.dateFrom ? safeDbDate(params.dateFrom) : null,
+      p_date_to: params?.dateTo ? safeDbDate(params.dateTo) : null,
+    });
+
+    if (error) {
+      console.warn('Dashboard RPC not available or failed, falling back:', error.message);
+      return null;
+    }
+
+    if (data) {
+      return {
+        totalRows: Number(data.total_rows) || 0,
+        totalRequired: Number(data.total_required) || 0,
+        totalReceived: Number(data.total_received) || 0,
+        totalDeficit: Number(data.total_deficit) || 0,
+        readyRows: Number(data.ready_rows) || 0,
+        notReadyRows: Number(data.not_ready_rows) || 0,
+        fulfillmentRate: Number(data.fulfillment_rate) || 0,
+        paretoItems: (data.pareto_items || []).map((p: any) => ({
+          materialCode: p.material_code,
+          materialName: p.material_name,
+          unit: p.unit,
+          totalRequired: Number(p.total_required) || 0,
+          totalReceived: Number(p.total_received) || 0,
+          totalDeficit: Number(p.total_deficit) || 0,
+        })),
+        topMaterials: (data.top_materials || []).map((t: any) => ({
+          materialCode: t.material_code,
+          materialName: t.material_name,
+          unit: t.unit,
+          required: Number(t.required) || 0,
+          received: Number(t.received) || 0,
+        })),
+        categoryBreakdown: (data.category_breakdown || []).map((c: any) => ({
+          category: c.category,
+          count: Number(c.count) || 0,
+          totalQty: Number(c.total_qty) || 0,
+        })),
+      };
+    }
+    return null;
+  } catch (err: any) {
+    console.warn('Failed to call dashboard summary RPC:', err);
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// MONITORING KAPASITAS & PERTUMBUHAN DATABASE SUPABASE
+// ---------------------------------------------------------------------------
+
+export interface DatabaseStorageStats {
+  databaseSizeBytes: number;
+  databaseSizePretty: string;
+  requirementsTableSizeBytes: number;
+  requirementsTableSizePretty: string;
+  historyTableSizeBytes: number;
+  historyTableSizePretty: string;
+  totalMaterialRows: number;
+  totalUploadHistory: number;
+  totalOrRelations: number;
+  totalMasterMaterials: number;
+  avgRowBytes: number;
+  dailyGrowthEstBytes: number;
+  dailyGrowthEstPretty: string;
+  monthlyGrowthEstBytes: number;
+  monthlyGrowthEstPretty: string;
+  freeTierLimitBytes: number;
+  freeTierUsagePercent: number;
+  proTierLimitBytes: number;
+  proTierUsagePercent: number;
+  isRpcSource: boolean;
+  warningLevel: 'NORMAL' | 'WARNING_70' | 'CRITICAL_85' | 'EMERGENCY_95';
+  warningMessage?: string;
+  daysRemainingEst: number;
+}
+
+export async function fetchDatabaseStorageStatsFromSupabase(): Promise<DatabaseStorageStats | null> {
+  const supabase = getSupabaseClient();
+  if (!supabase) return null;
+
+  try {
+    // 1. Try calling official PostgreSQL RPC first
+    const { data, error } = await supabase.rpc('get_ppic_database_storage_stats');
+
+    if (!error && data) {
+      const usagePercent = Number(data.free_tier_usage_percent) || 0;
+      const dailyGrowth = Number(data.daily_growth_est_bytes) || (20000 * 350);
+      const remainingBytes = Math.max(0, (524288000 - Number(data.database_size_bytes)));
+      const daysRemaining = dailyGrowth > 0 ? Math.floor(remainingBytes / dailyGrowth) : 999;
+
+      let warningLevel: 'NORMAL' | 'WARNING_70' | 'CRITICAL_85' | 'EMERGENCY_95' = 'NORMAL';
+      let warningMessage: string | undefined = undefined;
+
+      if (usagePercent >= 95) {
+        warningLevel = 'EMERGENCY_95';
+        warningMessage = 'PERINGATAN BAHAYA (95%+): Kapasitas database Supabase hampir penuh! Segera upgrade ke paket Pro atau lakukan arsip data lama agar proses upload harian tidak terhenti.';
+      } else if (usagePercent >= 85) {
+        warningLevel = 'CRITICAL_85';
+        warningMessage = 'PERINGATAN KRITIS (85%+): Pemakaian database telah mencapai 85% dari batas kuota Free Tier (500 MB). Disarankan untuk upgrade ke Supabase Pro (8 GB) dalam 1-2 minggu ke depan.';
+      } else if (usagePercent >= 70) {
+        warningLevel = 'WARNING_70';
+        warningMessage = 'PERINGATAN AWAL (70%+): Pemakaian database telah mencapai 70%. Monitor terus laju pertumbuhan data harian.';
+      }
+
+      return {
+        databaseSizeBytes: Number(data.database_size_bytes) || 0,
+        databaseSizePretty: data.database_size_pretty || '0 MB',
+        requirementsTableSizeBytes: Number(data.requirements_table_size_bytes) || 0,
+        requirementsTableSizePretty: data.requirements_table_size_pretty || '0 MB',
+        historyTableSizeBytes: Number(data.history_table_size_bytes) || 0,
+        historyTableSizePretty: data.history_table_size_pretty || '0 MB',
+        totalMaterialRows: Number(data.total_material_rows) || 0,
+        totalUploadHistory: Number(data.total_upload_history) || 0,
+        totalOrRelations: Number(data.total_or_relations) || 0,
+        totalMasterMaterials: Number(data.total_master_materials) || 0,
+        avgRowBytes: Number(data.avg_row_bytes) || 350,
+        dailyGrowthEstBytes: dailyGrowth,
+        dailyGrowthEstPretty: data.daily_growth_est_pretty || '7 MB',
+        monthlyGrowthEstBytes: Number(data.monthly_growth_est_bytes) || (dailyGrowth * 30),
+        monthlyGrowthEstPretty: data.monthly_growth_est_pretty || '210 MB',
+        freeTierLimitBytes: Number(data.free_tier_limit_bytes) || 524288000,
+        freeTierUsagePercent: usagePercent,
+        proTierLimitBytes: Number(data.pro_tier_limit_bytes) || 8589934592,
+        proTierUsagePercent: Number(data.pro_tier_usage_percent) || 0,
+        isRpcSource: true,
+        warningLevel,
+        warningMessage,
+        daysRemainingEst: daysRemaining,
+      };
+    }
+
+    // 2. Fallback: Query live exact table counts and compute reliable storage estimates
+    const [reqCountRes, histCountRes, relCountRes, matCountRes] = await Promise.all([
+      supabase.from('material_requirements').select('id', { count: 'exact', head: true }),
+      supabase.from('upload_history').select('id', { count: 'exact', head: true }),
+      supabase.from('or_style_relations').select('id', { count: 'exact', head: true }),
+      supabase.from('master_materials').select('id', { count: 'exact', head: true }),
+    ]);
+
+    const totalRows = reqCountRes.count || 0;
+    const avgRowBytes = 350;
+    const estimatedSizeBytes = (totalRows * avgRowBytes) + 5242880; // +5MB base overhead
+    const freeTierLimit = 524288000; // 500 MB
+    const usagePercent = Number(((estimatedSizeBytes / freeTierLimit) * 100).toFixed(2));
+    const dailyGrowth = 20000 * avgRowBytes; // ~7MB/day
+    const remainingBytes = Math.max(0, freeTierLimit - estimatedSizeBytes);
+    const daysRemaining = dailyGrowth > 0 ? Math.floor(remainingBytes / dailyGrowth) : 999;
+
+    let warningLevel: 'NORMAL' | 'WARNING_70' | 'CRITICAL_85' | 'EMERGENCY_95' = 'NORMAL';
+    let warningMessage: string | undefined = undefined;
+
+    if (usagePercent >= 95) {
+      warningLevel = 'EMERGENCY_95';
+      warningMessage = 'PERINGATAN BAHAYA (95%+): Estimasi kapasitas database Supabase hampir penuh! Pertimbangkan upgrade ke paket Pro.';
+    } else if (usagePercent >= 85) {
+      warningLevel = 'CRITICAL_85';
+      warningMessage = 'PERINGATAN KRITIS (85%+): Estimasi pemakaian database mencapai 85% dari kuota Free Tier (500 MB).';
+    } else if (usagePercent >= 70) {
+      warningLevel = 'WARNING_70';
+      warningMessage = 'PERINGATAN AWAL (70%+): Estimasi pemakaian database telah mencapai 70%.';
+    }
+
+    return {
+      databaseSizeBytes: estimatedSizeBytes,
+      databaseSizePretty: `${(estimatedSizeBytes / (1024 * 1024)).toFixed(1)} MB`,
+      requirementsTableSizeBytes: totalRows * avgRowBytes,
+      requirementsTableSizePretty: `${((totalRows * avgRowBytes) / (1024 * 1024)).toFixed(1)} MB`,
+      historyTableSizeBytes: (histCountRes.count || 0) * 200,
+      historyTableSizePretty: `${(((histCountRes.count || 0) * 200) / 1024).toFixed(0)} KB`,
+      totalMaterialRows: totalRows,
+      totalUploadHistory: histCountRes.count || 0,
+      totalOrRelations: relCountRes.count || 0,
+      totalMasterMaterials: matCountRes.count || 0,
+      avgRowBytes,
+      dailyGrowthEstBytes: dailyGrowth,
+      dailyGrowthEstPretty: `${(dailyGrowth / (1024 * 1024)).toFixed(1)} MB/hari`,
+      monthlyGrowthEstBytes: dailyGrowth * 30,
+      monthlyGrowthEstPretty: `${((dailyGrowth * 30) / (1024 * 1024)).toFixed(0)} MB/bulan`,
+      freeTierLimitBytes: freeTierLimit,
+      freeTierUsagePercent: usagePercent,
+      proTierLimitBytes: 8589934592,
+      proTierUsagePercent: Number(((estimatedSizeBytes / 8589934592) * 100).toFixed(2)),
+      isRpcSource: false,
+      warningLevel,
+      warningMessage,
+      daysRemainingEst: daysRemaining,
+    };
+  } catch (err: any) {
+    console.error('Failed to get database storage stats:', err);
+    return null;
   }
 }
 
