@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { usePpic } from '../../context/PpicContext';
 import { RiskBadge } from '../common/RiskBadge';
 import { getSupabaseCredentials, getSupabaseLiveCounts, cleanSupabaseUrl } from '../../lib/supabase';
+import { PPIC_SUPABASE_SCHEMA_SQL } from '../../lib/supabaseSchemaSql';
 import {
   Settings,
   Shield,
@@ -521,14 +522,26 @@ export const SettingsView: React.FC = () => {
             <input
               type="text"
               value={supabaseUrlInput}
-              onChange={(e) => setSupabaseUrlInput(e.target.value)}
+              onChange={(e) => {
+                const val = e.target.value;
+                if (val.includes('/rest/v1') || val.includes('/rest')) {
+                  setSupabaseUrlInput(cleanSupabaseUrl(val));
+                } else {
+                  setSupabaseUrlInput(val);
+                }
+              }}
+              onBlur={() => {
+                if (supabaseUrlInput.trim() && !isUrlActuallyKey) {
+                  setSupabaseUrlInput(cleanSupabaseUrl(supabaseUrlInput));
+                }
+              }}
               placeholder="https://xyzcompany.supabase.co"
               className={`w-full px-3 py-2 text-xs font-mono border rounded focus:ring-1 focus:ring-blue-500 bg-slate-50 focus:bg-white ${
                 isUrlActuallyKey ? 'border-amber-400 bg-amber-50/30' : 'border-slate-300'
               }`}
             />
             <p className="text-[11px] text-slate-500 mt-1.5">
-              Cari di dashboard Supabase: <strong>Project Settings &rarr; Data API &rarr; Project URL</strong>.
+              Cari di dashboard Supabase: <strong>Project Settings &rarr; Data API &rarr; Project URL</strong> (URL dasar saja, tanpa akhiran <code>/rest/v1</code>).
             </p>
           </div>
 
@@ -712,22 +725,22 @@ export const SettingsView: React.FC = () => {
         {/* Collapsible SQL Guide */}
         {showSqlGuide && (
           <div className="p-4 bg-slate-900 text-slate-200 rounded-lg text-xs space-y-3">
-            <div className="flex items-center justify-between text-slate-300">
+            <div className="flex items-center justify-between text-slate-300 flex-wrap gap-2">
               <span className="font-semibold text-white">Script Skema Database (Jalankan di Supabase SQL Editor):</span>
               <button
                 onClick={() => {
-                  navigator.clipboard.writeText(`-- Jalankan file supabase/schema.sql yang tersedia di root proyek aplikasi.`);
+                  navigator.clipboard.writeText(PPIC_SUPABASE_SCHEMA_SQL);
                   setCopiedSql(true);
                   setTimeout(() => setCopiedSql(false), 2000);
                 }}
-                className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded text-[11px] flex items-center gap-1 cursor-pointer"
+                className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors"
               >
-                {copiedSql ? <Check className="w-3.5 h-3.5 text-emerald-400" /> : <Copy className="w-3.5 h-3.5" />}
-                <span>{copiedSql ? 'Tersalin' : 'Salin Info'}</span>
+                {copiedSql ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Copy className="w-3.5 h-3.5" />}
+                <span>{copiedSql ? 'Skema SQL Berhasil Tersalin!' : 'Salin Seluruh Skema SQL (1-Klik)'}</span>
               </button>
             </div>
             <p className="text-[11px] text-slate-400 leading-relaxed">
-              File <code className="text-blue-400 font-mono">supabase/schema.sql</code> telah otomatis dibuat di dalam proyek Anda. Cukup buka <strong>Supabase Dashboard &rarr; SQL Editor</strong>, buat query baru, lalu tempel isi file <code className="text-blue-400 font-mono">supabase/schema.sql</code> dan klik <strong>Run</strong> untuk membuat tabel lengkap, indeks, aturan RLS, dan publikasi Realtime.
+              Jika tabel belum dibuat di Supabase Anda, buka <strong>Supabase Dashboard &rarr; SQL Editor</strong>, buat <strong>New Query</strong>, klik tombol <strong>Salin Seluruh Skema SQL</strong> di atas, lalu tempel (paste) dan klik <strong>Run</strong> untuk membuat ke-5 tabel lengkap (<code>or_style_relations</code>, <code>upload_history</code>, <code>material_requirements</code>, <code>production_schedules</code>, <code>master_materials</code>), indeks, Row Level Security (RLS), dan publikasi realtime.
             </p>
           </div>
         )}

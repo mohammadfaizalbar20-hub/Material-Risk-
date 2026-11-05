@@ -44,6 +44,28 @@ export function safeDbDate(val?: string | null): string {
 }
 
 /**
+ * Validates whether a string is an RFC4122 v4 UUID
+ */
+export function isValidUuid(str?: string | null): boolean {
+  if (!str || typeof str !== 'string') return false;
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(str.trim());
+}
+
+/**
+ * Generates an RFC4122 v4 compliant UUID
+ */
+export function generateUuid(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
+
+/**
  * Validates whether a string is a well-formed HTTP/HTTPS URL and not an API key
  */
 export function isValidSupabaseUrl(urlString?: string | null): boolean {
@@ -54,11 +76,12 @@ export function isValidSupabaseUrl(urlString?: string | null): boolean {
   if (clean.startsWith('sb_publishable_') || clean.startsWith('eyJ') || clean.includes(' ') || clean.length < 10) {
     return false;
   }
-  if (!clean.startsWith('http://') && !clean.startsWith('https://')) {
-    return false;
+  let target = clean;
+  if (!target.startsWith('http://') && !target.startsWith('https://')) {
+    target = `https://${target}`;
   }
   try {
-    const parsed = new URL(clean);
+    const parsed = new URL(target);
     return parsed.protocol === 'http:' || parsed.protocol === 'https:';
   } catch {
     return false;
@@ -66,23 +89,36 @@ export function isValidSupabaseUrl(urlString?: string | null): boolean {
 }
 
 /**
- * Normalizes input URL by trimming, stripping trailing slashes,
- * and auto-prepending https:// if the user entered domain.supabase.co
+ * Normalizes input URL by trimming, stripping /rest/v1 or /rest paths,
+ * trailing slashes, and auto-prepending https:// if needed.
+ * Guarantees that Supabase JavaScript Client never receives a double /rest/v1 path.
  */
 export function cleanSupabaseUrl(urlString?: string | null): string {
   if (!urlString || typeof urlString !== 'string') return '';
-  let clean = urlString.trim().replace(/\/+$/, '');
+  let clean = urlString.trim();
   if (!clean) return '';
   // Don't modify if it's obviously an API key
   if (clean.startsWith('sb_publishable_') || clean.startsWith('eyJ')) {
     return clean;
   }
   if (!clean.startsWith('http://') && !clean.startsWith('https://')) {
-    if (clean.includes('.supabase.co') || clean.includes('.supabase.in') || clean.includes('localhost')) {
-      clean = `https://${clean}`;
-    }
+    clean = `https://${clean}`;
   }
-  return clean;
+  try {
+    const parsed = new URL(clean);
+    // Standard Supabase project URLs should be origin only (https://[project-id].supabase.co)
+    if (parsed.hostname.endsWith('.supabase.co') || parsed.hostname.endsWith('.supabase.in')) {
+      return `${parsed.protocol}//${parsed.host}`;
+    }
+    // For localhost or custom proxy, strip /rest/v1 or /rest from pathname
+    const pathname = parsed.pathname
+      .replace(/\/rest\/v1\/?$/, '')
+      .replace(/\/rest\/?$/, '')
+      .replace(/\/+$/, '');
+    return `${parsed.protocol}//${parsed.host}${pathname}`;
+  } catch {
+    return clean.replace(/\/rest\/v1\/?$/, '').replace(/\/rest\/?$/, '').replace(/\/+$/, '');
+  }
 }
 
 /**
@@ -416,7 +452,12 @@ export function mapModelToDbDeletion(model: DeletionHistoryItem): any {
 export async function testSupabaseConnection(
   overrideUrl?: string,
   overrideKey?: string
-): Promise<{ success: boolean; message: string; tableCount?: number }> {
+): Promise<{
+  success: boolean;
+  message: string;
+  tableCount?: number;
+  missingTables?: string[];
+}> {
   const creds = getSupabaseCredentials();
   const rawUrl = (overrideUrl !== undefined ? overrideUrl : creds.url || '').trim();
   const rawKey = (overrideKey !== undefined ? overrideKey : creds.anonKey || '').trim();
@@ -451,13 +492,15 @@ export async function testSupabaseConnection(
   if (!isValidSupabaseUrl(url)) {
     return {
       success: false,
-      message: 'Format Project URL tidak valid. URL harus diawali dengan https:// (contoh: https://xyzcompany.supabase.co).',
+      message: 'Format Project URL tidak valid. URL harus diawali dengan https:// (contoh: https://xyzcompany.supabase.co). Jangan memasukkan akhiran /rest/v1.',
     };
   }
 
   let testClient: SupabaseClient;
   try {
-    testClient = createClient(url, anonKey);
+    testClient = createClient(url, anonKey, {
+      auth: { persistSession: false },
+    });
   } catch (err: any) {
     return {
       success: false,
@@ -466,26 +509,63 @@ export async function testSupabaseConnection(
   }
 
   try {
-    const { count, error } = await testClient
-      .from('material_requirements')
-      .select('*', { count: 'exact', head: true });
+    // Check all required PPIC core tables to ensure complete database readiness
+    const requiredTables = [
+      { name: 'material_requirements', label: 'Detail Kebutuhan Material' },
+      { name: 'or_style_relations', label: 'Relasi OR & Style' },
+      { name: 'upload_history', label: 'Riwayat Upload Excel' },
+      { name: 'production_schedules', label: 'Jadwal Produksi' },
+      { name: 'master_materials', label: 'Master Material' },
+    ];
 
-    if (error) {
+    const results = await Promise.all(
+      requiredTables.map(async (tbl) => {
+        const res = await testClient.from(tbl.name).select('id', { count: 'exact', head: true });
+        return { table: tbl.name, label: tbl.label, error: res.error, count: res.count ?? 0 };
+      })
+    );
+
+    const missingOrFailed = results.filter((r) => r.error !== null);
+
+    if (missingOrFailed.length > 0) {
+      const isRouteOrPathError = missingOrFailed.some(
+        (r) =>
+          r.error?.message?.toLowerCase().includes('invalid path') ||
+          r.error?.message?.toLowerCase().includes('relation') ||
+          r.error?.message?.toLowerCase().includes('does not exist') ||
+          (r.error as any)?.code === '42P01' ||
+          (r.error as any)?.code === 'PGRST106' ||
+          (r.error as any)?.code === 'PGRST205'
+      );
+
+      const tableNames = missingOrFailed.map((r) => `"${r.table}"`).join(', ');
+
+      if (isRouteOrPathError) {
+        return {
+          success: false,
+          missingTables: missingOrFailed.map((r) => r.table),
+          message: `Koneksi berhasil terhubung ke server Supabase, namun tabel ${tableNames} belum dibuat di database Anda. Silakan klik tombol "Lihat Skema Tabel SQL Supabase" di bawah, salin query SQL, dan jalankan di menu "SQL Editor" pada Supabase Dashboard.`,
+        };
+      }
+
       return {
         success: false,
-        message: `Koneksi gagal: ${error.message} (Pastikan script SQL Supabase sudah dijalankan di Supabase SQL Editor).`,
+        missingTables: missingOrFailed.map((r) => r.table),
+        message: `Koneksi gagal pada tabel ${tableNames}: ${missingOrFailed[0].error?.message}. Pastikan izin RLS aktif dan skema tabel sudah dijalankan.`,
       };
     }
 
+    const reqCount = results.find((r) => r.table === 'material_requirements')?.count || 0;
+
     return {
       success: true,
-      message: 'Koneksi ke Supabase berhasil dan database aktif terhubung!',
-      tableCount: count || 0,
+      message: 'Koneksi ke Supabase berhasil! Seluruh 5 tabel terpusat (material_requirements, or_style_relations, upload_history, production_schedules, master_materials) telah aktif dan siap digunakan.',
+      tableCount: reqCount,
     };
   } catch (err: any) {
     return {
       success: false,
-      message: `Gagal menghubungi server Supabase: ${err?.message || String(err)}`,
+      message: `Gagal menghubungi server Supabase: ${err?.message || String(err)}. Periksa koneksi internet atau format Project URL.`,
     };
   }
 }
@@ -773,108 +853,274 @@ export async function seedLocalDataToSupabase(data: {
   productionSchedules: ProductionSchedule[];
   orStyleRelations: OrStyleRelation[];
   materials: Material[];
-}): Promise<{ success: boolean; message: string; insertedCount: number; details?: any }> {
+}): Promise<{
+  success: boolean;
+  message: string;
+  insertedCount: number;
+  details?: {
+    requirements: { local: number; remote: number };
+    relations: { local: number; remote: number };
+    history: { local: number; remote: number };
+    materials: { local: number; remote: number };
+    schedules: { local: number; remote: number };
+  };
+}> {
   const supabase = getSupabaseClient();
-  if (!supabase) return { success: false, message: 'Supabase belum terkonfigurasi. Pastikan Project URL dan Anon Key sudah diisi.', insertedCount: 0 };
+  if (!supabase) {
+    return {
+      success: false,
+      message: 'Supabase belum terkonfigurasi. Pastikan Project URL dan Anon Key sudah diisi di tab Pengaturan.',
+      insertedCount: 0,
+    };
+  }
 
   try {
-    let totalInserted = 0;
-
-    // 1. Relations: deduplicate by or_number to prevent ON CONFLICT DO UPDATE batch collisions
-    if (data.orStyleRelations.length > 0) {
-      const relMap = new Map<string, any>();
-      for (const r of data.orStyleRelations) {
-        if (!r.orNumber?.trim()) continue;
-        const row = mapModelToDbRelation(r);
-        delete row.id;
-        relMap.set(r.orNumber.trim().toUpperCase(), row);
-      }
-      const relRows = Array.from(relMap.values());
-      if (relRows.length > 0) {
-        const { error } = await supabase.from('or_style_relations').upsert(relRows, { onConflict: 'or_number' });
-        if (error) {
-          console.error('Error upserting relations:', error);
-          throw new Error(`Gagal menyimpan relasi OR: ${error.message}`);
-        }
-      }
-    }
-
-    // 2. Upload History: deduplicate or insert safely
-    if (data.uploadHistory.length > 0) {
-      const histRows = data.uploadHistory.map((h) => {
-        const row = mapModelToDbUploadHistory(h);
-        delete row.id; // Let Supabase generate valid UUID
-        return row;
-      });
-      const { error } = await supabase.from('upload_history').insert(histRows);
-      if (error) {
-        console.error('Error inserting upload history:', error);
-        throw new Error(`Gagal menyimpan riwayat upload: ${error.message}`);
-      }
-    }
-
-    // 3. Materials: deduplicate by code
-    if (data.materials.length > 0) {
+    // -------------------------------------------------------------------------
+    // STEP 1 (Independen/Parent): Master Materials Katalog
+    // -------------------------------------------------------------------------
+    if (data.materials && data.materials.length > 0) {
       const matMap = new Map<string, any>();
       for (const m of data.materials) {
         if (!m.code?.trim()) continue;
         const row = mapModelToDbMaterial(m);
-        delete row.id;
+        if (!isValidUuid(row.id)) {
+          delete row.id;
+        }
         matMap.set(m.code.trim().toUpperCase(), row);
       }
       const matRows = Array.from(matMap.values());
       if (matRows.length > 0) {
-        const { error } = await supabase.from('master_materials').upsert(matRows, { onConflict: 'code' });
-        if (error) {
-          console.error('Error upserting master materials:', error);
-          throw new Error(`Gagal menyimpan master material: ${error.message}`);
+        const { error: matErr } = await supabase
+          .from('master_materials')
+          .upsert(matRows, { onConflict: 'code' });
+
+        if (matErr) {
+          console.error('Error upserting master materials:', matErr);
+          const isMissing = matErr.message?.toLowerCase().includes('does not exist') ||
+            matErr.message?.toLowerCase().includes('invalid path') ||
+            (matErr as any)?.code === '42P01';
+          throw new Error(
+            `[Tabel: master_materials | Operasi: Upsert] ${matErr.message}${
+              isMissing
+                ? ' (Tabel "master_materials" belum dibuat di Supabase. Jalankan skema SQL di Supabase SQL Editor).'
+                : ''
+            }`
+          );
         }
       }
     }
 
-    // 4. Schedules
-    if (data.productionSchedules.length > 0) {
-      const schRows = data.productionSchedules.map((s) => {
-        const row = mapModelToDbSchedule(s);
-        delete row.id;
-        return row;
-      });
-      const { error } = await supabase.from('production_schedules').insert(schRows);
-      if (error) {
-        console.error('Error inserting production schedules:', error);
-        throw new Error(`Gagal menyimpan jadwal produksi: ${error.message}`);
+    // -------------------------------------------------------------------------
+    // STEP 2 (Independen/Parent): OR & Style Relations
+    // -------------------------------------------------------------------------
+    if (data.orStyleRelations && data.orStyleRelations.length > 0) {
+      const relMap = new Map<string, any>();
+      for (const r of data.orStyleRelations) {
+        if (!r.orNumber?.trim()) continue;
+        const row = mapModelToDbRelation(r);
+        if (!isValidUuid(row.id)) {
+          delete row.id;
+        }
+        relMap.set(r.orNumber.trim().toUpperCase(), row);
+      }
+      const relRows = Array.from(relMap.values());
+      if (relRows.length > 0) {
+        const { error: relErr } = await supabase
+          .from('or_style_relations')
+          .upsert(relRows, { onConflict: 'or_number' });
+
+        if (relErr) {
+          console.error('Error upserting relations:', relErr);
+          const isMissing = relErr.message?.toLowerCase().includes('invalid path') ||
+            relErr.message?.toLowerCase().includes('does not exist') ||
+            relErr.message?.toLowerCase().includes('relation') ||
+            (relErr as any)?.code === '42P01' ||
+            (relErr as any)?.code === 'PGRST106' ||
+            (relErr as any)?.code === 'PGRST205';
+
+          throw new Error(
+            `[Tabel: or_style_relations | Operasi: Upsert Relasi OR] ${relErr.message}${
+              isMissing
+                ? ' (Tabel "or_style_relations" belum dibuat di database Supabase Anda. Buka menu SQL Editor pada Supabase Dashboard dan jalankan skema SQL yang disediakan di tombol "Lihat Skema Tabel SQL Supabase").'
+                : ''
+            }`
+          );
+        }
       }
     }
 
-    // 5. Requirements in chunks with strict date normalization and error check
-    if (data.materialRequirements.length > 0) {
+    // -------------------------------------------------------------------------
+    // STEP 3 (Parent): Upload History dengan UUID Mapping yang Aman
+    // -------------------------------------------------------------------------
+    // Map local ID to PostgreSQL UUID v4 to maintain exact foreign key references
+    const uploadIdMap = new Map<string, string>();
+
+    if (data.uploadHistory && data.uploadHistory.length > 0) {
+      // Fetch existing upload records to prevent duplicate entries and map IDs
+      const { data: existingUploads, error: fetchHistErr } = await supabase
+        .from('upload_history')
+        .select('id, or_number, update_date, file_name');
+
+      if (fetchHistErr) {
+        console.error('Error fetching upload history:', fetchHistErr);
+        throw new Error(`[Tabel: upload_history | Operasi: Select] ${fetchHistErr.message}`);
+      }
+
+      const existingSet = new Set<string>();
+      if (existingUploads) {
+        for (const ex of existingUploads) {
+          const key = `${ex.or_number}_${ex.update_date}_${ex.file_name}`.toLowerCase();
+          existingSet.add(key);
+        }
+      }
+
+      const newHistRows: any[] = [];
+      for (const h of data.uploadHistory) {
+        const assignedUuid = isValidUuid(h.id) ? h.id : generateUuid();
+        if (h.id) {
+          uploadIdMap.set(h.id, assignedUuid);
+        }
+
+        const compKey = `${h.orNumber}_${safeDbDate(h.updateDate)}_${h.fileName}`.toLowerCase();
+        if (existingSet.has(compKey)) {
+          // If already in Supabase, find existing remote ID to reuse
+          const matched = existingUploads?.find(
+            (ex) => `${ex.or_number}_${ex.update_date}_${ex.file_name}`.toLowerCase() === compKey
+          );
+          if (matched && h.id) {
+            uploadIdMap.set(h.id, matched.id);
+          }
+        } else {
+          const row = mapModelToDbUploadHistory(h);
+          row.id = assignedUuid;
+          row.update_date = safeDbDate(h.updateDate);
+          newHistRows.push(row);
+          existingSet.add(compKey);
+        }
+      }
+
+      if (newHistRows.length > 0) {
+        const { error: histErr } = await supabase.from('upload_history').insert(newHistRows);
+        if (histErr) {
+          console.error('Error inserting upload history:', histErr);
+          throw new Error(`[Tabel: upload_history | Operasi: Insert] ${histErr.message}`);
+        }
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // STEP 4 (Child): Detail Material Requirements (Chunked & Idempotent)
+    // -------------------------------------------------------------------------
+    if (data.materialRequirements && data.materialRequirements.length > 0) {
+      // Find all distinct OR numbers in the incoming migration dataset
+      const distinctOrs = Array.from(
+        new Set(
+          data.materialRequirements
+            .map((r) => r.orNumber?.trim())
+            .filter((x): x is string => Boolean(x))
+        )
+      );
+
+      // Clean existing requirements for these specific ORs to ensure idempotency (no duplicate rows)
+      if (distinctOrs.length > 0) {
+        const orChunkSize = 50;
+        for (let i = 0; i < distinctOrs.length; i += orChunkSize) {
+          const orChunk = distinctOrs.slice(i, i + orChunkSize);
+          const { error: delErr } = await supabase
+            .from('material_requirements')
+            .delete()
+            .in('or_number', orChunk);
+
+          if (delErr) {
+            console.warn('Warning during idempotent cleanup of existing ORs:', delErr);
+          }
+        }
+      }
+
+      // Map rows with valid UUIDs, normalized dates, and mapped upload_id foreign keys
       const reqRows = data.materialRequirements.map((r) => {
         const row = mapModelToDbRequirement(r);
-        delete row.id;
-        delete row.upload_id;
+        row.id = isValidUuid(r.id) ? r.id : generateUuid();
+        if (r.uploadId && uploadIdMap.has(r.uploadId)) {
+          row.upload_id = uploadIdMap.get(r.uploadId);
+        } else if (r.uploadId && isValidUuid(r.uploadId)) {
+          row.upload_id = r.uploadId;
+        } else {
+          row.upload_id = null;
+        }
+        row.update_date = safeDbDate(r.updateDate);
         return row;
       });
+
+      // Insert in chunks of 100 rows for high reliability and network resilience
       const chunkSize = 100;
       for (let i = 0; i < reqRows.length; i += chunkSize) {
         const chunk = reqRows.slice(i, i + chunkSize);
         const { error: chunkErr } = await supabase.from('material_requirements').insert(chunk);
         if (chunkErr) {
           console.error('Error inserting material requirements chunk:', chunkErr);
-          throw new Error(`Gagal menyimpan detail material: ${chunkErr.message}`);
+          const isMissing = chunkErr.message?.toLowerCase().includes('invalid path') ||
+            chunkErr.message?.toLowerCase().includes('does not exist') ||
+            (chunkErr as any)?.code === '42P01';
+          throw new Error(
+            `[Tabel: material_requirements | Operasi: Insert Batch ${Math.floor(i / chunkSize) + 1}] ${
+              chunkErr.message
+            }${
+              isMissing
+                ? ' (Tabel "material_requirements" belum dibuat di Supabase. Jalankan skema SQL di Supabase SQL Editor).'
+                : ''
+            }`
+          );
         }
-        totalInserted += chunk.length;
       }
     }
 
-    // Verify row count directly from Supabase
-    const { count: verifiedCount } = await supabase
-      .from('material_requirements')
-      .select('*', { count: 'exact', head: true });
+    // -------------------------------------------------------------------------
+    // STEP 5 (Independen): Production Schedules
+    // -------------------------------------------------------------------------
+    if (data.productionSchedules && data.productionSchedules.length > 0) {
+      const schRows = data.productionSchedules.map((s) => {
+        const row = mapModelToDbSchedule(s);
+        row.id = isValidUuid(s.id) ? s.id : generateUuid();
+        row.production_date = safeDbDate(s.productionDate);
+        row.finish_date = safeDbDate(s.finishDate);
+        return row;
+      });
+
+      const { error: schErr } = await supabase
+        .from('production_schedules')
+        .upsert(schRows, { onConflict: 'id' });
+
+      if (schErr) {
+        console.error('Error upserting production schedules:', schErr);
+        throw new Error(`[Tabel: production_schedules | Operasi: Upsert] ${schErr.message}`);
+      }
+    }
+
+    // -------------------------------------------------------------------------
+    // STEP 6: VERIFIKASI LANGSUNG JUMLAH DATA LOKAL VS SUPABASE
+    // -------------------------------------------------------------------------
+    const [reqCountRes, relCountRes, histCountRes, matCountRes, schCountRes] = await Promise.all([
+      supabase.from('material_requirements').select('id', { count: 'exact', head: true }),
+      supabase.from('or_style_relations').select('id', { count: 'exact', head: true }),
+      supabase.from('upload_history').select('id', { count: 'exact', head: true }),
+      supabase.from('master_materials').select('id', { count: 'exact', head: true }),
+      supabase.from('production_schedules').select('id', { count: 'exact', head: true }),
+    ]);
+
+    const verifiedCounts = {
+      requirements: { local: data.materialRequirements.length, remote: reqCountRes.count ?? 0 },
+      relations: { local: data.orStyleRelations.length, remote: relCountRes.count ?? 0 },
+      history: { local: data.uploadHistory.length, remote: histCountRes.count ?? 0 },
+      materials: { local: data.materials.length, remote: matCountRes.count ?? 0 },
+      schedules: { local: data.productionSchedules.length, remote: schCountRes.count ?? 0 },
+    };
 
     return {
       success: true,
-      message: `Migrasi data ke Supabase berhasil! Tersimpan ${verifiedCount || totalInserted} baris material di cloud online. Semua device tim sekarang dapat melihat data yang sama.`,
-      insertedCount: verifiedCount || totalInserted,
+      message: `Migrasi data ke Supabase berhasil dan terverifikasi!\n• Detail Material: ${verifiedCounts.requirements.remote} baris tersimpan (Lokal: ${verifiedCounts.requirements.local})\n• Relasi OR & Style: ${verifiedCounts.relations.remote} item\n• Riwayat Unggahan: ${verifiedCounts.history.remote} file\n• Master Material: ${verifiedCounts.materials.remote} item\n• Jadwal Produksi: ${verifiedCounts.schedules.remote} jadwal\nSemua device tim sekarang otomatis tersambung ke database terpusat yang sama.`,
+      insertedCount: verifiedCounts.requirements.remote,
+      details: verifiedCounts,
     };
   } catch (err: any) {
     console.error('Failed to seed local data to Supabase:', err);
