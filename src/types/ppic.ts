@@ -73,7 +73,7 @@ export interface UploadHistoryItem {
   style: string;
   fileName: string;
   rowCount: number;
-  status: 'Sukses' | 'Peringatan' | 'Gagal';
+  status: 'Sukses' | 'Peringatan' | 'Gagal' | 'Gagal Sebagian' | 'Melanjutkan Upload...';
   notes?: string;
 }
 

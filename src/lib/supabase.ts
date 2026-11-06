@@ -589,11 +589,11 @@ export async function fetchAllPpicFromSupabase(options?: { recentLimit?: number 
         .select('*')
         .order('created_at', { ascending: false })
         .limit(limit),
-      supabase.from('upload_history').select('*').order('created_at', { ascending: false }).limit(500),
+      supabase.from('upload_history').select('*').order('created_at', { ascending: false }).limit(5000),
       supabase.from('production_schedules').select('*').order('production_date', { ascending: true }),
       supabase.from('or_style_relations').select('*').order('created_at', { ascending: false }),
       supabase.from('master_materials').select('*').order('name', { ascending: true }),
-      supabase.from('deletion_history').select('*').order('created_at', { ascending: false }).limit(200),
+      supabase.from('deletion_history').select('*').order('created_at', { ascending: false }).limit(1000),
     ]);
 
     if (reqRes.error) {
@@ -677,6 +677,11 @@ export async function syncBatchExcelToSupabaseWithProgress(
     relation: OrStyleRelation;
     requirements: MaterialItemRequirement[];
     masterMaterials?: Material[];
+    resumeCheckpoint?: {
+      uploadId: string;
+      startRowIndex: number;
+      preparedRequirements?: any[];
+    };
   },
   onProgress?: (info: UploadProgressCallbackInfo) => void
 ): Promise<{
@@ -684,7 +689,9 @@ export async function syncBatchExcelToSupabaseWithProgress(
   uploadId?: string;
   totalInserted: number;
   failedBatch?: number;
+  failedRowIndex?: number;
   failingRange?: string;
+  preparedRequirements?: any[];
   error?: string;
 }> {
   const supabase = getSupabaseClient();
@@ -693,6 +700,9 @@ export async function syncBatchExcelToSupabaseWithProgress(
   }
 
   try {
+    const isResuming = Boolean(params.resumeCheckpoint?.uploadId);
+    let generatedUploadId = params.resumeCheckpoint?.uploadId || '';
+
     // 1. Upsert OR & Style relation (Parent)
     const dbRel = mapModelToDbRelation(params.relation);
     delete dbRel.id;
@@ -703,32 +713,47 @@ export async function syncBatchExcelToSupabaseWithProgress(
       throw new Error(`[Gagal Simpan Relasi OR] ${relErr.message}`);
     }
 
-    // 2. Insert Upload History Item (Parent Header)
-    const dbHist = mapModelToDbUploadHistory(params.uploadHistoryItem);
-    delete dbHist.id; // auto generate UUID
-    const { data: histData, error: histErr } = await supabase
-      .from('upload_history')
-      .insert(dbHist)
-      .select('id')
-      .single();
+    // 2. Insert Upload History Item ONLY if not resuming
+    if (!isResuming) {
+      const dbHist = mapModelToDbUploadHistory(params.uploadHistoryItem);
+      delete dbHist.id; // auto generate UUID
+      const { data: histData, error: histErr } = await supabase
+        .from('upload_history')
+        .insert(dbHist)
+        .select('id')
+        .single();
 
-    if (histErr) throw new Error(`[Gagal Simpan Riwayat Upload] ${histErr.message}`);
-    const generatedUploadId = histData.id;
+      if (histErr) throw new Error(`[Gagal Simpan Riwayat Upload] ${histErr.message}`);
+      generatedUploadId = histData.id;
+    } else {
+      // Update existing upload_history status to resuming
+      await supabase
+        .from('upload_history')
+        .update({
+          status: 'Melanjutkan Upload...',
+          notes: `Melanjutkan penyimpanan dari baris ${((params.resumeCheckpoint?.startRowIndex || 0) + 1).toLocaleString('id-ID')}...`,
+        })
+        .eq('id', generatedUploadId);
+    }
 
-    // 3. Insert Material Requirements Batch
-    const dbReqs = params.requirements.map((r) => {
-      const row = mapModelToDbRequirement(r);
-      row.upload_id = generatedUploadId;
-      delete row.id;
-      return row;
-    });
+    // 3. Prepare Material Requirements Batch with Stable Row IDs
+    // If resuming with pre-prepared rows, reuse exact existing UUIDs to prevent any duplication
+    const dbReqs = params.resumeCheckpoint?.preparedRequirements && params.resumeCheckpoint.preparedRequirements.length === params.requirements.length
+      ? params.resumeCheckpoint.preparedRequirements
+      : params.requirements.map((r) => {
+          const row = mapModelToDbRequirement(r);
+          row.upload_id = generatedUploadId;
+          row.id = isValidUuid(r.id) ? r.id : generateUuid();
+          return row;
+        });
 
     const totalRows = dbReqs.length;
     const chunkSize = 500; // Optimal 500 rows per chunk for high throughput & zero timeout
     const totalBatches = Math.ceil(totalRows / chunkSize) || 1;
-    let totalInserted = 0;
+    const startRowIndex = Math.max(0, params.resumeCheckpoint?.startRowIndex || 0);
+    let totalInserted = startRowIndex;
 
-    for (let i = 0; i < totalRows; i += chunkSize) {
+    for (let i = startRowIndex; i < totalRows; i += chunkSize) {
       const batchNum = Math.floor(i / chunkSize) + 1;
       const chunk = dbReqs.slice(i, i + chunkSize);
       const startRow = i + 1;
@@ -747,7 +772,7 @@ export async function syncBatchExcelToSupabaseWithProgress(
         });
       }
 
-      // Retry mechanism with exponential backoff (3 attempts)
+      // Retry mechanism with exponential backoff (3 attempts) using idempotent upsert by id
       const MAX_RETRIES = 3;
       let chunkSuccess = false;
       let lastChunkError: any = null;
@@ -756,7 +781,7 @@ export async function syncBatchExcelToSupabaseWithProgress(
         try {
           const { error: chunkErr } = await supabase
             .from('material_requirements')
-            .insert(chunk);
+            .upsert(chunk, { onConflict: 'id' });
 
           if (!chunkErr) {
             chunkSuccess = true;
@@ -774,18 +799,40 @@ export async function syncBatchExcelToSupabaseWithProgress(
 
       if (!chunkSuccess) {
         const failingRangeStr = `Baris ${startRow.toLocaleString('id-ID')} - ${endRow.toLocaleString('id-ID')}`;
+        // Mark upload_history status as Gagal Sebagian with resume checkpoint info
+        await supabase
+          .from('upload_history')
+          .update({
+            status: 'Gagal Sebagian',
+            notes: `Gagal pada batch ${batchNum}/${totalBatches} (${failingRangeStr}). Tersimpan ${totalInserted} dari ${totalRows} baris. Dapat dilanjutkan (resume).`,
+            row_count: totalInserted,
+          })
+          .eq('id', generatedUploadId);
+
         return {
           success: false,
           uploadId: generatedUploadId,
           totalInserted,
           failedBatch: batchNum,
+          failedRowIndex: i,
           failingRange: failingRangeStr,
+          preparedRequirements: dbReqs,
           error: `Batch ${batchNum}/${totalBatches} gagal disimpan setelah ${MAX_RETRIES}x percobaan: ${lastChunkError?.message || String(lastChunkError)}`,
         };
       }
 
       totalInserted += chunk.length;
     }
+
+    // Update upload_history status as Sukses with verified count
+    await supabase
+      .from('upload_history')
+      .update({
+        status: 'Sukses',
+        row_count: totalInserted,
+        notes: `Berhasil tersimpan ${totalInserted} baris material.`,
+      })
+      .eq('id', generatedUploadId);
 
     // 4. Upsert Master Materials if provided
     if (params.masterMaterials && params.masterMaterials.length > 0) {
@@ -924,6 +971,54 @@ export async function fetchPaginatedRequirementsFromSupabase(
     console.error('Failed to fetch paginated requirements:', err);
     return null;
   }
+}
+
+/**
+ * Paged retrieval helper that bypasses PostgREST default max-rows (1000) ceiling
+ * by looping through .range(from, to) until all records up to maxRows are retrieved.
+ */
+export async function fetchAllMaterialRequirementsPaged(options?: {
+  maxRows?: number;
+  orNumber?: string;
+  updateDate?: string;
+}): Promise<MaterialItemRequirement[]> {
+  const supabase = getSupabaseClient();
+  if (!supabase) return [];
+
+  const maxRows = options?.maxRows ?? 50000;
+  const chunkSize = 1000;
+  let allRows: MaterialItemRequirement[] = [];
+  let from = 0;
+
+  while (from < maxRows) {
+    const to = from + chunkSize - 1;
+    let query = supabase
+      .from('material_requirements')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .range(from, to);
+
+    if (options?.orNumber?.trim()) {
+      query = query.ilike('or_number', `%${options.orNumber.trim()}%`);
+    }
+    if (options?.updateDate?.trim()) {
+      query = query.eq('update_date', safeDbDate(options.updateDate));
+    }
+
+    const { data, error } = await query;
+    if (error) {
+      console.error('Error fetching paged material requirements:', error);
+      break;
+    }
+
+    if (!data || data.length === 0) break;
+    allRows = allRows.concat(data.map(mapDbRequirementToModel));
+
+    if (data.length < chunkSize) break;
+    from += chunkSize;
+  }
+
+  return allRows;
 }
 
 // ---------------------------------------------------------------------------
@@ -1494,34 +1589,9 @@ export async function seedLocalDataToSupabase(data: {
     }
 
     // -------------------------------------------------------------------------
-    // STEP 4 (Child): Detail Material Requirements (Chunked & Idempotent)
+    // STEP 4 (Child): Detail Material Requirements (Append-Only & Idempotent Upsert)
     // -------------------------------------------------------------------------
     if (data.materialRequirements && data.materialRequirements.length > 0) {
-      // Find all distinct OR numbers in the incoming migration dataset
-      const distinctOrs = Array.from(
-        new Set(
-          data.materialRequirements
-            .map((r) => r.orNumber?.trim())
-            .filter((x): x is string => Boolean(x))
-        )
-      );
-
-      // Clean existing requirements for these specific ORs to ensure idempotency (no duplicate rows)
-      if (distinctOrs.length > 0) {
-        const orChunkSize = 50;
-        for (let i = 0; i < distinctOrs.length; i += orChunkSize) {
-          const orChunk = distinctOrs.slice(i, i + orChunkSize);
-          const { error: delErr } = await supabase
-            .from('material_requirements')
-            .delete()
-            .in('or_number', orChunk);
-
-          if (delErr) {
-            console.warn('Warning during idempotent cleanup of existing ORs:', delErr);
-          }
-        }
-      }
-
       // Map rows with valid UUIDs, normalized dates, and mapped upload_id foreign keys
       const reqRows = data.materialRequirements.map((r) => {
         let cleanOr = (r.orNumber || '').trim();
@@ -1557,11 +1627,13 @@ export async function seedLocalDataToSupabase(data: {
         return row;
       });
 
-      // Insert in chunks of 100 rows for high reliability and network resilience
-      const chunkSize = 100;
+      // Upsert in chunks of 200 rows by ID (Purely additive: never deletes existing historical uploads)
+      const chunkSize = 200;
       for (let i = 0; i < reqRows.length; i += chunkSize) {
         const chunk = reqRows.slice(i, i + chunkSize);
-        const { error: chunkErr } = await supabase.from('material_requirements').insert(chunk);
+        const { error: chunkErr } = await supabase
+          .from('material_requirements')
+          .upsert(chunk, { onConflict: 'id' });
         if (chunkErr) {
           console.error('Error inserting material requirements chunk:', chunkErr);
           const isMissing = chunkErr.message?.toLowerCase().includes('invalid path') ||

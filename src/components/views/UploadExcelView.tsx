@@ -77,6 +77,31 @@ export const UploadExcelView: React.FC = () => {
     error?: string;
   } | null>(null);
 
+  // Resume checkpoint state for interrupted high-volume uploads (20,000+ rows)
+  const [resumeCheckpoint, setResumeCheckpoint] = useState<{
+    uploadId: string;
+    startRowIndex: number;
+    preparedRequirements?: any[];
+    failedBatch?: number;
+    failingRange?: string;
+    totalRows?: number;
+    error?: string;
+  } | null>(() => {
+    try {
+      const saved = sessionStorage.getItem('PPIC_UPLOAD_RESUME_CHECKPOINT');
+      return saved ? JSON.parse(saved) : null;
+    } catch {
+      return null;
+    }
+  });
+
+  const clearResumeCheckpoint = () => {
+    setResumeCheckpoint(null);
+    try {
+      sessionStorage.removeItem('PPIC_UPLOAD_RESUME_CHECKPOINT');
+    } catch {}
+  };
+
   // Riwayat Upload Search Input (Typed manual search - Single source of truth)
   const [historySearchInput, setHistorySearchInput] = useState<string>('');
 
@@ -272,14 +297,22 @@ export const UploadExcelView: React.FC = () => {
     setErrorMessage(null);
   };
 
-  // Tahap 4 & 5: Konfirmasi dan Penyimpanan Atomik ke Database (Batch Scale-Ready)
-  const handleConfirmAndSave = async () => {
+  // Tahap 4 & 5: Konfirmasi dan Penyimpanan Atomik ke Database (Batch Scale-Ready with Resume Support)
+  const handleConfirmAndSave = async (isResumingAction: boolean = false) => {
     if (!previewData) return;
 
     setIsProcessing(true);
     setErrorMessage(null);
     setBatchErrorDetails(null);
-    setStatusMessage('Memulai penyimpanan batch data ke database...');
+
+    const checkpointToUse = isResumingAction ? resumeCheckpoint : null;
+    const startRowIdx = checkpointToUse ? checkpointToUse.startRowIndex : 0;
+
+    setStatusMessage(
+      checkpointToUse
+        ? `Melanjutkan penyimpanan batch dari baris ${(startRowIdx + 1).toLocaleString('id-ID')}...`
+        : 'Memulai penyimpanan batch data ke database...'
+    );
 
     try {
       const res = await autoSaveExcelMaterials({
@@ -289,6 +322,13 @@ export const UploadExcelView: React.FC = () => {
         updateDate: previewData.updateDate,
         fileName: previewData.fileName,
         skipMenuRedirect: true,
+        resumeCheckpoint: checkpointToUse
+          ? {
+              uploadId: checkpointToUse.uploadId,
+              startRowIndex: checkpointToUse.startRowIndex,
+              preparedRequirements: checkpointToUse.preparedRequirements,
+            }
+          : undefined,
         onProgress: (info) => {
           setBatchProgress(info);
           setStatusMessage(info.statusText);
@@ -296,6 +336,7 @@ export const UploadExcelView: React.FC = () => {
       });
 
       if (res.success) {
+        clearResumeCheckpoint();
         const savedCount = previewData.rows.length;
         const savedOr = previewData.orNumber;
         const savedDate = previewData.updateDate;
@@ -314,11 +355,33 @@ export const UploadExcelView: React.FC = () => {
       } else {
         setIsProcessing(false);
         setBatchErrorDetails({
+          failedBatch: res.failedBatch,
           error: res.error,
         });
-        setErrorMessage(
-          `Gagal menyimpan seluruh batch data: ${res.error || 'Terjadi kesalahan sistem'}. Anda dapat mencoba ulang penyimpanan.`
-        );
+
+        if (res.failedRowIndex !== undefined && res.uploadId) {
+          const nextCheckpoint = {
+            uploadId: res.uploadId,
+            startRowIndex: res.failedRowIndex,
+            preparedRequirements: res.preparedRequirements || checkpointToUse?.preparedRequirements,
+            failedBatch: res.failedBatch,
+            totalRows: previewData.rows.length,
+            error: res.error,
+          };
+          setResumeCheckpoint(nextCheckpoint);
+          try {
+            sessionStorage.setItem('PPIC_UPLOAD_RESUME_CHECKPOINT', JSON.stringify(nextCheckpoint));
+          } catch (e) {
+            console.warn('SessionStorage setItem warning:', e);
+          }
+          setErrorMessage(
+            `Penyimpanan terhenti di batch ${res.failedBatch || '?'}. ${res.totalInserted || 0} baris telah tersimpan. Anda dapat menekan tombol "Lanjutkan Upload (Resume)" untuk meneruskan tanpa duplikasi.`
+          );
+        } else {
+          setErrorMessage(
+            `Gagal menyimpan seluruh batch data: ${res.error || 'Terjadi kesalahan sistem'}. Anda dapat mencoba ulang penyimpanan.`
+          );
+        }
       }
     } catch (err: any) {
       console.error(err);
@@ -517,6 +580,50 @@ export const UploadExcelView: React.FC = () => {
         <div className="p-3.5 rounded-lg bg-red-50 border border-red-300 text-red-900 text-xs flex items-center gap-2">
           <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
           <span className="font-semibold">{errorMessage}</span>
+        </div>
+      )}
+
+      {/* Resume Pending Upload Banner */}
+      {resumeCheckpoint && (
+        <div className="p-4 rounded-xl bg-amber-50 border border-amber-300 text-amber-950 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+          <div className="flex items-start gap-3">
+            <div className="p-2 rounded-lg bg-amber-100 text-amber-700 shrink-0 mt-0.5">
+              <AlertCircle className="w-5 h-5" />
+            </div>
+            <div>
+              <div className="flex items-center gap-2">
+                <span className="font-bold text-xs uppercase tracking-wide bg-amber-200 text-amber-900 px-2 py-0.5 rounded">
+                  Sesi Upload Tertunda Terdeteksi
+                </span>
+                <span className="text-[11px] font-mono text-amber-800">
+                  Upload ID: {resumeCheckpoint.uploadId}
+                </span>
+              </div>
+              <p className="text-xs text-amber-900 mt-1">
+                Upload sebelumnya terhenti di <strong>Batch {resumeCheckpoint.failedBatch || '?'}</strong>. Sebanyak <strong>{resumeCheckpoint.startRowIndex.toLocaleString('id-ID')} baris</strong> telah aman tersimpan di Supabase. Anda dapat melanjutkan penyimpanan mulai dari baris {(resumeCheckpoint.startRowIndex + 1).toLocaleString('id-ID')} tanpa duplikasi data.
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={clearResumeCheckpoint}
+              className="px-3 py-1.5 text-xs font-semibold text-slate-700 bg-white hover:bg-slate-100 border border-slate-300 rounded-md transition-colors cursor-pointer"
+            >
+              Hapus Sesi Tertunda
+            </button>
+            {previewData && (
+              <button
+                type="button"
+                onClick={() => handleConfirmAndSave(true)}
+                disabled={isProcessing}
+                className="px-3.5 py-1.5 text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 rounded-md shadow-xs transition-colors flex items-center gap-1.5 cursor-pointer"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isProcessing ? 'animate-spin' : ''}`} />
+                Lanjutkan Upload Sekarang
+              </button>
+            )}
+          </div>
         </div>
       )}
 
@@ -797,7 +904,7 @@ export const UploadExcelView: React.FC = () => {
               </button>
               <button
                 type="button"
-                onClick={handleConfirmAndSave}
+                onClick={() => handleConfirmAndSave(false)}
                 disabled={isProcessing}
                 className="px-4 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-md shadow-xs transition-colors flex items-center gap-1.5 cursor-pointer"
               >
@@ -934,9 +1041,20 @@ export const UploadExcelView: React.FC = () => {
               >
                 Batal
               </button>
+              {resumeCheckpoint && (
+                <button
+                  type="button"
+                  onClick={() => handleConfirmAndSave(true)}
+                  disabled={isProcessing}
+                  className="px-4 py-2 text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 rounded-md shadow-xs transition-colors flex items-center gap-1.5 cursor-pointer animate-pulse"
+                >
+                  <RefreshCw className={`w-4 h-4 ${isProcessing ? 'animate-spin' : ''}`} />
+                  Lanjutkan Upload (Resume Batch {resumeCheckpoint.failedBatch || '?'})
+                </button>
+              )}
               <button
                 type="button"
-                onClick={handleConfirmAndSave}
+                onClick={() => handleConfirmAndSave(false)}
                 disabled={isProcessing}
                 className="px-4 py-2 text-xs font-bold text-white bg-emerald-600 hover:bg-emerald-700 rounded-md shadow-xs transition-colors flex items-center gap-1.5 cursor-pointer"
               >
@@ -1184,7 +1302,7 @@ export const UploadExcelView: React.FC = () => {
                     Tutup
                   </button>
                   <button
-                    onClick={handleConfirmAndSave}
+                    onClick={() => handleConfirmAndSave(Boolean(resumeCheckpoint))}
                     className="px-3.5 py-1.5 text-xs font-bold text-white bg-rose-600 hover:bg-rose-700 rounded-md transition-colors flex items-center gap-1.5"
                   >
                     <RefreshCw className="w-3.5 h-3.5" />

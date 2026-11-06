@@ -8,6 +8,7 @@ export const PPIC_SUPABASE_SCHEMA_SQL = `-- ====================================
 
 -- 1. EXTENSIONS
 CREATE EXTENSION IF NOT EXISTS "pgcrypto";
+CREATE EXTENSION IF NOT EXISTS "pg_trgm"; -- Diperlukan untuk GIN Trigram Index (ILIKE '%pattern%' pada jutaan baris)
 
 -- 2. TABEL: or_style_relations (Pemetaan No. OR dan Style)
 CREATE TABLE IF NOT EXISTS public.or_style_relations (
@@ -18,6 +19,7 @@ CREATE TABLE IF NOT EXISTS public.or_style_relations (
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_or_style_number ON public.or_style_relations(or_number);
+CREATE INDEX IF NOT EXISTS idx_or_style_trgm ON public.or_style_relations USING gin (style gin_trgm_ops);
 
 -- 3. TABEL: upload_history (Riwayat Unggahan File Excel)
 CREATE TABLE IF NOT EXISTS public.upload_history (
@@ -36,6 +38,7 @@ CREATE INDEX IF NOT EXISTS idx_upload_history_or ON public.upload_history(or_num
 CREATE INDEX IF NOT EXISTS idx_upload_history_date ON public.upload_history(update_date);
 CREATE INDEX IF NOT EXISTS idx_upload_hist_date_or ON public.upload_history(update_date DESC, or_number);
 CREATE INDEX IF NOT EXISTS idx_upload_hist_created ON public.upload_history(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_upload_hist_or_trgm ON public.upload_history USING gin (or_number gin_trgm_ops);
 
 -- 4. TABEL: material_requirements (Detail Kebutuhan & Penerimaan Material)
 CREATE TABLE IF NOT EXISTS public.material_requirements (
@@ -56,6 +59,7 @@ CREATE TABLE IF NOT EXISTS public.material_requirements (
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+-- B-Tree Indexes (Optimal untuk =, range date, dan ORDER BY)
 CREATE INDEX IF NOT EXISTS idx_mat_req_or ON public.material_requirements(or_number);
 CREATE INDEX IF NOT EXISTS idx_mat_req_date ON public.material_requirements(update_date);
 CREATE INDEX IF NOT EXISTS idx_mat_req_or_date ON public.material_requirements(or_number, update_date DESC);
@@ -65,6 +69,14 @@ CREATE INDEX IF NOT EXISTS idx_mat_req_style ON public.material_requirements(sty
 CREATE INDEX IF NOT EXISTS idx_mat_req_category ON public.material_requirements(category);
 CREATE INDEX IF NOT EXISTS idx_mat_req_created ON public.material_requirements(created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_mat_req_imported ON public.material_requirements(imported_at DESC);
+
+-- GIN Trigram Indexes (Wajib untuk pencarian cepat wildcard ILIKE '%pola%' tanpa Full Table Scan)
+-- CATATAN POSTGRESQL: Indeks ini dieksekusi di luar blok transaksi (DO $$)
+-- karena CREATE INDEX CONCURRENTLY / DDL tidak diizinkan di dalam transaction block.
+CREATE INDEX IF NOT EXISTS idx_mat_req_name_trgm ON public.material_requirements USING gin (material_name gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_mat_req_code_trgm ON public.material_requirements USING gin (material_code gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_mat_req_or_trgm ON public.material_requirements USING gin (or_number gin_trgm_ops);
+CREATE INDEX IF NOT EXISTS idx_mat_req_style_trgm ON public.material_requirements USING gin (style gin_trgm_ops);
 
 -- 5. TABEL: production_schedules (Penjadwalan Produksi / Gantt Board)
 CREATE TABLE IF NOT EXISTS public.production_schedules (

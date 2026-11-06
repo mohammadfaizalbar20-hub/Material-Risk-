@@ -158,7 +158,20 @@ interface PpicContextType {
     fileName?: string;
     skipMenuRedirect?: boolean;
     onProgress?: (info: UploadProgressCallbackInfo) => void;
-  }) => Promise<{ success: boolean; uploadId?: string; error?: string }>;
+    resumeCheckpoint?: {
+      uploadId: string;
+      startRowIndex: number;
+      preparedRequirements?: any[];
+    };
+  }) => Promise<{
+    success: boolean;
+    uploadId?: string;
+    failedBatch?: number;
+    failedRowIndex?: number;
+    totalInserted?: number;
+    preparedRequirements?: any[];
+    error?: string;
+  }>;
 
   // Master Data Deletion Feature
   deletionHistory: DeletionHistoryItem[];
@@ -353,13 +366,14 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
 
   useEffect(() => {
     try {
-      // High volume optimization: Cache at most 1,000 recent requirements in localStorage
-      // to avoid QuotaExceededError (5MB browser limit) when storing 20,000+ rows daily.
-      // Supabase PostgreSQL remains the comprehensive centralized single source of truth.
-      const toCache = materialRequirements.slice(0, 1000);
-      localStorage.setItem(`${LOCAL_STORAGE_KEY}_requirements`, JSON.stringify(toCache));
+      localStorage.setItem(`${LOCAL_STORAGE_KEY}_requirements`, JSON.stringify(materialRequirements));
     } catch (e) {
-      console.warn('LocalStorage quota limit reached, Supabase cloud remains authoritative:', e);
+      try {
+        const toCache = materialRequirements.slice(0, 5000);
+        localStorage.setItem(`${LOCAL_STORAGE_KEY}_requirements`, JSON.stringify(toCache));
+      } catch (err) {
+        console.warn('LocalStorage quota limit reached, Supabase cloud remains authoritative:', err);
+      }
     }
   }, [materialRequirements]);
 
@@ -405,7 +419,12 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       const data = await fetchAllPpicFromSupabase();
       if (data) {
         if (data.materialRequirements.length > 0) {
-          setMaterialRequirements(data.materialRequirements);
+          setMaterialRequirements((prev) => {
+            if (prev.length === 0) return data.materialRequirements;
+            const existingIds = new Set(prev.map((r) => r.id));
+            const newItems = data.materialRequirements.filter((r) => !existingIds.has(r.id));
+            return newItems.length > 0 ? [...newItems, ...prev] : prev;
+          });
         }
         if (data.uploadHistory.length > 0) {
           setUploadHistory(data.uploadHistory);
@@ -540,12 +559,18 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
             if (!isMounted) return;
             const fresh = await fetchAllPpicFromSupabase();
             if (fresh && isMounted) {
-              setMaterialRequirements(fresh.materialRequirements);
               setUploadHistory(fresh.uploadHistory);
               setProductionSchedules(fresh.productionSchedules);
               setOrStyleRelations(fresh.orStyleRelations);
               setMaterials(fresh.materials);
               setDeletionHistory(fresh.deletionHistory);
+              // CRITICAL: Merge instead of overwrite to prevent wiping uploaded 20,000+ rows
+              setMaterialRequirements((prev) => {
+                if (prev.length === 0) return fresh.materialRequirements;
+                const existingIds = new Set(prev.map((r) => r.id));
+                const newItems = fresh.materialRequirements.filter((r) => !existingIds.has(r.id));
+                return newItems.length > 0 ? [...newItems, ...prev] : prev;
+              });
               setLastSyncTimestamp(Date.now());
             }
           }
@@ -1406,7 +1431,7 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     ]);
   };
 
-  // Direct Automatic Save from Excel Reader into Master Data Material (High-Volume Resilient)
+  // Direct Automatic Save from Excel Reader into Master Data Material (High-Volume Resilient with Resume Checkpoint)
   const autoSaveExcelMaterials = async ({
     newRequirements,
     newMasterMaterials = [],
@@ -1415,6 +1440,7 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     fileName = 'Data_Material_PPIC.xlsx',
     skipMenuRedirect = false,
     onProgress,
+    resumeCheckpoint,
   }: {
     newRequirements: MaterialItemRequirement[];
     newMasterMaterials?: Material[];
@@ -1423,11 +1449,25 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     fileName?: string;
     skipMenuRedirect?: boolean;
     onProgress?: (info: UploadProgressCallbackInfo) => void;
-  }): Promise<{ success: boolean; uploadId?: string; error?: string }> => {
+    resumeCheckpoint?: {
+      uploadId: string;
+      startRowIndex: number;
+      preparedRequirements?: any[];
+    };
+  }): Promise<{
+    success: boolean;
+    uploadId?: string;
+    failedBatch?: number;
+    failedRowIndex?: number;
+    totalInserted?: number;
+    preparedRequirements?: any[];
+    error?: string;
+  }> => {
     if (newRequirements.length === 0) {
       return { success: false, error: 'Tidak ada baris material yang diproses.' };
     }
 
+    const isResuming = Boolean(resumeCheckpoint?.uploadId);
     // Use selected updateDate or default to current date in WIB (Asia/Jakarta)
     const effectiveUpdateDate =
       updateDate || new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
@@ -1444,24 +1484,27 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
 
     // 2. Transaction Lines (1 Upload = 1 OR = N Material Details)
-    const uploadId = `upload-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+    // Reuse existing uploadId if resuming to preserve 100% upload session identity
+    const uploadId = resumeCheckpoint?.uploadId || `upload-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
     const primaryOr = (newRequirements[0]?.orNumber || '').trim().toUpperCase();
     const primaryStyle = (newRequirements[0]?.style || '').trim();
 
-    setMaterialRequirements((prev) => {
-      const taggedNewReqs = newRequirements.map((r, idx) => ({
-        ...r,
-        id: r.id && !r.id.startsWith('temp-') ? r.id : `req-${Date.now()}-${idx}-${Math.floor(Math.random() * 1000)}`,
-        uploadId,
-        orNumber: primaryOr,
-        style: primaryStyle,
-        updateDate: effectiveUpdateDate,
-        isRecentlyImported: true,
-        importedAt: r.importedAt || new Date().toISOString(),
-      }));
+    if (!isResuming) {
+      setMaterialRequirements((prev) => {
+        const taggedNewReqs = newRequirements.map((r, idx) => ({
+          ...r,
+          id: r.id && !r.id.startsWith('temp-') ? r.id : `req-${Date.now()}-${idx}-${Math.floor(Math.random() * 1000)}`,
+          uploadId,
+          orNumber: primaryOr,
+          style: primaryStyle,
+          updateDate: effectiveUpdateDate,
+          isRecentlyImported: true,
+          importedAt: r.importedAt || new Date().toISOString(),
+        }));
 
-      return [...taggedNewReqs, ...prev.map((r) => ({ ...r, isRecentlyImported: false }))];
-    });
+        return [...taggedNewReqs, ...prev.map((r) => ({ ...r, isRecentlyImported: false }))];
+      });
+    }
 
     // 3. Save OR <-> Style relations
     if (primaryOr && primaryStyle) {
@@ -1499,10 +1542,23 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       style: primaryStyle,
       fileName: fileName,
       rowCount: newRequirements.length,
-      status: 'Sukses',
-      notes: `Berhasil diproses & disimpan (${newRequirements.length} baris material)`,
+      status: isResuming ? 'Melanjutkan Upload...' : 'Sukses',
+      notes: isResuming
+        ? `Melanjutkan penyimpanan dari baris ${(resumeCheckpoint?.startRowIndex || 0) + 1}...`
+        : `Berhasil diproses & disimpan (${newRequirements.length} baris material)`,
     };
-    setUploadHistory((prev) => [newHistItem, ...prev]);
+
+    if (!isResuming) {
+      setUploadHistory((prev) => [newHistItem, ...prev]);
+    } else {
+      setUploadHistory((prev) =>
+        prev.map((h) =>
+          h.id === uploadId
+            ? { ...h, status: 'Melanjutkan Upload...', notes: newHistItem.notes }
+            : h
+        )
+      );
+    }
 
     // 5. Record recently imported batch info
     setLastImportedInfo({
@@ -1514,19 +1570,21 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     });
 
     // 6. Add system notification
-    setNotifications((prev) => [
-      {
-        id: `notif-${Date.now()}`,
-        type: 'info',
-        title: 'Hasil Pembacaan Excel Otomatis Tersimpan',
-        message: `${newRequirements.length} baris material (${primaryOr}) tersimpan untuk Tanggal Update: ${effectiveUpdateDate}.`,
-        timestamp: 'Baru saja',
-        read: false,
-      },
-      ...prev,
-    ]);
+    if (!isResuming) {
+      setNotifications((prev) => [
+        {
+          id: `notif-${Date.now()}`,
+          type: 'info',
+          title: 'Hasil Pembacaan Excel Otomatis Tersimpan',
+          message: `${newRequirements.length} baris material (${primaryOr}) tersimpan untuk Tanggal Update: ${effectiveUpdateDate}.`,
+          timestamp: 'Baru saja',
+          read: false,
+        },
+        ...prev,
+      ]);
+    }
 
-    // 7. Sync to Centralized Supabase Database if configured (High-Volume 500-row batching with 3x retry)
+    // 7. Sync to Centralized Supabase Database if configured (High-Volume 500-row batching with 3x retry & resume support)
     if (getSupabaseCredentials().isConfigured) {
       try {
         const syncRes = await syncBatchExcelToSupabaseWithProgress(
@@ -1546,6 +1604,7 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
               updateDate: effectiveUpdateDate,
             })),
             masterMaterials: newMasterMaterials,
+            resumeCheckpoint,
           },
           onProgress
         );
@@ -1553,13 +1612,50 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
         if (syncRes.success) {
           setLastSyncTimestamp(Date.now());
           setSupabaseConnected(true);
+          // Mark status as 'Sukses' in local upload history with verified count
+          setUploadHistory((prev) =>
+            prev.map((h) =>
+              h.id === (syncRes.uploadId || uploadId)
+                ? {
+                    ...h,
+                    status: 'Sukses',
+                    rowCount: syncRes.totalInserted || newRequirements.length,
+                    notes: `Berhasil tersimpan ${syncRes.totalInserted || newRequirements.length} baris material di Supabase.`,
+                  }
+                : h
+            )
+          );
           if (!skipMenuRedirect) {
             setActiveMenu('Rekap Material');
           }
-          return { success: true, uploadId: syncRes.uploadId || uploadId };
+          return {
+            success: true,
+            uploadId: syncRes.uploadId || uploadId,
+            totalInserted: syncRes.totalInserted,
+          };
         } else {
           console.warn('Batch Supabase sync notice:', syncRes.error);
-          return { success: false, uploadId, error: syncRes.error };
+          // Mark status as 'Gagal Sebagian' in local upload history
+          setUploadHistory((prev) =>
+            prev.map((h) =>
+              h.id === (syncRes.uploadId || uploadId)
+                ? {
+                    ...h,
+                    status: 'Gagal Sebagian',
+                    notes: `Gagal pada batch ${syncRes.failedBatch || '?'}. ${syncRes.error || ''}`,
+                  }
+                : h
+            )
+          );
+          return {
+            success: false,
+            uploadId: syncRes.uploadId || uploadId,
+            error: syncRes.error,
+            failedBatch: syncRes.failedBatch,
+            failedRowIndex: syncRes.failedRowIndex,
+            totalInserted: syncRes.totalInserted,
+            preparedRequirements: syncRes.preparedRequirements,
+          };
         }
       } catch (err: any) {
         console.error('Error during Supabase batch sync:', err);
@@ -1580,7 +1676,7 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       if (!skipMenuRedirect) {
         setActiveMenu('Rekap Material');
       }
-      return { success: true, uploadId };
+      return { success: true, uploadId, totalInserted: newRequirements.length };
     }
   };
 

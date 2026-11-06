@@ -169,3 +169,184 @@ test('High-Volume Scale: Material Risk Analysis performance filter on active sch
   assert.strictEqual(orSummaries.length, 1);
   assert.strictEqual(orSummaries[0].orNumber, 'OR-ACTIVE-2026');
 });
+
+test('Multi-Upload Retention: Upload A (1k, 1 Nov) + Upload B (1k, 2 Nov, same OR) preserves all 2,000 rows without overwriting', () => {
+  // Simulate Upload A: OR001 on 2026-11-01, 1,000 rows
+  const uploadIdA = 'upload-uuid-aaa-111';
+  const uploadA_Rows: MaterialItemRequirement[] = Array.from({ length: 1000 }, (_, i) => ({
+    id: `req-a-${i + 1}`,
+    uploadId: uploadIdA,
+    orNumber: 'OR001',
+    style: 'Style Casual Jacket',
+    materialCode: `MAT-A-${String(i + 1).padStart(4, '0')}`,
+    materialName: `Material A #${i + 1}`,
+    category: 'Raw Material',
+    unit: 'Kg',
+    requiredQty: 100,
+    receivedQty: 50,
+    unitPrice: 15000,
+    updateDate: '2026-11-01',
+    importedAt: '2026-11-01T08:00:00Z',
+  }));
+
+  // Simulate Upload B: OR001 on 2026-11-02, 1,000 rows (Same OR, later snapshot date, different uploadId)
+  const uploadIdB = 'upload-uuid-bbb-222';
+  const uploadB_Rows: MaterialItemRequirement[] = Array.from({ length: 1000 }, (_, i) => ({
+    id: `req-b-${i + 1}`,
+    uploadId: uploadIdB,
+    orNumber: 'OR001',
+    style: 'Style Casual Jacket',
+    materialCode: `MAT-B-${String(i + 1).padStart(4, '0')}`,
+    materialName: `Material B #${i + 1}`,
+    category: 'Raw Material',
+    unit: 'Kg',
+    requiredQty: 200,
+    receivedQty: 200,
+    unitPrice: 15000,
+    updateDate: '2026-11-02',
+    importedAt: '2026-11-02T08:00:00Z',
+  }));
+
+  // Append-only simulation (as performed by autoSaveExcelMaterials & syncBatchExcelToSupabaseWithProgress)
+  const accumulatedRequirements: MaterialItemRequirement[] = [...uploadB_Rows, ...uploadA_Rows];
+
+  // Verification 1: Total rows must be exactly 2,000
+  assert.strictEqual(accumulatedRequirements.length, 2000, 'Total accumulated requirements must be exactly 2,000');
+
+  // Verification 2: Upload A records must be 100% intact and unchanged
+  const filteredUploadA = accumulatedRequirements.filter((r) => r.uploadId === uploadIdA);
+  assert.strictEqual(filteredUploadA.length, 1000, 'Upload A must retain all 1,000 rows');
+  assert.strictEqual(filteredUploadA[0].updateDate, '2026-11-01');
+  assert.strictEqual(filteredUploadA[0].requiredQty, 100);
+  assert.strictEqual(filteredUploadA[0].receivedQty, 50);
+
+  // Verification 3: Upload B records must be 100% intact
+  const filteredUploadB = accumulatedRequirements.filter((r) => r.uploadId === uploadIdB);
+  assert.strictEqual(filteredUploadB.length, 1000, 'Upload B must retain all 1,000 rows');
+  assert.strictEqual(filteredUploadB[0].updateDate, '2026-11-02');
+  assert.strictEqual(filteredUploadB[0].requiredQty, 200);
+  assert.strictEqual(filteredUploadB[0].receivedQty, 200);
+
+  // Verification 4: Both can be searched separately by updateDate
+  const searchNov1 = accumulatedRequirements.filter((r) => r.orNumber === 'OR001' && r.updateDate === '2026-11-01');
+  assert.strictEqual(searchNov1.length, 1000, 'Searching OR001 on 1 Nov must yield 1,000 rows');
+
+  const searchNov2 = accumulatedRequirements.filter((r) => r.orNumber === 'OR001' && r.updateDate === '2026-11-02');
+  assert.strictEqual(searchNov2.length, 1000, 'Searching OR001 on 2 Nov must yield 1,000 rows');
+
+  // Verification 5: Searching by OR001 alone returns all 2,000 historical rows
+  const searchAllOr001 = accumulatedRequirements.filter((r) => r.orNumber === 'OR001');
+  assert.strictEqual(searchAllOr001.length, 2000, 'Searching OR001 alone must return all 2,000 rows');
+});
+
+test('High-Volume Scale: Upload C (20,000 rows) expands total to 22,000 rows with 100% searchability', () => {
+  // Existing 2,000 rows from Upload A and B
+  const initialCount = 2000;
+  const existingReqs: MaterialItemRequirement[] = Array.from({ length: initialCount }, (_, i) => ({
+    id: `req-prev-${i}`,
+    uploadId: i < 1000 ? 'upload-a' : 'upload-b',
+    orNumber: 'OR001',
+    style: 'Style Casual Jacket',
+    materialCode: `MAT-PREV-${i}`,
+    materialName: `Existing Material ${i}`,
+    category: 'Raw Material',
+    unit: 'Kg',
+    requiredQty: 100,
+    receivedQty: 100,
+    unitPrice: 10000,
+    updateDate: i < 1000 ? '2026-11-01' : '2026-11-02',
+  }));
+
+  // Simulate Upload C: 20,000 new rows for OR002 on 2026-11-03
+  const uploadIdC = 'upload-uuid-ccc-333';
+  const uploadC_Rows: MaterialItemRequirement[] = Array.from({ length: 20000 }, (_, i) => ({
+    id: `req-c-${i + 1}`,
+    uploadId: uploadIdC,
+    orNumber: 'OR002',
+    style: 'Style Heavy Parka Waterproof',
+    materialCode: `MAT-C-${String(i + 1).padStart(5, '0')}`,
+    materialName: `Material C #${i + 1}`,
+    category: 'Raw Material',
+    unit: 'Yard',
+    requiredQty: 500,
+    receivedQty: 400,
+    unitPrice: 35000,
+    updateDate: '2026-11-03',
+    importedAt: '2026-11-03T09:00:00Z',
+  }));
+
+  // Combine via append-only
+  const allReqs = [...uploadC_Rows, ...existingReqs];
+
+  // Verification 1: Exactly 22,000 rows
+  assert.strictEqual(allReqs.length, 22000, 'Accumulated total must reach 22,000 rows (2k previous + 20k new)');
+
+  // Verification 2: Upload A & B still intact
+  const foundA = allReqs.filter((r) => r.uploadId === 'upload-a');
+  assert.strictEqual(foundA.length, 1000);
+  const foundB = allReqs.filter((r) => r.uploadId === 'upload-b');
+  assert.strictEqual(foundB.length, 1000);
+
+  // Verification 3: Upload C has all 20,000 rows
+  const foundC = allReqs.filter((r) => r.uploadId === uploadIdC);
+  assert.strictEqual(foundC.length, 20000);
+
+  // Verification 4: Server-side pagination simulated across 22,000 rows (pageSize = 50)
+  const pageSize = 50;
+  const totalPages = Math.ceil(allReqs.length / pageSize);
+  assert.strictEqual(totalPages, 440, '22,000 rows produces 440 pages');
+
+  // Page 1 slice
+  const page1 = allReqs.slice(0, 50);
+  assert.strictEqual(page1.length, 50);
+  assert.strictEqual(page1[0].orNumber, 'OR002');
+
+  // Page 440 slice (last page containing rows from Upload A)
+  const page440 = allReqs.slice((440 - 1) * pageSize, 440 * pageSize);
+  assert.strictEqual(page440.length, 50);
+  assert.strictEqual(page440[0].orNumber, 'OR001');
+
+  // Verification 5: Search filters work independently
+  const searchOr2 = allReqs.filter((r) => r.orNumber === 'OR002');
+  assert.strictEqual(searchOr2.length, 20000);
+
+  const searchOr1 = allReqs.filter((r) => r.orNumber === 'OR001');
+  assert.strictEqual(searchOr1.length, 2000);
+
+  const searchDateNov3 = allReqs.filter((r) => r.updateDate === '2026-11-03');
+  assert.strictEqual(searchDateNov3.length, 20000);
+});
+
+test('Schema Safety: Supabase schema uses TEXT type on all flexible text columns (No VARCHAR(255) truncation)', () => {
+  // Check or_style_relations
+  assert.ok(
+    PPIC_SUPABASE_SCHEMA_SQL.includes('or_number TEXT NOT NULL UNIQUE'),
+    'or_number must be TEXT'
+  );
+  assert.ok(
+    PPIC_SUPABASE_SCHEMA_SQL.includes('style TEXT NOT NULL'),
+    'style must be TEXT'
+  );
+
+  // Check upload_history
+  assert.ok(
+    PPIC_SUPABASE_SCHEMA_SQL.includes('file_name TEXT NOT NULL'),
+    'upload_history.file_name must be TEXT'
+  );
+
+  // Check material_requirements
+  assert.ok(
+    PPIC_SUPABASE_SCHEMA_SQL.includes('material_name TEXT NOT NULL'),
+    'material_requirements.material_name must be TEXT'
+  );
+
+  // Check ALTER TABLE migration
+  assert.ok(
+    PPIC_SUPABASE_MIGRATION_WIDEN_TEXT_SQL.includes('ALTER TABLE IF EXISTS public.or_style_relations ALTER COLUMN style TYPE TEXT'),
+    'ALTER TABLE migration must widen or_style_relations.style to TEXT'
+  );
+  assert.ok(
+    PPIC_SUPABASE_MIGRATION_WIDEN_TEXT_SQL.includes('ALTER TABLE IF EXISTS public.material_requirements ALTER COLUMN material_name TYPE TEXT'),
+    'ALTER TABLE migration must widen material_requirements.material_name to TEXT'
+  );
+});

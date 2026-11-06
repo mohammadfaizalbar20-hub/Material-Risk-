@@ -2,6 +2,7 @@ import React, { useState, useMemo, useEffect } from 'react';
 import { usePpic } from '../../context/PpicContext';
 import { MaterialItemRequirement, MaterialCategory, MaterialUnit } from '../../types/ppic';
 import * as XLSX from 'xlsx';
+import { fetchPaginatedRequirementsFromSupabase } from '../../lib/supabase';
 import {
   Boxes,
   Plus,
@@ -57,6 +58,8 @@ export const MaterialSummaryView: React.FC = () => {
     getDeletionImpactByDate,
     getDeletionImpactByStyle,
     getOrHistoryDetails,
+    supabaseConnected,
+    lastSyncTimestamp,
   } = usePpic();
 
   // Active view tab:
@@ -247,14 +250,90 @@ export const MaterialSummaryView: React.FC = () => {
     pageSize,
   ]);
 
-  const totalFilteredCount = filteredRequirements.length;
-  const totalPages = Math.max(1, Math.ceil(totalFilteredCount / pageSize));
+  // Server-side Range Pagination & Search (Active when Supabase is connected)
+  const [serverPageData, setServerPageData] = useState<{
+    items: typeof processedRequirements;
+    totalCount: number;
+    totalPages: number;
+  } | null>(null);
+  const [isServerLoading, setIsServerLoading] = useState<boolean>(false);
+
+  useEffect(() => {
+    if (!supabaseConnected) {
+      setServerPageData(null);
+      return;
+    }
+
+    let isCancelled = false;
+    setIsServerLoading(true);
+
+    const timer = setTimeout(async () => {
+      try {
+        const res = await fetchPaginatedRequirementsFromSupabase({
+          page: currentPage,
+          pageSize,
+          orNumber: searchOrInput.trim() || undefined,
+          style: searchStyleInput.trim() || undefined,
+          search: (searchMaterialInput.trim() || activeSearchQuery.trim()) || undefined,
+          updateDate: searchDateInput.trim() || undefined,
+          status: statusFilter,
+        });
+
+        if (!isCancelled && res) {
+          const mapped = res.data.map((req) => {
+            const shortage = req.receivedQty - req.requiredQty;
+            const isReady = shortage >= 0;
+            return {
+              ...req,
+              shortage,
+              isReady,
+              statusLabel: isReady ? ('READY' as const) : ('BELUM READY' as const),
+              effectiveDate: req.updateDate || '2026-10-31',
+            };
+          });
+
+          setServerPageData({
+            items: mapped,
+            totalCount: res.totalCount,
+            totalPages: res.totalPages,
+          });
+        }
+      } catch (err) {
+        console.error('Error fetching server paginated requirements:', err);
+      } finally {
+        if (!isCancelled) setIsServerLoading(false);
+      }
+    }, 200);
+
+    return () => {
+      isCancelled = true;
+      clearTimeout(timer);
+    };
+  }, [
+    supabaseConnected,
+    currentPage,
+    pageSize,
+    searchOrInput,
+    searchStyleInput,
+    searchMaterialInput,
+    activeSearchQuery,
+    searchDateInput,
+    statusFilter,
+    lastSyncTimestamp,
+  ]);
+
+  const isServerActive = Boolean(supabaseConnected && serverPageData);
+  const totalFilteredCount = isServerActive ? serverPageData!.totalCount : filteredRequirements.length;
+  const totalPages = isServerActive ? serverPageData!.totalPages : Math.max(1, Math.ceil(totalFilteredCount / pageSize));
   const safeCurrentPage = Math.min(currentPage, totalPages);
 
   const paginatedRequirements = useMemo(() => {
+    if (isServerActive) {
+      return serverPageData!.items;
+    }
     const from = (safeCurrentPage - 1) * pageSize;
     return filteredRequirements.slice(from, from + pageSize);
-  }, [filteredRequirements, safeCurrentPage, pageSize]);
+  }, [isServerActive, serverPageData, filteredRequirements, safeCurrentPage, pageSize]);
 
   // Checkbox selection helpers (Operates over filtered & visible items)
   const allFilteredSelected = useMemo(() => {
@@ -292,6 +371,27 @@ export const MaterialSummaryView: React.FC = () => {
 
   // KPI Metrics
   const metrics = useMemo(() => {
+    if (isServerActive) {
+      const total = serverPageData!.totalCount;
+      const sample = serverPageData!.items;
+      const readySample = sample.filter((r) => r.isReady).length;
+      const sampleLen = Math.max(1, sample.length);
+      const readyRatio = readySample / sampleLen;
+      const totalRequired = sample.reduce((sum, r) => sum + r.requiredQty, 0);
+      const totalReceived = sample.reduce((sum, r) => sum + r.receivedQty, 0);
+
+      return {
+        total,
+        ready: Math.round(readyRatio * total),
+        notReady: total - Math.round(readyRatio * total),
+        readyPercent: Math.round(readyRatio * 100),
+        notReadyPercent: 100 - Math.round(readyRatio * 100),
+        totalRequired,
+        totalReceived,
+        recentlyImportedCount: sample.filter((r) => r.isRecentlyImported).length,
+      };
+    }
+
     const total = filteredRequirements.length;
     const ready = filteredRequirements.filter((r) => r.isReady).length;
     const notReady = total - ready;
@@ -309,7 +409,7 @@ export const MaterialSummaryView: React.FC = () => {
       totalReceived,
       recentlyImportedCount,
     };
-  }, [filteredRequirements]);
+  }, [isServerActive, serverPageData, filteredRequirements]);
 
   // Daily diff comparison data
   const comparisonData = useMemo(() => {
@@ -1151,7 +1251,21 @@ export const MaterialSummaryView: React.FC = () => {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {filteredRequirements.length === 0 ? (
+                  {isServerLoading ? (
+                    <tr>
+                      <td colSpan={11} className="py-12 text-center text-slate-500 text-xs">
+                        <div className="flex flex-col items-center justify-center gap-2">
+                          <RefreshCw className="w-6 h-6 text-blue-600 animate-spin" />
+                          <span className="font-semibold text-slate-700">
+                            Memuat data dari database Supabase...
+                          </span>
+                          <span className="text-[11px] text-slate-400">
+                            Mengambil data halaman {safeCurrentPage} dari {totalPages}
+                          </span>
+                        </div>
+                      </td>
+                    </tr>
+                  ) : totalFilteredCount === 0 ? (
                     <tr>
                       <td colSpan={11} className="py-12 text-center text-slate-400 text-xs">
                         <div className="flex flex-col items-center justify-center gap-2">
