@@ -66,6 +66,41 @@ export function generateUuid(): string {
 }
 
 /**
+ * Deterministically generates an RFC4122-compliant UUID for a row in an upload session.
+ * Guarantees that row N in upload session U will produce the exact identical UUID
+ * before refresh, after refresh, across retries, and across client restarts.
+ */
+export function generateDeterministicRowUuid(uploadId: string, index: number): string {
+  let h1 = 0xdeadbeef;
+  let h2 = 0x41c64e6d;
+  let h3 = 0x9e3779b9;
+  let h4 = 0x85ebca6b;
+  const input = `${uploadId}__row__${index}`;
+
+  for (let i = 0; i < input.length; i++) {
+    const ch = input.charCodeAt(i);
+    h1 = Math.imul(h1 ^ ch, 0x85ebca6b);
+    h2 = Math.imul(h2 ^ (ch << 1), 0xc2b2ae35);
+    h3 = Math.imul(h3 ^ (ch << 2), 0x7feb352d);
+    h4 = Math.imul(h4 ^ (ch << 3), 0x846ca68b);
+  }
+
+  h1 ^= h1 >>> 16;
+  h2 ^= h2 >>> 16;
+  h3 ^= h3 >>> 16;
+  h4 ^= h4 >>> 16;
+
+  const hex1 = (h1 >>> 0).toString(16).padStart(8, '0');
+  const hex2 = ((h2 >>> 0) & 0xffff).toString(16).padStart(4, '0');
+  const hex3 = '4' + (((h2 >>> 16) & 0x0fff).toString(16).padStart(3, '0'));
+  const variantNibble = (8 + (Math.abs(h3) & 0x3)).toString(16);
+  const hex4 = variantNibble + (((h3 >>> 4) & 0x0fff).toString(16).padStart(3, '0'));
+  const hex5 = (h4 >>> 0).toString(16).padStart(8, '0') + (((h3 >>> 16) & 0xffff).toString(16).padStart(4, '0'));
+
+  return `${hex1}-${hex2}-${hex3}-${hex4}-${hex5}`.toLowerCase();
+}
+
+/**
  * Validates whether a string is a well-formed HTTP/HTTPS URL and not an API key
  */
 export function isValidSupabaseUrl(urlString?: string | null): boolean {
@@ -740,10 +775,10 @@ export async function syncBatchExcelToSupabaseWithProgress(
     // If resuming with pre-prepared rows, reuse exact existing UUIDs to prevent any duplication
     const dbReqs = params.resumeCheckpoint?.preparedRequirements && params.resumeCheckpoint.preparedRequirements.length === params.requirements.length
       ? params.resumeCheckpoint.preparedRequirements
-      : params.requirements.map((r) => {
+      : params.requirements.map((r, idx) => {
           const row = mapModelToDbRequirement(r);
           row.upload_id = generatedUploadId;
-          row.id = isValidUuid(r.id) ? r.id : generateUuid();
+          row.id = isValidUuid(r.id) ? r.id : generateDeterministicRowUuid(generatedUploadId, idx);
           return row;
         });
 

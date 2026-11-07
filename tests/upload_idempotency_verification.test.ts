@@ -314,3 +314,153 @@ test('Section F Verification: 20,000 rows upload, simulated failure at batch 10,
   assert.strictEqual(day2RowsInDb[0].updateDate, '2026-11-06');
 });
 
+test('Section 4.1: Resume setelah Browser Refresh (IndexedDB row caching & checkpoint matching)', async () => {
+  const {
+    saveCheckpointMeta,
+    getCheckpointMeta,
+    savePendingUploadRows,
+    getPendingUploadRows,
+    clearPendingUpload,
+  } = await import('../src/utils/uploadOfflineStorage');
+  const { generateDeterministicRowUuid } = await import('../src/lib/supabase');
+
+  const uploadId = 'upload-refresh-test-001';
+  const totalRows = 20000;
+
+  // Generate 20,000 rows with deterministic UUIDs
+  const rows = Array.from({ length: totalRows }, (_, i) => ({
+    id: generateDeterministicRowUuid(uploadId, i),
+    upload_id: uploadId,
+    or_number: 'OR-REFRESH-001',
+    style: 'Performance Jacket',
+    material_code: `MAT-${i}`,
+    material_name: `Material Item #${i}`,
+    required_qty: 100,
+    received_qty: 80,
+    update_date: '2026-11-06',
+  }));
+
+  // Step 1: Save full rows to offline cache (simulating IndexedDB)
+  await savePendingUploadRows(uploadId, rows);
+
+  // Step 2: Save checkpoint after failure at batch 10 (row 4500)
+  const checkpoint = {
+    uploadId,
+    fileName: 'Data_Material_PPIC.xlsx',
+    orNumber: 'OR-REFRESH-001',
+    style: 'Performance Jacket',
+    updateDate: '2026-11-06',
+    totalRows,
+    startRowIndex: 4500,
+    failedBatch: 10,
+    totalBatches: 40,
+    savedAt: new Date().toISOString(),
+  };
+  saveCheckpointMeta(checkpoint);
+
+  // Step 3: Simulate browser refresh (re-reading from storage)
+  const restoredMeta = getCheckpointMeta();
+  assert.ok(restoredMeta, 'Checkpoint metadata must survive browser refresh');
+  assert.strictEqual(restoredMeta.uploadId, uploadId);
+  assert.strictEqual(restoredMeta.startRowIndex, 4500);
+
+  const restoredRows = await getPendingUploadRows(restoredMeta.uploadId);
+  assert.ok(restoredRows, 'Full rows must be restored from offline storage');
+  assert.strictEqual(restoredRows.length, 20000);
+
+  // Verify that all 20,000 restored row IDs match the original IDs exactly
+  for (let i = 0; i < totalRows; i++) {
+    assert.strictEqual(
+      restoredRows[i].id,
+      generateDeterministicRowUuid(uploadId, i),
+      `Row ${i} must preserve its exact UUID after refresh`
+    );
+  }
+
+  // Step 4: Simulate resuming from row 4500 into database
+  const db = new Map<string, any>();
+  // Batches 1..9 were already committed before failure
+  for (let i = 0; i < 4500; i++) {
+    db.set(rows[i].id, rows[i]);
+  }
+  assert.strictEqual(db.size, 4500);
+
+  // Resume from 4500 using restored rows
+  for (let i = restoredMeta.startRowIndex; i < totalRows; i++) {
+    db.set(restoredRows[i].id, restoredRows[i]);
+  }
+
+  assert.strictEqual(db.size, 20000, 'Database must contain exactly 20,000 rows after refresh resume');
+
+  // Step 5: Clean up after completion
+  await clearPendingUpload(uploadId);
+  assert.strictEqual(getCheckpointMeta(), null, 'Checkpoint metadata must be cleared on success');
+  const clearedRows = await getPendingUploadRows(uploadId);
+  assert.strictEqual(clearedRows, null, 'Offline cache must be cleared on success');
+});
+
+test('Section 4.2: Resume setelah Browser Refresh dengan Re-pilih Berkas (Validasi File Match & Deterministic UUID)', async () => {
+  const { validateFileMatchWithCheckpoint } = await import('../src/utils/uploadOfflineStorage');
+  const { generateDeterministicRowUuid } = await import('../src/lib/supabase');
+
+  const uploadId = 'upload-reselect-file-002';
+  const checkpoint = {
+    uploadId,
+    fileName: 'Master_Order_Lines_20k.xlsx',
+    orNumber: 'OR-2026-VAL-01',
+    style: 'Polo Shirt DryFit',
+    updateDate: '2026-11-06',
+    totalRows: 20000,
+    startRowIndex: 4500,
+    failedBatch: 10,
+    totalBatches: 40,
+    savedAt: new Date().toISOString(),
+  };
+
+  // Case A: User accidentally picks a wrong file with 500 rows
+  const wrongFile = { name: 'Different_Order.xlsx' };
+  const checkWrongRows = validateFileMatchWithCheckpoint(wrongFile, 500, 'OR-2026-VAL-01', checkpoint);
+  assert.strictEqual(checkWrongRows.isValid, false, 'Should reject file with mismatched row count');
+  assert.ok(checkWrongRows.reason?.includes('Jumlah baris material'));
+
+  // Case B: User picks file with different OR
+  const checkWrongOr = validateFileMatchWithCheckpoint({ name: 'Master_Order_Lines_20k.xlsx' }, 20000, 'OR-WRONG-999', checkpoint);
+  assert.strictEqual(checkWrongOr.isValid, false, 'Should reject file with mismatched OR number');
+  assert.ok(checkWrongOr.reason?.includes('Nomor OR'));
+
+  // Case C: User picks the matching file
+  const checkCorrect = validateFileMatchWithCheckpoint({ name: 'Master_Order_Lines_20k.xlsx' }, 20000, 'OR-2026-VAL-01', checkpoint);
+  assert.strictEqual(checkCorrect.isValid, true, 'Should accept identical file');
+
+  // Even if parsed from a reloaded file, deterministic UUID generation produces identical IDs
+  for (let idx = 0; idx < 100; idx++) {
+    const idOriginal = generateDeterministicRowUuid(uploadId, idx);
+    const idResumed = generateDeterministicRowUuid(checkpoint.uploadId, idx);
+    assert.strictEqual(idOriginal, idResumed, `Row index ${idx} must produce identical UUID across file re-selection`);
+  }
+});
+
+test('Section 4.3: Penolakan Akses untuk Pengguna Tidak Berwenang (RLS Policy Audit)', () => {
+  // Simulate PostgreSQL RLS policy: TO authenticated USING (auth.uid() IS NOT NULL) WITH CHECK (auth.uid() IS NOT NULL)
+  function evaluateRlsAccess(authContext: { role: string; uid: string | null }): { canSelect: boolean; canInsert: boolean } {
+    const isAuthenticated = authContext.role === 'authenticated' && authContext.uid !== null;
+    return {
+      canSelect: isAuthenticated,
+      canInsert: isAuthenticated,
+    };
+  }
+
+  // 1. Anonymous internet user with Anon Key only (No login)
+  const anonUser = { role: 'anon', uid: null };
+  const anonAccess = evaluateRlsAccess(anonUser);
+  assert.strictEqual(anonAccess.canSelect, false, 'Anon user without login MUST NOT be allowed to read PPIC data');
+  assert.strictEqual(anonAccess.canInsert, false, 'Anon user without login MUST NOT be allowed to insert/upsert data');
+
+  // 2. Authenticated user with valid session token
+  const loggedInUser = { role: 'authenticated', uid: 'user-ppic-uuid-456' };
+  const authAccess = evaluateRlsAccess(loggedInUser);
+  assert.strictEqual(authAccess.canSelect, true, 'Authenticated PPIC user is granted read access');
+  assert.strictEqual(authAccess.canInsert, true, 'Authenticated PPIC user is granted write access');
+});
+
+

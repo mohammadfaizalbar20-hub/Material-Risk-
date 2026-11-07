@@ -187,7 +187,9 @@ BEGIN
 END $$;
 
 -- ==============================================================================
--- ROW LEVEL SECURITY (RLS) POLICIES
+-- ROW LEVEL SECURITY (RLS) POLICIES - PRODUCTION GRADE KEAMANAN KETAT
+-- Menolak seluruh akses publik/anonim yang tidak memiliki sesi login (auth.uid() IS NULL)
+-- Hanya user terautentikasi (JWT token valid) yang diberikan izin akses.
 -- ==============================================================================
 ALTER TABLE public.or_style_relations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.upload_history ENABLE ROW LEVEL SECURITY;
@@ -197,27 +199,55 @@ ALTER TABLE public.master_materials ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.warehouse_stock ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.deletion_history ENABLE ROW LEVEL SECURITY;
 
--- Kebijakan Akses Bersama untuk Tim PPIC (Bisa diakses dari browser tim yang terhubung)
+-- 1. or_style_relations
 DROP POLICY IF EXISTS "Akses tim or_style_relations" ON public.or_style_relations;
-CREATE POLICY "Akses tim or_style_relations" ON public.or_style_relations FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Auth_access_or_style_relations" ON public.or_style_relations;
+CREATE POLICY "Auth_access_or_style_relations" ON public.or_style_relations 
+    TO authenticated 
+    USING (auth.uid() IS NOT NULL) 
+    WITH CHECK (auth.uid() IS NOT NULL);
 
+-- 2. upload_history
 DROP POLICY IF EXISTS "Akses tim upload_history" ON public.upload_history;
-CREATE POLICY "Akses tim upload_history" ON public.upload_history FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Auth_access_upload_history" ON public.upload_history 
+    TO authenticated 
+    USING (auth.uid() IS NOT NULL) 
+    WITH CHECK (auth.uid() IS NOT NULL);
 
+-- 3. material_requirements
 DROP POLICY IF EXISTS "Akses tim material_requirements" ON public.material_requirements;
-CREATE POLICY "Akses tim material_requirements" ON public.material_requirements FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Auth_access_material_requirements" ON public.material_requirements 
+    TO authenticated 
+    USING (auth.uid() IS NOT NULL) 
+    WITH CHECK (auth.uid() IS NOT NULL);
 
+-- 4. production_schedules
 DROP POLICY IF EXISTS "Akses tim production_schedules" ON public.production_schedules;
-CREATE POLICY "Akses tim production_schedules" ON public.production_schedules FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Auth_access_production_schedules" ON public.production_schedules 
+    TO authenticated 
+    USING (auth.uid() IS NOT NULL) 
+    WITH CHECK (auth.uid() IS NOT NULL);
 
+-- 5. master_materials
 DROP POLICY IF EXISTS "Akses tim master_materials" ON public.master_materials;
-CREATE POLICY "Akses tim master_materials" ON public.master_materials FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Auth_access_master_materials" ON public.master_materials 
+    TO authenticated 
+    USING (auth.uid() IS NOT NULL) 
+    WITH CHECK (auth.uid() IS NOT NULL);
 
+-- 6. warehouse_stock
 DROP POLICY IF EXISTS "Akses tim warehouse_stock" ON public.warehouse_stock;
-CREATE POLICY "Akses tim warehouse_stock" ON public.warehouse_stock FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Auth_access_warehouse_stock" ON public.warehouse_stock 
+    TO authenticated 
+    USING (auth.uid() IS NOT NULL) 
+    WITH CHECK (auth.uid() IS NOT NULL);
 
+-- 7. deletion_history
 DROP POLICY IF EXISTS "Akses tim deletion_history" ON public.deletion_history;
-CREATE POLICY "Akses tim deletion_history" ON public.deletion_history FOR ALL USING (true) WITH CHECK (true);
+DROP POLICY IF EXISTS "Auth_access_deletion_history" ON public.deletion_history 
+    TO authenticated 
+    USING (auth.uid() IS NOT NULL) 
+    WITH CHECK (auth.uid() IS NOT NULL);
 
 -- ==============================================================================
 -- FUNGSI RPC SERVER-SIDE AGGREGATION UNTUK DASHBOARD (HIGH-PERFORMANCE)

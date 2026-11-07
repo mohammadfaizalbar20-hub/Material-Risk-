@@ -1,4 +1,4 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useEffect } from 'react';
 import { usePpic } from '../../context/PpicContext';
 import * as XLSX from 'xlsx';
 import {
@@ -24,6 +24,16 @@ import {
   X,
 } from 'lucide-react';
 import { parseExcelRowsToMaterials } from '../../utils/excelMaterialParser';
+import {
+  UploadResumeCheckpoint,
+  getCheckpointMeta,
+  saveCheckpointMeta,
+  clearPendingUpload,
+  getPendingUploadRows,
+  savePendingUploadRows,
+  validateFileMatchWithCheckpoint,
+} from '../../utils/uploadOfflineStorage';
+import { generateDeterministicRowUuid } from '../../lib/supabase';
 
 export const UploadExcelView: React.FC = () => {
   const {
@@ -78,29 +88,91 @@ export const UploadExcelView: React.FC = () => {
   } | null>(null);
 
   // Resume checkpoint state for interrupted high-volume uploads (20,000+ rows)
-  const [resumeCheckpoint, setResumeCheckpoint] = useState<{
-    uploadId: string;
-    startRowIndex: number;
-    preparedRequirements?: any[];
-    failedBatch?: number;
-    failingRange?: string;
-    totalRows?: number;
-    error?: string;
-  } | null>(() => {
-    try {
-      const saved = sessionStorage.getItem('PPIC_UPLOAD_RESUME_CHECKPOINT');
-      return saved ? JSON.parse(saved) : null;
-    } catch {
-      return null;
-    }
+  const [resumeCheckpoint, setResumeCheckpoint] = useState<UploadResumeCheckpoint | null>(() => {
+    return getCheckpointMeta();
   });
 
-  const clearResumeCheckpoint = () => {
+  const clearResumeCheckpoint = async () => {
+    if (resumeCheckpoint?.uploadId) {
+      await clearPendingUpload(resumeCheckpoint.uploadId);
+    }
     setResumeCheckpoint(null);
-    try {
-      sessionStorage.removeItem('PPIC_UPLOAD_RESUME_CHECKPOINT');
-    } catch {}
   };
+
+  // Restore pending upload session from IndexedDB across browser refresh
+  useEffect(() => {
+    async function restorePendingSession() {
+      const meta = getCheckpointMeta();
+      if (!meta) return;
+
+      setResumeCheckpoint(meta);
+
+      try {
+        const cachedRows = await getPendingUploadRows(meta.uploadId);
+        if (cachedRows && cachedRows.length > 0) {
+          setOrNumber(meta.orNumber);
+          setStyle(meta.style);
+          setUpdateDate(meta.updateDate);
+          setFileName(meta.fileName);
+
+          const rowsWithStatus = cachedRows.map((r, idx) => {
+            const shortage = (r.receivedQty ?? 0) - (r.requiredQty ?? 0);
+            const isReady = shortage >= 0;
+            return {
+              ...r,
+              id: r.id || generateDeterministicRowUuid(meta.uploadId, idx),
+              shortage,
+              isReady,
+              statusLabel: isReady ? 'READY' : 'BELUM READY',
+            };
+          });
+
+          const totalRequired = rowsWithStatus.reduce((acc, r) => acc + (r.requiredQty || 0), 0);
+          const totalReceived = rowsWithStatus.reduce((acc, r) => acc + (r.receivedQty || 0), 0);
+
+          setPreviewData({
+            fileName: meta.fileName,
+            orNumber: meta.orNumber,
+            style: meta.style,
+            updateDate: meta.updateDate,
+            rows: rowsWithStatus,
+            parsedResult: {
+              requirements: rowsWithStatus,
+              newMasterMaterials: [],
+              relations: [
+                {
+                  id: `rel-${meta.uploadId}`,
+                  orNumber: meta.orNumber,
+                  style: meta.style,
+                  createdAt: meta.savedAt || new Date().toISOString(),
+                },
+              ],
+            },
+            summary: {
+              totalRows: rowsWithStatus.length,
+              validRows: rowsWithStatus.length,
+              failedRows: 0,
+              totalRequired,
+              totalReceived,
+            },
+          });
+
+          setStatusMessage(
+            `Sesi upload tertunda dipulihkan dari memori browser: "${meta.fileName}" (${meta.startRowIndex.toLocaleString('id-ID')} dari ${meta.totalRows.toLocaleString('id-ID')} baris tersimpan). Anda dapat langsung melanjutkan upload.`
+          );
+        } else {
+          // If rows are not cached in IndexedDB, prompt the user to re-select the exact same file
+          setStatusMessage(
+            `Sesi upload tertunda terdeteksi (Upload ID: ${meta.uploadId}). Silakan pilih kembali berkas "${meta.fileName}" untuk melanjutkan dari baris ${(meta.startRowIndex + 1).toLocaleString('id-ID')}.`
+          );
+        }
+      } catch (err) {
+        console.warn('Gagal memulihkan sesi upload tertunda dari IndexedDB:', err);
+      }
+    }
+
+    restorePendingSession();
+  }, []);
 
   // Riwayat Upload Search Input (Typed manual search - Single source of truth)
   const [historySearchInput, setHistorySearchInput] = useState<string>('');
@@ -241,11 +313,32 @@ export const UploadExcelView: React.FC = () => {
         const cleanStyle = style.trim();
         const result = parseExcelRowsToMaterials(rawJson, materials, cleanOr, cleanStyle, updateDate);
 
-        const rowsWithStatus = result.requirements.map((r) => {
+        // Validation against pending checkpoint if user is resuming after refresh
+        if (resumeCheckpoint) {
+          const fileMatch = validateFileMatchWithCheckpoint(
+            file,
+            result.requirements.length,
+            cleanOr,
+            resumeCheckpoint
+          );
+          if (!fileMatch.isValid) {
+            setErrorMessage(
+              `[Validasi Berkas Gagal] ${fileMatch.reason} Untuk melanjutkan sesi upload tertunda, berkas harus memiliki Nomor OR dan jumlah baris yang identik, atau batalkan sesi tertunda terlebih dahulu.`
+            );
+            setIsProcessing(false);
+            return;
+          }
+        }
+
+        const targetUploadId = resumeCheckpoint?.uploadId || `upload-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+
+        const rowsWithStatus = result.requirements.map((r, idx) => {
           const shortage = r.receivedQty - r.requiredQty;
           const isReady = shortage >= 0;
           return {
             ...r,
+            id: r.id && !r.id.startsWith('temp-') ? r.id : generateDeterministicRowUuid(targetUploadId, idx),
+            uploadId: targetUploadId,
             orNumber: cleanOr,
             style: cleanStyle,
             shortage,
@@ -257,6 +350,11 @@ export const UploadExcelView: React.FC = () => {
         const totalRequired = rowsWithStatus.reduce((acc, r) => acc + (r.requiredQty || 0), 0);
         const totalReceived = rowsWithStatus.reduce((acc, r) => acc + (r.receivedQty || 0), 0);
         const failedRows = Math.max(0, rawJson.length - rowsWithStatus.length);
+
+        // Save prepared rows to IndexedDB so they survive page reload
+        savePendingUploadRows(targetUploadId, rowsWithStatus).catch((err) =>
+          console.warn('Gagal menyimpan rows ke IndexedDB:', err)
+        );
 
         // Tahap 3: Set preview data (Database remains untouched!)
         setPreviewData({
@@ -279,7 +377,11 @@ export const UploadExcelView: React.FC = () => {
         });
 
         setIsProcessing(false);
-        setStatusMessage(null);
+        setStatusMessage(
+          resumeCheckpoint
+            ? `Berkas terverifikasi cocok dengan sesi tertunda (${cleanOr}, ${rowsWithStatus.length.toLocaleString('id-ID')} baris). Anda dapat melanjutkan upload mulai dari baris ${(resumeCheckpoint.startRowIndex + 1).toLocaleString('id-ID')}.`
+            : null
+        );
       } catch (err: any) {
         console.error(err);
         setIsProcessing(false);
@@ -336,7 +438,10 @@ export const UploadExcelView: React.FC = () => {
       });
 
       if (res.success) {
-        clearResumeCheckpoint();
+        const finishedUploadId = checkpointToUse?.uploadId || res.uploadId || previewData.parsedResult.requirements[0]?.uploadId || '';
+        await clearPendingUpload(finishedUploadId);
+        setResumeCheckpoint(null);
+
         const savedCount = previewData.rows.length;
         const savedOr = previewData.orNumber;
         const savedDate = previewData.updateDate;
@@ -360,22 +465,27 @@ export const UploadExcelView: React.FC = () => {
         });
 
         if (res.failedRowIndex !== undefined && res.uploadId) {
-          const nextCheckpoint = {
+          const nextCheckpoint: UploadResumeCheckpoint = {
             uploadId: res.uploadId,
+            fileName: previewData.fileName,
+            orNumber: previewData.orNumber,
+            style: previewData.style,
+            updateDate: previewData.updateDate,
             startRowIndex: res.failedRowIndex,
-            preparedRequirements: res.preparedRequirements || checkpointToUse?.preparedRequirements,
-            failedBatch: res.failedBatch,
+            failedBatch: res.failedBatch || 1,
+            totalBatches: Math.ceil(previewData.rows.length / 500) || 1,
             totalRows: previewData.rows.length,
+            failingRange: `Baris ${(res.failedRowIndex + 1).toLocaleString('id-ID')} - ${Math.min(res.failedRowIndex + 500, previewData.rows.length).toLocaleString('id-ID')}`,
             error: res.error,
+            savedAt: new Date().toISOString(),
           };
+
           setResumeCheckpoint(nextCheckpoint);
-          try {
-            sessionStorage.setItem('PPIC_UPLOAD_RESUME_CHECKPOINT', JSON.stringify(nextCheckpoint));
-          } catch (e) {
-            console.warn('SessionStorage setItem warning:', e);
-          }
+          saveCheckpointMeta(nextCheckpoint);
+          await savePendingUploadRows(nextCheckpoint.uploadId, previewData.parsedResult.requirements);
+
           setErrorMessage(
-            `Penyimpanan terhenti di batch ${res.failedBatch || '?'}. ${res.totalInserted || 0} baris telah tersimpan. Anda dapat menekan tombol "Lanjutkan Upload (Resume)" untuk meneruskan tanpa duplikasi.`
+            `Penyimpanan terhenti di batch ${res.failedBatch || '?'}. ${res.totalInserted || 0} baris telah tersimpan dengan aman di Supabase. Anda dapat menekan tombol "Lanjutkan Upload (Resume)" untuk meneruskan tanpa duplikasi.`
           );
         } else {
           setErrorMessage(
