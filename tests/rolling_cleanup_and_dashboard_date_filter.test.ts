@@ -15,17 +15,19 @@ import {
 } from '../src/utils/ppicCalculations';
 import { MaterialItemRequirement, UploadHistoryItem } from '../src/types/ppic';
 
+const jakartaDateFormatter = new Intl.DateTimeFormat('en-CA', {
+  timeZone: 'Asia/Jakarta',
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+});
+
 // Helper to convert ISO string to Asia/Jakarta YYYY-MM-DD
 function toJakartaDate(dateVal?: string | Date | null): string {
   if (!dateVal) return '';
   const d = typeof dateVal === 'string' ? new Date(dateVal) : dateVal;
   if (isNaN(d.getTime())) return '';
-  return new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'Asia/Jakarta',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  }).format(d);
+  return jakartaDateFormatter.format(d);
 }
 
 // ============================================================================
@@ -51,9 +53,12 @@ test('Suite 1.1: SQL skrip rolling 4 hari memuat fungsi, tabel log, dan pg_cron 
   assert.ok(sql.includes("NOW() - INTERVAL '4 days'"), 'Cutoff wajib tepat 4 hari (96 jam)');
   assert.ok(sql.includes('SET search_path = public, pg_temp'), 'SECURITY DEFINER wajib memiliki search_path aman (public, pg_temp)');
   assert.ok(sql.includes("status NOT IN ('Melanjutkan Upload...', 'Sedang Berjalan')"), 'Upload aktif/resuming TIDAK boleh dihapus');
-  assert.ok(sql.includes("status IN ('Sukses', 'Gagal Sebagian', 'Gagal', 'Peringatan')"), 'Upload sukses, partial tidak aktif, dan gagal lama harus dibersihkan');
+  assert.ok(sql.includes("status IN ('Gagal Sebagian', 'Gagal', 'Peringatan')"), 'Upload partial tidak aktif dan gagal lama harus dibersihkan');
+  assert.ok(sql.includes('COALESCE(uh.updated_at, uh.created_at) < v_cutoff'), 'Wajib memeriksa waktu aktivitas terakhir updated_at');
+  assert.ok(sql.includes('NOT EXISTS'), 'Wajib memverifikasi tidak ada baris material baru dalam 96 jam');
   assert.ok(sql.includes('WHERE upload_id = ANY(v_target_upload_ids)'), 'Hapus detail material terkait upload_id');
   assert.ok(sql.includes('WHERE id = ANY(v_target_upload_ids)'), 'Hapus riwayat upload terkait');
+  assert.ok(sql.includes('RAISE EXCEPTION'), 'Harus melempar kembali exception agar pg_cron mencatat status FAILED');
 
   // 4. Verifikasi pencabutan hak akses EXECUTE (Hardened Security)
   assert.ok(sql.includes('REVOKE ALL ON FUNCTION public.cleanup_old_uploads_rolling_4days() FROM PUBLIC;'), 'Hak ALL harus dicabut dari PUBLIC');
@@ -62,7 +67,11 @@ test('Suite 1.1: SQL skrip rolling 4 hari memuat fungsi, tabel log, dan pg_cron 
   assert.ok(sql.includes('GRANT EXECUTE ON FUNCTION public.cleanup_old_uploads_rolling_4days() TO postgres;'), 'Hak EXECUTE hanya diberikan ke postgres (pg_cron)');
   assert.ok(sql.includes('GRANT EXECUTE ON FUNCTION public.cleanup_old_uploads_rolling_4days() TO service_role;'), 'Hak EXECUTE dapat diberikan ke service_role');
 
-  // 5. Verifikasi ekstensi dan jadwal cron
+  // 5. Verifikasi kolom updated_at dan trigger otomatis
+  assert.ok(sql.includes('ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()'), 'Harus menambahkan kolom updated_at');
+  assert.ok(sql.includes('trg_upload_history_updated_at'), 'Harus mendaftarkan trigger updated_at');
+
+  // 6. Verifikasi ekstensi dan jadwal cron
   assert.ok(sql.includes('CREATE EXTENSION IF NOT EXISTS pg_cron;'), 'Harus mengaktifkan ekstensi pg_cron');
   assert.ok(sql.includes('cron.schedule'), 'Harus mendaftarkan jadwal cron di PostgreSQL');
   assert.ok(sql.includes('*/15 * * * *'), 'Jadwal cron harus setiap 15 menit agar pembersihan tepat waktu');
@@ -84,10 +93,11 @@ test('Suite 1.2: Simulasi Logika Rolling 4 Hari — Upload sukses, partial lama,
   const now = new Date('2026-11-07T12:00:00Z'); // Waktu simulasi: 7 Nov 2026 12:00
   const cutoffTime = new Date(now.getTime() - 4 * 24 * 60 * 60 * 1000); // 3 Nov 2026 12:00:00Z (Tepat 96 jam)
 
-  // Kumpulan riwayat upload dengan variasi umur dan status
+  // Kumpulan riwayat upload dengan variasi umur, status, dan timestamp aktivitas (updated_at)
   const uploads: Array<{
     id: string;
     createdAt: Date;
+    updatedAt?: Date;
     status: string;
     rowCount: number;
     uploadName: string;
@@ -95,6 +105,7 @@ test('Suite 1.2: Simulasi Logika Rolling 4 Hari — Upload sukses, partial lama,
     {
       id: 'up-1-old-success',
       createdAt: new Date('2026-11-01T10:00:00Z'), // 6 hari lalu (> 96 jam)
+      updatedAt: new Date('2026-11-01T10:00:00Z'),
       status: 'Sukses',
       rowCount: 20000,
       uploadName: 'Upload Sukses 6 Hari Lalu',
@@ -102,6 +113,7 @@ test('Suite 1.2: Simulasi Logika Rolling 4 Hari — Upload sukses, partial lama,
     {
       id: 'up-2-old-inprogress',
       createdAt: new Date('2026-11-02T10:00:00Z'), // 5 hari lalu tapi proses resume aktif
+      updatedAt: new Date('2026-11-07T11:50:00Z'),
       status: 'Melanjutkan Upload...',
       rowCount: 5000,
       uploadName: 'Upload Sedang Di-resume',
@@ -109,6 +121,7 @@ test('Suite 1.2: Simulasi Logika Rolling 4 Hari — Upload sukses, partial lama,
     {
       id: 'up-3-old-partial',
       createdAt: new Date('2026-11-02T15:00:00Z'), // 5 hari lalu (> 96 jam) dan ditinggalkan (gagal sebagian tidak aktif)
+      updatedAt: new Date('2026-11-02T15:00:00Z'),
       status: 'Gagal Sebagian',
       rowCount: 8000,
       uploadName: 'Upload Gagal Sebagian Lama',
@@ -116,6 +129,7 @@ test('Suite 1.2: Simulasi Logika Rolling 4 Hari — Upload sukses, partial lama,
     {
       id: 'up-4-old-failed',
       createdAt: new Date('2026-11-01T08:00:00Z'), // 6 hari lalu (> 96 jam), gagal total
+      updatedAt: new Date('2026-11-01T08:00:00Z'),
       status: 'Gagal',
       rowCount: 0,
       uploadName: 'Upload Gagal Lama',
@@ -123,6 +137,7 @@ test('Suite 1.2: Simulasi Logika Rolling 4 Hari — Upload sukses, partial lama,
     {
       id: 'up-5-retained-3days',
       createdAt: new Date('2026-11-04T08:00:00Z'), // 3 hari lalu (< 96 jam)
+      updatedAt: new Date('2026-11-04T08:00:00Z'),
       status: 'Sukses',
       rowCount: 20000,
       uploadName: 'Upload Day 4 (Masih Berlaku)',
@@ -130,6 +145,7 @@ test('Suite 1.2: Simulasi Logika Rolling 4 Hari — Upload sukses, partial lama,
     {
       id: 'up-6-retained-2days',
       createdAt: new Date('2026-11-05T08:00:00Z'), // 2 hari lalu (< 96 jam)
+      updatedAt: new Date('2026-11-05T08:00:00Z'),
       status: 'Sukses',
       rowCount: 20000,
       uploadName: 'Upload Day 5 (Masih Berlaku)',
@@ -137,6 +153,7 @@ test('Suite 1.2: Simulasi Logika Rolling 4 Hari — Upload sukses, partial lama,
     {
       id: 'up-7-retained-today',
       createdAt: new Date('2026-11-07T08:00:00Z'), // Hari ini (< 4 jam)
+      updatedAt: new Date('2026-11-07T08:00:00Z'),
       status: 'Sukses',
       rowCount: 20000,
       uploadName: 'Upload Hari Ini',
@@ -144,9 +161,18 @@ test('Suite 1.2: Simulasi Logika Rolling 4 Hari — Upload sukses, partial lama,
     {
       id: 'up-8-active-running',
       createdAt: new Date('2026-11-07T11:30:00Z'), // 30 menit lalu, sedang berjalan
+      updatedAt: new Date('2026-11-07T11:30:00Z'),
       status: 'Sedang Berjalan',
       rowCount: 12000,
       uploadName: 'Upload Sedang Berjalan',
+    },
+    {
+      id: 'up-9-resumed-partial-active',
+      createdAt: new Date('2026-11-02T10:00:00Z'), // Dibuat 5 hari lalu, status Gagal Sebagian, tapi BARU SAJA di-resume (updated_at 10 menit lalu)
+      updatedAt: new Date('2026-11-07T11:50:00Z'), // Aktif baru saja disentuh
+      status: 'Gagal Sebagian',
+      rowCount: 6000,
+      uploadName: 'Upload Gagal Sebagian Sedang Aktif Di-resume',
     },
   ];
 
@@ -155,6 +181,7 @@ test('Suite 1.2: Simulasi Logika Rolling 4 Hari — Upload sukses, partial lama,
     id: string;
     uploadId: string | null;
     createdAt: Date;
+    updatedAt?: Date;
     materialCode: string;
   }> = [];
 
@@ -165,6 +192,7 @@ test('Suite 1.2: Simulasi Logika Rolling 4 Hari — Upload sukses, partial lama,
         id: `mat-${u.id}-${i}`,
         uploadId: u.id,
         createdAt: u.createdAt,
+        updatedAt: u.updatedAt,
         materialCode: `MAT-${i}`,
       });
     }
@@ -180,18 +208,36 @@ test('Suite 1.2: Simulasi Logika Rolling 4 Hari — Upload sukses, partial lama,
     });
   }
 
-  // --- JALANKAN LOGIKA FUNGSI PEMBERSIHAN ROLLING 4 HARI REVISI ---
+  // --- JALANKAN LOGIKA FUNGSI PEMBERSIHAN ROLLING 4 HARI DENGAN PERLINDUNGAN DUAL-LAYER ---
   // Syarat:
-  // 1. created_at < cutoffTime (berumur > 96 jam)
-  // 2. id IS NOT NULL
-  // 3. status NOT IN ('Melanjutkan Upload...', 'Sedang Berjalan') -> perlindungan upload aktif
-  // 4. status IN ('Sukses', 'Gagal Sebagian', 'Gagal', 'Peringatan') -> membersihkan data selesai atau gagal lama
+  // 1. uh.created_at < cutoffTime (berumur > 96 jam)
+  // 2. uh.id IS NOT NULL
+  // 3. uh.status NOT IN ('Melanjutkan Upload...', 'Sedang Berjalan')
+  // 4. (uh.status = 'Sukses') OR (
+  //      uh.status IN ('Gagal Sebagian', 'Gagal', 'Peringatan')
+  //      AND COALESCE(uh.updated_at, uh.created_at) < cutoffTime
+  //      AND NOT EXISTS material_requirements dengan COALESCE(mr.updated_at, mr.created_at) >= cutoffTime
+  //    )
   const targetUploadIds = uploads
     .filter((u) => {
       const isOlderThan96h = u.createdAt < cutoffTime;
-      const isNotActive = !['Melanjutkan Upload...', 'Sedang Berjalan'].includes(u.status);
-      const isEligibleStatus = ['Sukses', 'Gagal Sebagian', 'Gagal', 'Peringatan'].includes(u.status);
-      return isOlderThan96h && u.id !== null && isNotActive && isEligibleStatus;
+      const isNotExplicitlyRunning = !['Melanjutkan Upload...', 'Sedang Berjalan'].includes(u.status);
+      if (!isOlderThan96h || !u.id || !isNotExplicitlyRunning) return false;
+
+      if (u.status === 'Sukses') {
+        return true;
+      }
+
+      if (['Gagal Sebagian', 'Gagal', 'Peringatan'].includes(u.status)) {
+        const lastActivity = u.updatedAt || u.createdAt;
+        const uploadActivityOlderThanCutoff = lastActivity < cutoffTime;
+        const hasRecentMaterialActivity = materials.some(
+          (m) => m.uploadId === u.id && ((m.updatedAt || m.createdAt) >= cutoffTime)
+        );
+        return uploadActivityOlderThanCutoff && !hasRecentMaterialActivity;
+      }
+
+      return false;
     })
     .map((u) => u.id);
 
@@ -199,7 +245,7 @@ test('Suite 1.2: Simulasi Logika Rolling 4 Hari — Upload sukses, partial lama,
   assert.deepEqual(
     targetUploadIds.sort(),
     ['up-1-old-success', 'up-3-old-partial', 'up-4-old-failed'].sort(),
-    'Upload sukses > 96h, partial lama > 96h, dan gagal lama > 96h harus terjaring untuk pembersihan'
+    'Upload sukses > 96h, partial DITINGGALKAN > 96h, dan gagal lama > 96h harus terjaring untuk pembersihan'
   );
 
   // Lakukan penghapusan transaksional
@@ -210,12 +256,16 @@ test('Suite 1.2: Simulasi Logika Rolling 4 Hari — Upload sukses, partial lama,
   const remainingUploads = uploads.filter((u) => !targetUploadIds.includes(u.id));
 
   // Assertions:
-  assert.equal(deletedUploads.length, 3, '3 upload berumur > 96 jam (sukses, partial lama, gagal lama) harus terhapus');
+  assert.equal(deletedUploads.length, 3, '3 upload berumur > 96 jam (sukses, partial ditinggalkan, gagal lama) harus terhapus');
   assert.equal(deletedMaterials.length, 30, '30 baris material terkait upload lama harus terhapus secara atomik');
 
   // Pastikan upload sedang berjalan & sedang di-resume TIDAK terhapus
-  assert.ok(remainingUploads.some((u) => u.id === 'up-2-old-inprogress'), 'Upload sedang di-resume tidak boleh dihapus');
+  assert.ok(remainingUploads.some((u) => u.id === 'up-2-old-inprogress'), 'Upload status Melanjutkan Upload... tidak boleh dihapus');
   assert.ok(remainingUploads.some((u) => u.id === 'up-8-active-running'), 'Upload sedang berjalan tidak boleh dihapus');
+  assert.ok(
+    remainingUploads.some((u) => u.id === 'up-9-resumed-partial-active'),
+    'Upload Gagal Sebagian yang sedang aktif di-resume (updated_at baru) TIDAK boleh dihapus'
+  );
 
   // Pastikan upload umur < 96 jam tetap utuh
   assert.ok(remainingUploads.some((u) => u.id === 'up-5-retained-3days'), 'Upload 3 hari lalu harus tetap ada');

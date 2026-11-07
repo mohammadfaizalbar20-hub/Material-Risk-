@@ -384,6 +384,7 @@ export function mapDbUploadHistoryToModel(row: any): UploadHistoryItem {
     status: row.status,
     notes: row.notes || undefined,
     createdAt: row.created_at,
+    updatedAt: row.updated_at || row.created_at,
   };
 }
 
@@ -769,6 +770,7 @@ export async function syncBatchExcelToSupabaseWithProgress(
         .update({
           status: 'Melanjutkan Upload...',
           notes: `Melanjutkan penyimpanan dari baris ${((params.resumeCheckpoint?.startRowIndex || 0) + 1).toLocaleString('id-ID')}...`,
+          updated_at: new Date().toISOString(),
         })
         .eq('id', generatedUploadId);
     }
@@ -843,6 +845,7 @@ export async function syncBatchExcelToSupabaseWithProgress(
             status: 'Gagal Sebagian',
             notes: `Gagal pada batch ${batchNum}/${totalBatches} (${failingRangeStr}). Tersimpan ${totalInserted} dari ${totalRows} baris. Dapat dilanjutkan (resume).`,
             row_count: totalInserted,
+            updated_at: new Date().toISOString(),
           })
           .eq('id', generatedUploadId);
 
@@ -868,6 +871,7 @@ export async function syncBatchExcelToSupabaseWithProgress(
         status: 'Sukses',
         row_count: totalInserted,
         notes: `Berhasil tersimpan ${totalInserted} baris material.`,
+        updated_at: new Date().toISOString(),
       })
       .eq('id', generatedUploadId);
 

@@ -28,10 +28,12 @@ CREATE TABLE IF NOT EXISTS public.upload_history (
     row_count INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'Sukses',
     notes TEXT,
-    created_at TIMESTAMPTZ DEFAULT NOW()
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_upload_history_or ON public.upload_history(or_number);
 CREATE INDEX IF NOT EXISTS idx_upload_history_date ON public.upload_history(update_date);
+CREATE INDEX IF NOT EXISTS idx_upload_hist_updated ON public.upload_history(updated_at DESC);
 
 -- 4. TABEL: material_requirements (Detail Kebutuhan & Penerimaan Material)
 CREATE TABLE IF NOT EXISTS public.material_requirements (
@@ -163,7 +165,25 @@ BEGIN
   ALTER TABLE IF EXISTS public.deletion_history ALTER COLUMN method_label TYPE TEXT;
   ALTER TABLE IF EXISTS public.deletion_history ALTER COLUMN target_value TYPE TEXT;
   ALTER TABLE IF EXISTS public.deletion_history ALTER COLUMN operator_user TYPE TEXT;
+
+  -- Kolom updated_at untuk indikator aktivitas upload_history (Perlindungan Resume Aktif)
+  ALTER TABLE IF EXISTS public.upload_history ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW();
 END $$;
+
+-- Trigger otomatis untuk memperbarui updated_at setiap kali ada aktivitas update pada upload_history
+CREATE OR REPLACE FUNCTION public.trg_set_upload_history_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+    NEW.updated_at = NOW();
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_upload_history_updated_at ON public.upload_history;
+CREATE TRIGGER trg_upload_history_updated_at
+BEFORE UPDATE ON public.upload_history
+FOR EACH ROW
+EXECUTE FUNCTION public.trg_set_upload_history_updated_at();
 
 -- ==============================================================================
 -- ROW LEVEL SECURITY (RLS) POLICIES
@@ -369,21 +389,34 @@ DECLARE
     v_log_id UUID;
 BEGIN
     -- 1. Cari upload_history yang berumur > 4 hari (96 jam sejak created_at)
-    -- Syarat ketat:
+    -- Syarat & Perlindungan Ketat:
     -- - Upload 'Sukses' yang berumur > 96 jam dihapus
-    -- - Upload 'Gagal Sebagian' yang sudah tidak aktif (> 96 jam) dan upload 'Gagal' lama juga dibersihkan
-    -- - JANGAN PERNAH menghapus upload yang sedang berjalan atau memiliki proses resume aktif ('Melanjutkan Upload...', 'Sedang Berjalan')
-    -- - upload_id harus terisi dan valid
-    SELECT ARRAY_AGG(id) INTO v_target_upload_ids
-    FROM public.upload_history
-    WHERE created_at < v_cutoff
-      AND id IS NOT NULL
-      AND status NOT IN ('Melanjutkan Upload...', 'Sedang Berjalan')
-      AND status IN ('Sukses', 'Gagal Sebagian', 'Gagal', 'Peringatan');
+    -- - Upload 'Melanjutkan Upload...' atau 'Sedang Berjalan' JANGAN PERNAH dihapus (sedang aktif)
+    -- - Upload 'Gagal Sebagian' / 'Gagal' / 'Peringatan' HANYA dihapus jika BENAR-BENAR DITINGGALKAN:
+    --   (1) Tidak ada update aktivitas pada upload_history dalam 96 jam terakhir (updated_at < cutoff), DAN
+    --   (2) Tidak ada baris material_requirements yang baru ditambahkan/diperbarui dalam 96 jam terakhir
+    SELECT ARRAY_AGG(uh.id) INTO v_target_upload_ids
+    FROM public.upload_history uh
+    WHERE uh.created_at < v_cutoff
+      AND uh.id IS NOT NULL
+      AND uh.status NOT IN ('Melanjutkan Upload...', 'Sedang Berjalan')
+      AND (
+          (uh.status = 'Sukses')
+          OR
+          (
+              uh.status IN ('Gagal Sebagian', 'Gagal', 'Peringatan')
+              AND COALESCE(uh.updated_at, uh.created_at) < v_cutoff
+              AND NOT EXISTS (
+                  SELECT 1 
+                  FROM public.material_requirements mr 
+                  WHERE mr.upload_id = uh.id 
+                    AND (COALESCE(mr.updated_at, mr.created_at) >= v_cutoff)
+              )
+          )
+      );
 
     IF v_target_upload_ids IS NOT NULL AND array_length(v_target_upload_ids, 1) > 0 THEN
-        -- 2. Hapus detail material_requirements yang terkait dengan upload_id tersebut
-        -- (Seluruh baris dalam upload terkait dibersihkan secara atomik tanpa sisa yatim)
+        -- 2. Hapus detail material_requirements yang terkait dengan upload_id tersebut terlebih dahulu
         WITH deleted_mats AS (
             DELETE FROM public.material_requirements
             WHERE upload_id = ANY(v_target_upload_ids)
@@ -391,7 +424,7 @@ BEGIN
         )
         SELECT COUNT(*) INTO v_deleted_materials FROM deleted_mats;
 
-        -- 3. Hapus riwayat upload terkait agar tidak meninggalkan data yatim
+        -- 3. Hapus riwayat upload terkait
         WITH deleted_ups AS (
             DELETE FROM public.upload_history
             WHERE id = ANY(v_target_upload_ids)
@@ -431,25 +464,29 @@ BEGIN
         'affected_upload_ids', v_target_upload_ids
     );
 EXCEPTION WHEN OTHERS THEN
-    INSERT INTO public.ppic_cleanup_log (
-        executed_at,
-        cutoff_time,
-        deleted_uploads_count,
-        deleted_materials_count,
-        notes,
-        status
-    ) VALUES (
-        NOW(),
-        v_cutoff,
-        0,
-        0,
-        'Gagal mengeksekusi rolling 4 hari: ' || SQLERRM,
-        'FAILED'
-    );
-    RETURN json_build_object(
-        'success', false,
-        'error', SQLERRM
-    );
+    -- Catat error ke tabel ppic_cleanup_log
+    BEGIN
+        INSERT INTO public.ppic_cleanup_log (
+            executed_at,
+            cutoff_time,
+            deleted_uploads_count,
+            deleted_materials_count,
+            notes,
+            status
+        ) VALUES (
+            NOW(),
+            v_cutoff,
+            0,
+            0,
+            'Gagal mengeksekusi rolling 4 hari: ' || SQLERRM,
+            'FAILED'
+        );
+    EXCEPTION WHEN OTHERS THEN
+        NULL;
+    END;
+
+    -- Lempar kembali exception agar pg_cron mencatat eksekusi sebagai FAILED di cron.job_run_details
+    RAISE EXCEPTION 'Cleanup rolling 4 hari gagal: %', SQLERRM;
 END;
 $$;
 

@@ -77,6 +77,7 @@ export interface UploadHistoryItem {
   status: 'Sukses' | 'Peringatan' | 'Gagal' | 'Gagal Sebagian' | 'Melanjutkan Upload...';
   notes?: string;
   createdAt?: string; // Timestamp waktu simpan/upload di database Supabase (TIMESTAMPTZ)
+  updatedAt?: string; // Timestamp waktu update/resume terakhir di database Supabase (TIMESTAMPTZ)
 }
 
 export interface ScheduleConflict {
