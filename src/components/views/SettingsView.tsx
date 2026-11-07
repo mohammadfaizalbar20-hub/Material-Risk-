@@ -7,11 +7,13 @@ import {
   cleanSupabaseUrl,
   fetchDatabaseStorageStatsFromSupabase,
   DatabaseStorageStats,
+  fetchCleanupLogsFromSupabase,
 } from '../../lib/supabase';
 import {
   PPIC_SUPABASE_SCHEMA_SQL,
   PPIC_SUPABASE_MIGRATION_WIDEN_TEXT_SQL,
   PPIC_SUPABASE_HIGH_VOLUME_SCALE_SQL,
+  PPIC_SUPABASE_ROLLING_4DAYS_CLEANUP_SQL,
 } from '../../lib/supabaseSchemaSql';
 import {
   Settings,
@@ -66,6 +68,8 @@ export const SettingsView: React.FC = () => {
   const [copiedSql, setCopiedSql] = useState(false);
   const [copiedAlterSql, setCopiedAlterSql] = useState(false);
   const [copiedScaleSql, setCopiedScaleSql] = useState(false);
+  const [copiedRollingSql, setCopiedRollingSql] = useState(false);
+  const [isCleaningRolling, setIsCleaningRolling] = useState(false);
   const [showAnonKey, setShowAnonKey] = useState(false);
 
   const [storageStats, setStorageStats] = useState<DatabaseStorageStats | null>(null);
@@ -883,6 +887,20 @@ export const SettingsView: React.FC = () => {
                 <button
                   type="button"
                   onClick={() => {
+                    navigator.clipboard.writeText(PPIC_SUPABASE_ROLLING_4DAYS_CLEANUP_SQL);
+                    setCopiedRollingSql(true);
+                    setTimeout(() => setCopiedRollingSql(false), 2000);
+                  }}
+                  className="px-3 py-1.5 bg-rose-600 hover:bg-rose-700 text-white rounded text-[11px] font-semibold flex items-center gap-1.5 cursor-pointer shadow-xs transition-colors"
+                  title="Salin skrip SQL otomatisasi rolling 4 hari (tabel log, fungsi transaksional, dan jadwal pg_cron)"
+                >
+                  {copiedRollingSql ? <Check className="w-3.5 h-3.5 text-emerald-300" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedRollingSql ? 'SQL Rolling 4 Hari Tersalin!' : 'Salin SQL Rolling 4 Hari (1-Klik)'}</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => {
                     navigator.clipboard.writeText(PPIC_SUPABASE_HIGH_VOLUME_SCALE_SQL);
                     setCopiedScaleSql(true);
                     setTimeout(() => setCopiedScaleSql(false), 2000);
@@ -922,9 +940,10 @@ export const SettingsView: React.FC = () => {
               </div>
             </div>
             <p className="text-[11px] text-slate-400 leading-relaxed">
-              &bull; <strong>Tombol &quot;Salin Indeks Skala 20k/Hari&quot;</strong>: Mengoptimalkan database PostgreSQL dengan indeks komposit B-Tree pada kolom (<code>or_number</code>, <code>update_date</code>, <code>upload_id</code>) dan mengaktifkan RPC agregasi server-side agar query tetap berkecepatan milidetik pada jutaan baris data.<br />
+              &bull; <strong>Tombol &quot;Salin SQL Rolling 4 Hari&quot;</strong>: Mengaktifkan pembersihan otomatis Supabase berdasarkan timestamp upload database (<code>created_at &lt; NOW() - INTERVAL &#39;4 days&#39;</code>) via <code>pg_cron</code> yang berjalan di server cloud 24/7 meskipun browser ditutup.<br />
+              &bull; <strong>Tombol &quot;Salin Indeks Skala 20k/Hari&quot;</strong>: Mengoptimalkan database PostgreSQL dengan indeks komposit B-Tree pada kolom (<code>or_number</code>, <code>created_at</code>, <code>upload_id</code>) dan mengaktifkan RPC agregasi server-side agar filter Dashboard berkecepatan milidetik pada jutaan baris data.<br />
               &bull; <strong>Tombol &quot;Salin ALTER TABLE ke TEXT&quot;</strong>: Memperbarui seluruh kolom teks menjadi <code>TEXT</code> secara non-destruktif tanpa batas 255 karakter.<br />
-              &bull; <strong>Tombol &quot;Salin Seluruh Skema SQL&quot;</strong>: Membuat 5 tabel lengkap dari awal untuk database Supabase baru.
+              &bull; <strong>Tombol &quot;Salin Seluruh Skema SQL&quot;</strong>: Membuat tabel lengkap dari awal untuk database Supabase baru.
             </p>
           </div>
         )}

@@ -141,6 +141,19 @@ CREATE TABLE IF NOT EXISTS public.deletion_history (
     created_at TIMESTAMPTZ DEFAULT NOW()
 );
 
+-- 9. TABEL: ppic_cleanup_log (Audit Log Pembersihan Rolling 4 Hari)
+CREATE TABLE IF NOT EXISTS public.ppic_cleanup_log (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    executed_at TIMESTAMPTZ DEFAULT NOW(),
+    cutoff_time TIMESTAMPTZ NOT NULL,
+    deleted_uploads_count INTEGER NOT NULL DEFAULT 0,
+    deleted_materials_count INTEGER NOT NULL DEFAULT 0,
+    affected_upload_ids UUID[],
+    notes TEXT,
+    status TEXT NOT NULL DEFAULT 'SUCCESS'
+);
+CREATE INDEX IF NOT EXISTS idx_cleanup_log_time ON public.ppic_cleanup_log(executed_at DESC);
+
 -- ==============================================================================
 -- MIGRASI NON-DESTRUKTIF UNTUK DATABASE YANG SUDAH DIBUAT DENGAN VARCHAR(255)
 -- ==============================================================================
@@ -198,6 +211,7 @@ ALTER TABLE public.production_schedules ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.master_materials ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.warehouse_stock ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.deletion_history ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.ppic_cleanup_log ENABLE ROW LEVEL SECURITY;
 
 -- 1. or_style_relations
 DROP POLICY IF EXISTS "Akses tim or_style_relations" ON public.or_style_relations;
@@ -249,13 +263,19 @@ DROP POLICY IF EXISTS "Auth_access_deletion_history" ON public.deletion_history
     USING (auth.uid() IS NOT NULL) 
     WITH CHECK (auth.uid() IS NOT NULL);
 
+-- 8. ppic_cleanup_log
+DROP POLICY IF EXISTS "Auth_access_ppic_cleanup_log" ON public.ppic_cleanup_log;
+CREATE POLICY "Auth_access_ppic_cleanup_log" ON public.ppic_cleanup_log 
+    TO authenticated 
+    USING (auth.uid() IS NOT NULL) 
+    WITH CHECK (auth.uid() IS NOT NULL);
+
 -- ==============================================================================
--- FUNGSI RPC SERVER-SIDE AGGREGATION UNTUK DASHBOARD (HIGH-PERFORMANCE)
+-- FUNGSI RPC SERVER-SIDE AGGREGATION UNTUK DASHBOARD (BERDASARKAN TANGGAL UPLOAD)
 -- ==============================================================================
 CREATE OR REPLACE FUNCTION public.get_ppic_dashboard_summary(
     p_or_query TEXT DEFAULT NULL,
-    p_date_from DATE DEFAULT NULL,
-    p_date_to DATE DEFAULT NULL
+    p_upload_date DATE DEFAULT NULL
 )
 RETURNS JSON
 LANGUAGE plpgsql
@@ -264,25 +284,37 @@ AS $$
 DECLARE
     v_result JSON;
     v_clean_or TEXT := NULLIF(TRIM(p_or_query), '');
+    v_date_start TIMESTAMPTZ;
+    v_date_end TIMESTAMPTZ;
 BEGIN
+    -- Batas rentang tanggal upload konsisten dengan zona waktu Indonesia (Asia/Jakarta, WIB, UTC+7)
+    IF p_upload_date IS NOT NULL THEN
+        v_date_start := (p_upload_date::TEXT || ' 00:00:00+07')::TIMESTAMPTZ;
+        v_date_end := (p_upload_date::TEXT || ' 23:59:59.999999+07')::TIMESTAMPTZ;
+    END IF;
+
+    -- Menggunakan timestamp upload pada upload_history sebagai sumber tanggal utama melalui upload_id
     WITH filtered_data AS (
         SELECT 
-            id,
-            or_number,
-            style,
-            material_code,
-            material_name,
-            category,
-            unit,
-            required_qty,
-            received_qty,
-            GREATEST(0, required_qty - received_qty) AS deficit,
-            CASE WHEN received_qty >= required_qty THEN 1 ELSE 0 END AS is_ready,
-            update_date
-        FROM public.material_requirements
-        WHERE (v_clean_or IS NULL OR or_number ILIKE '%' || v_clean_or || '%' OR style ILIKE '%' || v_clean_or || '%')
-          AND (p_date_from IS NULL OR update_date >= p_date_from)
-          AND (p_date_to IS NULL OR update_date <= p_date_to)
+            mr.id,
+            mr.or_number,
+            mr.style,
+            mr.material_code,
+            mr.material_name,
+            mr.category,
+            mr.unit,
+            mr.required_qty,
+            mr.received_qty,
+            GREATEST(0, mr.required_qty - mr.received_qty) AS deficit,
+            CASE WHEN mr.received_qty >= mr.required_qty THEN 1 ELSE 0 END AS is_ready,
+            COALESCE(uh.created_at, mr.created_at) AS authoritative_upload_at
+        FROM public.material_requirements mr
+        LEFT JOIN public.upload_history uh ON mr.upload_id = uh.id
+        WHERE (v_clean_or IS NULL OR mr.or_number ILIKE '%' || v_clean_or || '%' OR mr.style ILIKE '%' || v_clean_or || '%')
+          AND (
+            p_upload_date IS NULL OR 
+            (COALESCE(uh.created_at, mr.created_at) >= v_date_start AND COALESCE(uh.created_at, mr.created_at) <= v_date_end)
+          )
     ),
     summary_metrics AS (
         SELECT 
@@ -345,6 +377,118 @@ BEGIN
     RETURN v_result;
 END;
 $$;
+
+-- ==============================================================================
+-- PENGHAPUSAN OTOMATIS ROLLING 4 HARI (4 x 24 JAM / 96 JAM SEJAK WAKTU UPLOAD)
+-- ==============================================================================
+CREATE OR REPLACE FUNCTION public.cleanup_old_uploads_rolling_4days()
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_cutoff TIMESTAMPTZ := NOW() - INTERVAL '4 days';
+    v_target_upload_ids UUID[];
+    v_deleted_materials INTEGER := 0;
+    v_deleted_uploads INTEGER := 0;
+    v_log_id UUID;
+BEGIN
+    -- 1. Cari upload_history yang berumur > 4 hari (96 jam sejak created_at)
+    -- Syarat ketat:
+    -- - Upload 'Sukses' yang berumur > 96 jam dihapus
+    -- - Upload 'Gagal Sebagian' yang sudah tidak aktif (> 96 jam) dan upload 'Gagal' lama juga dibersihkan
+    -- - JANGAN PERNAH menghapus upload yang sedang berjalan atau memiliki proses resume aktif ('Melanjutkan Upload...', 'Sedang Berjalan')
+    -- - upload_id harus terisi dan valid
+    SELECT ARRAY_AGG(id) INTO v_target_upload_ids
+    FROM public.upload_history
+    WHERE created_at < v_cutoff
+      AND id IS NOT NULL
+      AND status NOT IN ('Melanjutkan Upload...', 'Sedang Berjalan')
+      AND status IN ('Sukses', 'Gagal Sebagian', 'Gagal', 'Peringatan');
+
+    IF v_target_upload_ids IS NOT NULL AND array_length(v_target_upload_ids, 1) > 0 THEN
+        -- 2. Hapus detail material_requirements yang terkait dengan upload_id tersebut
+        -- (Seluruh baris dalam upload terkait dibersihkan secara atomik tanpa sisa yatim)
+        WITH deleted_mats AS (
+            DELETE FROM public.material_requirements
+            WHERE upload_id = ANY(v_target_upload_ids)
+            RETURNING id
+        )
+        SELECT COUNT(*) INTO v_deleted_materials FROM deleted_mats;
+
+        -- 3. Hapus riwayat upload terkait
+        WITH deleted_ups AS (
+            DELETE FROM public.upload_history
+            WHERE id = ANY(v_target_upload_ids)
+            RETURNING id
+        )
+        SELECT COUNT(*) INTO v_deleted_uploads FROM deleted_ups;
+    END IF;
+
+    -- 4. Catat log pembersihan agar proses dapat diverifikasi
+    INSERT INTO public.ppic_cleanup_log (
+        executed_at,
+        cutoff_time,
+        deleted_uploads_count,
+        deleted_materials_count,
+        affected_upload_ids,
+        notes,
+        status
+    ) VALUES (
+        NOW(),
+        v_cutoff,
+        v_deleted_uploads,
+        v_deleted_materials,
+        v_target_upload_ids,
+        CASE 
+            WHEN v_deleted_uploads > 0 THEN 'Pembersihan rolling 4 hari berhasil: ' || v_deleted_materials || ' baris material dari ' || v_deleted_uploads || ' sesi upload (> 96 jam) dihapus.'
+            ELSE 'Pemeriksaan rutin rolling 4 hari: Tidak ada data berumur > 96 jam yang memenuhi syarat penghapusan.'
+        END,
+        'SUCCESS'
+    ) RETURNING id INTO v_log_id;
+
+    RETURN json_build_object(
+        'success', true,
+        'log_id', v_log_id,
+        'cutoff_time', v_cutoff,
+        'deleted_uploads_count', v_deleted_uploads,
+        'deleted_materials_count', v_deleted_materials,
+        'affected_upload_ids', v_target_upload_ids
+    );
+EXCEPTION WHEN OTHERS THEN
+    INSERT INTO public.ppic_cleanup_log (
+        executed_at,
+        cutoff_time,
+        deleted_uploads_count,
+        deleted_materials_count,
+        notes,
+        status
+    ) VALUES (
+        NOW(),
+        v_cutoff,
+        0,
+        0,
+        'Gagal mengeksekusi rolling 4 hari: ' || SQLERRM,
+        'FAILED'
+    );
+    RETURN json_build_object(
+        'success', false,
+        'error', SQLERRM
+    );
+END;
+$$;
+
+-- Cabut seluruh hak EXECUTE dari PUBLIC, anon, dan authenticated untuk keamanan ketat (Mencegah pemanggilan dari browser RPC)
+REVOKE ALL ON FUNCTION public.cleanup_old_uploads_rolling_4days() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.cleanup_old_uploads_rolling_4days() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.cleanup_old_uploads_rolling_4days() FROM anon;
+REVOKE EXECUTE ON FUNCTION public.cleanup_old_uploads_rolling_4days() FROM authenticated;
+
+-- Berikan izin eksekusi hanya kepada role pemilik/administrator database (postgres dan service_role)
+-- pg_cron berjalan secara internal sebagai superuser postgres sehingga tetap dapat mengeksekusi terjadwal
+GRANT EXECUTE ON FUNCTION public.cleanup_old_uploads_rolling_4days() TO postgres;
+GRANT EXECUTE ON FUNCTION public.cleanup_old_uploads_rolling_4days() TO service_role;
 
 -- ==============================================================================
 -- FUNGSI RPC DATABASE STORAGE MONITORING (PEMANTAUAN UKURAN & PERTUMBUHAN)
@@ -427,6 +571,35 @@ BEGIN
     NULL;
   END;
 END $$;
+
+-- ==============================================================================
+-- JADWAL CRON OTOMATIS SUPABASE (pg_cron) — ROLLING 4 HARI (SETIAP 15 MENIT)
+-- ==============================================================================
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+-- Bersihkan seluruh jadwal cron lama agar tidak pernah ada duplikasi saat SQL dijalankan berulang
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN (
+        SELECT jobid FROM cron.job 
+        WHERE jobname IN ('ppic_rolling_4days_cleanup_hourly', 'ppic_rolling_4days_cleanup_15min')
+    ) LOOP
+        BEGIN
+            PERFORM cron.unschedule(r.jobid);
+        EXCEPTION WHEN OTHERS THEN
+            NULL;
+        END;
+    END LOOP;
+END $$;
+
+-- Jadwalkan pembersihan otomatis setiap 15 menit:
+SELECT cron.schedule(
+    'ppic_rolling_4days_cleanup_15min',
+    '*/15 * * * *',
+    'SELECT public.cleanup_old_uploads_rolling_4days();'
+);
 `;
 
 // Script Cepat Pembaruan Kolom VARCHAR ke TEXT (Aman untuk database yang sudah terisi)
@@ -453,7 +626,7 @@ ALTER TABLE IF EXISTS public.master_materials ALTER COLUMN name TYPE TEXT;
 ALTER TABLE IF EXISTS public.master_materials ALTER COLUMN supplier_name TYPE TEXT;
 `;
 
-// Script Optimasi High-Volume Scale (Index Komposit & RPC Dashboard/Monitoring)
+// Script Optimasi High-Volume Scale (Index Komposit & RPC Dashboard/Monitoring Berdasarkan Tanggal Upload)
 export const PPIC_SUPABASE_HIGH_VOLUME_SCALE_SQL = `-- Jalankan query berikut di Supabase SQL Editor untuk mengaktifkan Index High-Volume & RPC Aggregation:
 CREATE INDEX IF NOT EXISTS idx_mat_req_or_date ON public.material_requirements(or_number, update_date DESC);
 CREATE INDEX IF NOT EXISTS idx_mat_req_upload_id ON public.material_requirements(upload_id);
@@ -463,11 +636,10 @@ CREATE INDEX IF NOT EXISTS idx_mat_req_imported ON public.material_requirements(
 CREATE INDEX IF NOT EXISTS idx_upload_hist_date_or ON public.upload_history(update_date DESC, or_number);
 CREATE INDEX IF NOT EXISTS idx_upload_hist_created ON public.upload_history(created_at DESC);
 
--- RPC Server-Side Aggregation Dashboard
+-- RPC Server-Side Aggregation Dashboard (Berdasarkan Timestamp Tanggal Upload created_at, Asia/Jakarta)
 CREATE OR REPLACE FUNCTION public.get_ppic_dashboard_summary(
     p_or_query TEXT DEFAULT NULL,
-    p_date_from DATE DEFAULT NULL,
-    p_date_to DATE DEFAULT NULL
+    p_upload_date DATE DEFAULT NULL
 )
 RETURNS JSON
 LANGUAGE plpgsql
@@ -476,25 +648,36 @@ AS $$
 DECLARE
     v_result JSON;
     v_clean_or TEXT := NULLIF(TRIM(p_or_query), '');
+    v_date_start TIMESTAMPTZ;
+    v_date_end TIMESTAMPTZ;
 BEGIN
+    IF p_upload_date IS NOT NULL THEN
+        v_date_start := (p_upload_date::TEXT || ' 00:00:00+07')::TIMESTAMPTZ;
+        v_date_end := (p_upload_date::TEXT || ' 23:59:59.999999+07')::TIMESTAMPTZ;
+    END IF;
+
+    -- Menggunakan timestamp upload pada upload_history sebagai sumber tanggal utama melalui upload_id
     WITH filtered_data AS (
         SELECT 
-            id,
-            or_number,
-            style,
-            material_code,
-            material_name,
-            category,
-            unit,
-            required_qty,
-            received_qty,
-            GREATEST(0, required_qty - received_qty) AS deficit,
-            CASE WHEN received_qty >= required_qty THEN 1 ELSE 0 END AS is_ready,
-            update_date
-        FROM public.material_requirements
-        WHERE (v_clean_or IS NULL OR or_number ILIKE '%' || v_clean_or || '%' OR style ILIKE '%' || v_clean_or || '%')
-          AND (p_date_from IS NULL OR update_date >= p_date_from)
-          AND (p_date_to IS NULL OR update_date <= p_date_to)
+            mr.id,
+            mr.or_number,
+            mr.style,
+            mr.material_code,
+            mr.material_name,
+            mr.category,
+            mr.unit,
+            mr.required_qty,
+            mr.received_qty,
+            GREATEST(0, mr.required_qty - mr.received_qty) AS deficit,
+            CASE WHEN mr.received_qty >= mr.required_qty THEN 1 ELSE 0 END AS is_ready,
+            COALESCE(uh.created_at, mr.created_at) AS authoritative_upload_at
+        FROM public.material_requirements mr
+        LEFT JOIN public.upload_history uh ON mr.upload_id = uh.id
+        WHERE (v_clean_or IS NULL OR mr.or_number ILIKE '%' || v_clean_or || '%' OR mr.style ILIKE '%' || v_clean_or || '%')
+          AND (
+            p_upload_date IS NULL OR 
+            (COALESCE(uh.created_at, mr.created_at) >= v_date_start AND COALESCE(uh.created_at, mr.created_at) <= v_date_end)
+          )
     ),
     summary_metrics AS (
         SELECT 
@@ -617,4 +800,168 @@ BEGIN
     );
 END;
 $$;
+`;
+
+// Script Rolling 4 Hari Otomatis (Tabel Log, Fungsi Transaksional, dan Jadwal pg_cron)
+export const PPIC_SUPABASE_ROLLING_4DAYS_CLEANUP_SQL = `-- ==============================================================================
+-- SISTEM PENGHAPUSAN OTOMATIS SUPABASE — ROLLING 4 HARI (4 x 24 JAM SEJAK UPLOAD)
+-- ==============================================================================
+
+-- 1. TABEL AUDIT LOG PEMBERSIHAN
+CREATE TABLE IF NOT EXISTS public.ppic_cleanup_log (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    executed_at TIMESTAMPTZ DEFAULT NOW(),
+    cutoff_time TIMESTAMPTZ NOT NULL,
+    deleted_uploads_count INTEGER NOT NULL DEFAULT 0,
+    deleted_materials_count INTEGER NOT NULL DEFAULT 0,
+    affected_upload_ids UUID[],
+    notes TEXT,
+    status TEXT NOT NULL DEFAULT 'SUCCESS'
+);
+CREATE INDEX IF NOT EXISTS idx_cleanup_log_time ON public.ppic_cleanup_log(executed_at DESC);
+
+ALTER TABLE public.ppic_cleanup_log ENABLE ROW LEVEL SECURITY;
+DROP POLICY IF EXISTS "Auth_access_ppic_cleanup_log" ON public.ppic_cleanup_log;
+CREATE POLICY "Auth_access_ppic_cleanup_log" ON public.ppic_cleanup_log 
+    TO authenticated 
+    USING (auth.uid() IS NOT NULL) 
+    WITH CHECK (auth.uid() IS NOT NULL);
+
+-- 2. FUNGSI TRANSAKSIONAL PEMBERSIHAN ROLLING 4 HARI
+CREATE OR REPLACE FUNCTION public.cleanup_old_uploads_rolling_4days()
+RETURNS JSON
+LANGUAGE plpgsql
+SECURITY DEFINER
+SET search_path = public, pg_temp
+AS $$
+DECLARE
+    v_cutoff TIMESTAMPTZ := NOW() - INTERVAL '4 days';
+    v_target_upload_ids UUID[];
+    v_deleted_materials INTEGER := 0;
+    v_deleted_uploads INTEGER := 0;
+    v_log_id UUID;
+BEGIN
+    -- 1. Cari upload_history yang berumur > 4 hari (96 jam sejak created_at)
+    -- Syarat ketat:
+    -- - Upload 'Sukses' yang berumur > 96 jam dihapus
+    -- - Upload 'Gagal Sebagian' yang sudah tidak aktif (> 96 jam) dan upload 'Gagal' lama juga dibersihkan
+    -- - JANGAN PERNAH menghapus upload yang sedang berjalan atau memiliki proses resume aktif ('Melanjutkan Upload...', 'Sedang Berjalan')
+    -- - upload_id harus terisi dan valid
+    SELECT ARRAY_AGG(id) INTO v_target_upload_ids
+    FROM public.upload_history
+    WHERE created_at < v_cutoff
+      AND id IS NOT NULL
+      AND status NOT IN ('Melanjutkan Upload...', 'Sedang Berjalan')
+      AND status IN ('Sukses', 'Gagal Sebagian', 'Gagal', 'Peringatan');
+
+    IF v_target_upload_ids IS NOT NULL AND array_length(v_target_upload_ids, 1) > 0 THEN
+        -- 2. Hapus detail material_requirements yang terkait dengan upload_id tersebut
+        -- (Seluruh baris dalam upload terkait dibersihkan secara atomik tanpa sisa yatim)
+        WITH deleted_mats AS (
+            DELETE FROM public.material_requirements
+            WHERE upload_id = ANY(v_target_upload_ids)
+            RETURNING id
+        )
+        SELECT COUNT(*) INTO v_deleted_materials FROM deleted_mats;
+
+        -- 3. Hapus riwayat upload terkait agar tidak meninggalkan data yatim
+        WITH deleted_ups AS (
+            DELETE FROM public.upload_history
+            WHERE id = ANY(v_target_upload_ids)
+            RETURNING id
+        )
+        SELECT COUNT(*) INTO v_deleted_uploads FROM deleted_ups;
+    END IF;
+
+    -- 4. Catat log pembersihan agar proses dapat diverifikasi
+    INSERT INTO public.ppic_cleanup_log (
+        executed_at,
+        cutoff_time,
+        deleted_uploads_count,
+        deleted_materials_count,
+        affected_upload_ids,
+        notes,
+        status
+    ) VALUES (
+        NOW(),
+        v_cutoff,
+        v_deleted_uploads,
+        v_deleted_materials,
+        v_target_upload_ids,
+        CASE 
+            WHEN v_deleted_uploads > 0 THEN 'Pembersihan rolling 4 hari berhasil: ' || v_deleted_materials || ' baris material dari ' || v_deleted_uploads || ' sesi upload (> 96 jam) dihapus.'
+            ELSE 'Pemeriksaan rutin rolling 4 hari: Tidak ada data berumur > 96 jam yang memenuhi syarat penghapusan.'
+        END,
+        'SUCCESS'
+    ) RETURNING id INTO v_log_id;
+
+    RETURN json_build_object(
+        'success', true,
+        'log_id', v_log_id,
+        'cutoff_time', v_cutoff,
+        'deleted_uploads_count', v_deleted_uploads,
+        'deleted_materials_count', v_deleted_materials,
+        'affected_upload_ids', v_target_upload_ids
+    );
+EXCEPTION WHEN OTHERS THEN
+    INSERT INTO public.ppic_cleanup_log (
+        executed_at,
+        cutoff_time,
+        deleted_uploads_count,
+        deleted_materials_count,
+        notes,
+        status
+    ) VALUES (
+        NOW(),
+        v_cutoff,
+        0,
+        0,
+        'Gagal mengeksekusi rolling 4 hari: ' || SQLERRM,
+        'FAILED'
+    );
+    RETURN json_build_object(
+        'success', false,
+        'error', SQLERRM
+    );
+END;
+$$;
+
+-- Cabut seluruh hak EXECUTE dari PUBLIC, anon, dan authenticated untuk keamanan ketat (Mencegah pemanggilan dari browser RPC)
+REVOKE ALL ON FUNCTION public.cleanup_old_uploads_rolling_4days() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.cleanup_old_uploads_rolling_4days() FROM PUBLIC;
+REVOKE EXECUTE ON FUNCTION public.cleanup_old_uploads_rolling_4days() FROM anon;
+REVOKE EXECUTE ON FUNCTION public.cleanup_old_uploads_rolling_4days() FROM authenticated;
+
+-- Berikan izin eksekusi hanya kepada role pemilik/administrator database (postgres dan service_role)
+-- pg_cron berjalan secara internal sebagai superuser postgres sehingga tetap dapat mengeksekusi terjadwal
+GRANT EXECUTE ON FUNCTION public.cleanup_old_uploads_rolling_4days() TO postgres;
+GRANT EXECUTE ON FUNCTION public.cleanup_old_uploads_rolling_4days() TO service_role;
+
+-- 3. JADWAL CRON OTOMATIS SUPABASE (pg_cron) — ROLLING 4 HARI (SETIAP 15 MENIT)
+-- Aktif berjalan di server Supabase meskipun browser / aplikasi ditutup
+CREATE EXTENSION IF NOT EXISTS pg_cron;
+
+-- Bersihkan seluruh jadwal cron lama agar tidak pernah ada duplikasi saat SQL dijalankan berulang
+DO $$
+DECLARE
+    r RECORD;
+BEGIN
+    FOR r IN (
+        SELECT jobid FROM cron.job 
+        WHERE jobname IN ('ppic_rolling_4days_cleanup_hourly', 'ppic_rolling_4days_cleanup_15min')
+    ) LOOP
+        BEGIN
+            PERFORM cron.unschedule(r.jobid);
+        EXCEPTION WHEN OTHERS THEN
+            NULL;
+        END;
+    END LOOP;
+END $$;
+
+-- Jadwalkan pembersihan otomatis setiap 15 menit:
+SELECT cron.schedule(
+    'ppic_rolling_4days_cleanup_15min',
+    '*/15 * * * *',
+    'SELECT public.cleanup_old_uploads_rolling_4days();'
+);
 `;

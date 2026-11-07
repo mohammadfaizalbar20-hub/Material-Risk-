@@ -322,6 +322,7 @@ export function mapDbRequirementToModel(row: any): MaterialItemRequirement {
     supplierName: row.supplier_name || undefined,
     updateDate: row.update_date,
     importedAt: row.imported_at,
+    createdAt: row.created_at,
   };
 }
 
@@ -382,6 +383,7 @@ export function mapDbUploadHistoryToModel(row: any): UploadHistoryItem {
     rowCount: Number(row.row_count) || 0,
     status: row.status,
     notes: row.notes || undefined,
+    createdAt: row.created_at,
   };
 }
 
@@ -1092,6 +1094,7 @@ export interface DashboardSummaryData {
 
 export async function fetchDashboardSummaryFromSupabase(params?: {
   orQuery?: string;
+  uploadDate?: string | null; // format YYYY-MM-DD
   dateFrom?: string;
   dateTo?: string;
 }): Promise<DashboardSummaryData | null> {
@@ -1101,8 +1104,7 @@ export async function fetchDashboardSummaryFromSupabase(params?: {
   try {
     const { data, error } = await supabase.rpc('get_ppic_dashboard_summary', {
       p_or_query: params?.orQuery?.trim() || null,
-      p_date_from: params?.dateFrom ? safeDbDate(params.dateFrom) : null,
-      p_date_to: params?.dateTo ? safeDbDate(params.dateTo) : null,
+      p_upload_date: params?.uploadDate ? safeDbDate(params.uploadDate) : null,
     });
 
     if (error) {
@@ -1145,6 +1147,65 @@ export async function fetchDashboardSummaryFromSupabase(params?: {
   } catch (err: any) {
     console.warn('Failed to call dashboard summary RPC:', err);
     return null;
+  }
+}
+
+/**
+ * Pemicu manual dari sisi browser dinonaktifkan demi keamanan (Hardened Database Security).
+ * Hak EXECUTE fungsi cleanup_old_uploads_rolling_4days() telah dicabut dari PUBLIC, anon, dan authenticated
+ * untuk mencegah eksekusi sepihak melalui RPC PostgREST browser.
+ * Penghapusan otomatis dijalankan secara aman oleh pg_cron di sisi server Supabase.
+ */
+export async function triggerRollingCleanupInSupabase(): Promise<{
+  success: boolean;
+  deletedUploadsCount: number;
+  deletedMaterialsCount: number;
+  cutoffTime?: string;
+  logId?: string;
+  error?: string;
+}> {
+  return {
+    success: false,
+    deletedUploadsCount: 0,
+    deletedMaterialsCount: 0,
+    error: 'Pemicu manual melalui RPC browser dinonaktifkan demi keamanan. Penghapusan rolling 4 hari berjalan secara otomatis dan terjadwal di sisi server database via Supabase pg_cron.',
+  };
+}
+
+/**
+ * Fetches recent audit logs from ppic_cleanup_log
+ */
+export async function fetchCleanupLogsFromSupabase(limit = 10): Promise<Array<{
+  id: string;
+  executedAt: string;
+  cutoffTime: string;
+  deletedUploadsCount: number;
+  deletedMaterialsCount: number;
+  notes?: string;
+  status: string;
+}>> {
+  const supabase = getSupabaseClient();
+  if (!supabase) return [];
+  try {
+    const { data, error } = await supabase
+      .from('ppic_cleanup_log')
+      .select('*')
+      .order('executed_at', { ascending: false })
+      .limit(limit);
+
+    if (error) throw error;
+    return (data || []).map((row: any) => ({
+      id: row.id,
+      executedAt: row.executed_at,
+      cutoffTime: row.cutoff_time,
+      deletedUploadsCount: Number(row.deleted_uploads_count) || 0,
+      deletedMaterialsCount: Number(row.deleted_materials_count) || 0,
+      notes: row.notes,
+      status: row.status,
+    }));
+  } catch (err) {
+    console.warn('Failed to fetch cleanup logs:', err);
+    return [];
   }
 }
 

@@ -61,6 +61,7 @@ export interface MaterialItemRequirement {
   supplierName?: string;
   isRecentlyImported?: boolean;
   importedAt?: string;
+  createdAt?: string; // Timestamp waktu simpan/upload di database Supabase (TIMESTAMPTZ)
   updateDate?: string; // YYYY-MM-DD (WIB) - Tanggal Update
   uploadId?: string; // ID Upload from parent UploadHistoryItem (1 Upload = 1 OR = N Material Details)
 }
@@ -75,6 +76,7 @@ export interface UploadHistoryItem {
   rowCount: number;
   status: 'Sukses' | 'Peringatan' | 'Gagal' | 'Gagal Sebagian' | 'Melanjutkan Upload...';
   notes?: string;
+  createdAt?: string; // Timestamp waktu simpan/upload di database Supabase (TIMESTAMPTZ)
 }
 
 export interface ScheduleConflict {
@@ -195,3 +197,15 @@ export interface DeletionHistoryItem {
   affectedOrs: string[];
   user: string;
 }
+
+export interface PpicCleanupLogItem {
+  id: string;
+  executedAt: string;
+  cutoffTime: string;
+  deletedUploadsCount: number;
+  deletedMaterialsCount: number;
+  affectedUploadIds?: string[];
+  notes?: string;
+  status: 'SUCCESS' | 'FAILED';
+}
+
