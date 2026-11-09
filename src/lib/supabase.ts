@@ -608,7 +608,11 @@ export async function testSupabaseConnection(
   }
 }
 
-export async function fetchAllPpicFromSupabase(options?: { recentLimit?: number }): Promise<{
+export async function fetchAllPpicFromSupabase(options?: { 
+  recentLimit?: number;
+  chunkSize?: number;
+  maxTotalRows?: number;
+}): Promise<{
   materialRequirements: MaterialItemRequirement[];
   uploadHistory: UploadHistoryItem[];
   productionSchedules: ProductionSchedule[];
@@ -620,13 +624,12 @@ export async function fetchAllPpicFromSupabase(options?: { recentLimit?: number 
   if (!supabase) return null;
 
   try {
-    const limit = options?.recentLimit ?? 2000;
-    const [reqRes, histRes, schRes, relRes, matRes, delRes] = await Promise.all([
-      supabase
-        .from('material_requirements')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(limit),
+    const CHUNK_SIZE = options?.chunkSize ?? 2000;
+    const MAX_TOTAL = options?.maxTotalRows ?? 100000;
+    const isSingleLimitMode = typeof options?.recentLimit === 'number' && options.recentLimit > 0;
+
+    // 1. Fetch metadata tables in parallel
+    const [histRes, schRes, relRes, matRes, delRes] = await Promise.all([
       supabase.from('upload_history').select('*').order('created_at', { ascending: false }).limit(5000),
       supabase.from('production_schedules').select('*').order('production_date', { ascending: true }),
       supabase.from('or_style_relations').select('*').order('created_at', { ascending: false }),
@@ -634,13 +637,90 @@ export async function fetchAllPpicFromSupabase(options?: { recentLimit?: number 
       supabase.from('deletion_history').select('*').order('created_at', { ascending: false }).limit(1000),
     ]);
 
-    if (reqRes.error) {
-      console.error('Error fetching material_requirements:', reqRes.error);
-      throw reqRes.error;
+    // 2. Fetch material_requirements with Cursor-Based Pagination
+    // Deterministic ordering: created_at DESC, id ASC
+    const requirementsMap = new Map<string, MaterialItemRequirement>();
+
+    if (isSingleLimitMode) {
+      // Direct single query if caller specifically asked for an explicit recent limit
+      const { data, error } = await supabase
+        .from('material_requirements')
+        .select('*')
+        .order('created_at', { ascending: false })
+        .order('id', { ascending: true })
+        .limit(options!.recentLimit!);
+
+      if (error) {
+        console.error('Error fetching material_requirements:', error);
+        throw error;
+      }
+      for (const row of data || []) {
+        const item = mapDbRequirementToModel(row);
+        requirementsMap.set(item.id, item);
+      }
+    } else {
+      // Cursor loop: compound cursor (created_at < lastCreatedAt) OR (created_at = lastCreatedAt AND id > lastId)
+      let lastCreatedAt: string | null = null;
+      let lastId: string | null = null;
+      let hasMore = true;
+      let offset = 0;
+      let useOffsetFallback = false;
+
+      while (hasMore && requirementsMap.size < MAX_TOTAL) {
+        let query = supabase
+          .from('material_requirements')
+          .select('*')
+          .order('created_at', { ascending: false })
+          .order('id', { ascending: true });
+
+        if (!useOffsetFallback && lastCreatedAt && lastId) {
+          // PostgREST compound cursor
+          query = query
+            .or(`created_at.lt.${lastCreatedAt},and(created_at.eq.${lastCreatedAt},id.gt.${lastId})`)
+            .limit(CHUNK_SIZE);
+        } else if (useOffsetFallback) {
+          // Fallback to range pagination if compound cursor or filter is rejected
+          query = query.range(offset, offset + CHUNK_SIZE - 1);
+        } else {
+          query = query.limit(CHUNK_SIZE);
+        }
+
+        const { data, error } = await query;
+        if (error) {
+          if (!useOffsetFallback && lastCreatedAt && lastId) {
+            console.warn('Compound cursor filter failed or not supported by PostgREST gateway, switching to dual-sort range fallback:', error.message);
+            useOffsetFallback = true;
+            offset = requirementsMap.size;
+            continue;
+          }
+          console.error('Error fetching material_requirements chunk:', error);
+          if (requirementsMap.size === 0) throw error;
+          break;
+        }
+
+        if (!data || data.length === 0) {
+          hasMore = false;
+          break;
+        }
+
+        for (const raw of data) {
+          const item = mapDbRequirementToModel(raw);
+          requirementsMap.set(item.id, item);
+        }
+
+        const lastRow = data[data.length - 1];
+        lastCreatedAt = lastRow.created_at;
+        lastId = lastRow.id;
+        offset += data.length;
+
+        if (data.length < CHUNK_SIZE) {
+          hasMore = false;
+        }
+      }
     }
 
     return {
-      materialRequirements: (reqRes.data || []).map(mapDbRequirementToModel),
+      materialRequirements: Array.from(requirementsMap.values()),
       uploadHistory: (histRes.data || []).map(mapDbUploadHistoryToModel),
       productionSchedules: (schRes.data || []).map(mapDbScheduleToModel),
       orStyleRelations: (relRes.data || []).map(mapDbRelationToModel),
@@ -1096,14 +1176,28 @@ export interface DashboardSummaryData {
   }>;
 }
 
+export interface FetchDashboardSummaryResult {
+  success: boolean;
+  data: DashboardSummaryData | null;
+  error?: string;
+  isOffline?: boolean;
+}
+
 export async function fetchDashboardSummaryFromSupabase(params?: {
   orQuery?: string;
   uploadDate?: string | null; // format YYYY-MM-DD
   dateFrom?: string;
   dateTo?: string;
-}): Promise<DashboardSummaryData | null> {
+}): Promise<FetchDashboardSummaryResult> {
   const supabase = getSupabaseClient();
-  if (!supabase) return null;
+  if (!supabase) {
+    return {
+      success: false,
+      data: null,
+      isOffline: true,
+      error: 'Supabase client belum terkonfigurasi atau offline.',
+    };
+  }
 
   try {
     const { data, error } = await supabase.rpc('get_ppic_dashboard_summary', {
@@ -1112,12 +1206,16 @@ export async function fetchDashboardSummaryFromSupabase(params?: {
     });
 
     if (error) {
-      console.warn('Dashboard RPC not available or failed, falling back:', error.message);
-      return null;
+      console.warn('Dashboard RPC not available or failed:', error.message);
+      return {
+        success: false,
+        data: null,
+        error: error.message || 'Kueri RPC Dashboard gagal dieksekusi di database.',
+      };
     }
 
     if (data) {
-      return {
+      const parsed: DashboardSummaryData = {
         totalRows: Number(data.total_rows) || 0,
         totalRequired: Number(data.total_required) || 0,
         totalReceived: Number(data.total_received) || 0,
@@ -1146,11 +1244,24 @@ export async function fetchDashboardSummaryFromSupabase(params?: {
           totalQty: Number(c.total_qty) || 0,
         })),
       };
+      return {
+        success: true,
+        data: parsed,
+      };
     }
-    return null;
+
+    return {
+      success: false,
+      data: null,
+      error: 'Server Supabase tidak mengembalikan data ringkasan dashboard.',
+    };
   } catch (err: any) {
     console.warn('Failed to call dashboard summary RPC:', err);
-    return null;
+    return {
+      success: false,
+      data: null,
+      error: err?.message || 'Gagal memanggil fungsi ringkasan dashboard.',
+    };
   }
 }
 

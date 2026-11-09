@@ -299,12 +299,18 @@ BEGIN
             mr.unit,
             mr.required_qty,
             mr.received_qty,
-            GREATEST(0, mr.required_qty - mr.received_qty) AS deficit,
-            CASE WHEN mr.received_qty >= mr.required_qty THEN 1 ELSE 0 END AS is_ready,
+            (mr.received_qty - mr.required_qty) AS kekurangan,
+            CASE WHEN (mr.received_qty - mr.required_qty) < 0 THEN ABS(mr.received_qty - mr.required_qty) ELSE 0 END AS deficit,
+            CASE WHEN (mr.received_qty - mr.required_qty) >= 0 THEN 1 ELSE 0 END AS is_ready,
             COALESCE(uh.created_at, mr.created_at) AS authoritative_upload_at
         FROM public.material_requirements mr
         LEFT JOIN public.upload_history uh ON mr.upload_id = uh.id
-        WHERE (v_clean_or IS NULL OR mr.or_number ILIKE '%' || v_clean_or || '%' OR mr.style ILIKE '%' || v_clean_or || '%')
+        WHERE (
+            v_clean_or IS NULL OR 
+            mr.or_number ILIKE '%' || v_clean_or || '%' OR 
+            REPLACE(mr.or_number, ' ', '') ILIKE '%' || REPLACE(v_clean_or, ' ', '') || '%' OR
+            mr.style ILIKE '%' || v_clean_or || '%'
+        )
           AND (
             p_upload_date IS NULL OR 
             (COALESCE(uh.created_at, mr.created_at) >= v_date_start AND COALESCE(uh.created_at, mr.created_at) <= v_date_end)

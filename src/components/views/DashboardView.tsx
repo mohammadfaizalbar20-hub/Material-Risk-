@@ -82,19 +82,45 @@ export const DashboardView: React.FC = () => {
 
   // Server-side fast aggregation cache (for millions of rows)
   const [serverSummary, setServerSummary] = useState<DashboardSummaryData | null>(null);
+  const [isServerSummaryLoading, setIsServerSummaryLoading] = useState<boolean>(true);
+  const [rpcError, setRpcError] = useState<string | null>(null);
+
+  const loadServerSummary = async () => {
+    setIsServerSummaryLoading(true);
+    const res = await fetchDashboardSummaryFromSupabase({
+      orQuery: orSearchInput.trim() || undefined,
+      uploadDate: selectedUploadDate || null,
+    });
+    setIsServerSummaryLoading(false);
+    if (res.success && res.data) {
+      setServerSummary(res.data);
+      setRpcError(null);
+    } else {
+      setServerSummary(null);
+      setRpcError(res.error || 'Gagal memuat ringkasan data dari server Supabase.');
+    }
+  };
 
   useEffect(() => {
     let isMounted = true;
-    const loadServerSummary = async () => {
+    const execute = async () => {
+      setIsServerSummaryLoading(true);
       const res = await fetchDashboardSummaryFromSupabase({
         orQuery: orSearchInput.trim() || undefined,
-        uploadDate: selectedUploadDate || null, // Server RPC will query created_at in Asia/Jakarta bounds
+        uploadDate: selectedUploadDate || null,
       });
-      if (isMounted && res) {
-        setServerSummary(res);
+      if (isMounted) {
+        setIsServerSummaryLoading(false);
+        if (res.success && res.data) {
+          setServerSummary(res.data);
+          setRpcError(null);
+        } else {
+          setServerSummary(null);
+          setRpcError(res.error || 'Gagal memuat ringkasan data dari server Supabase.');
+        }
       }
     };
-    loadServerSummary();
+    execute();
     return () => {
       isMounted = false;
     };
@@ -111,23 +137,6 @@ export const DashboardView: React.FC = () => {
     return map;
   }, [uploadHistory]);
 
-  // Filtered requirements based on upload timestamp created_at & typed OR (client fallback)
-  // Seluruh baris dalam satu upload_id dipastikan masuk ke tanggal upload_history yang sama
-  const filteredRequirements = useMemo(() => {
-    let list = materialRequirements;
-    if (selectedUploadDate) {
-      list = list.filter((r) => {
-        const rowDate = (r.uploadId && uploadDateByUploadId.get(r.uploadId)) || toJakartaDate(r.createdAt || r.importedAt);
-        return rowDate === selectedUploadDate;
-      });
-    }
-    const q = orSearchInput.trim().toUpperCase();
-    if (q) {
-      list = list.filter((r) => r.orNumber.toUpperCase().includes(q) || r.style.toUpperCase().includes(q));
-    }
-    return list;
-  }, [materialRequirements, selectedUploadDate, orSearchInput, uploadDateByUploadId]);
-
   // ORs uploaded on the selected upload date
   const matchingOrsOnDate = useMemo(() => {
     if (!selectedUploadDate) return null;
@@ -137,14 +146,8 @@ export const DashboardView: React.FC = () => {
         orSet.add(h.orNumber.toUpperCase());
       }
     }
-    for (const r of materialRequirements) {
-      const rowDate = (r.uploadId && uploadDateByUploadId.get(r.uploadId)) || toJakartaDate(r.createdAt || r.importedAt);
-      if (rowDate === selectedUploadDate) {
-        orSet.add(r.orNumber.toUpperCase());
-      }
-    }
     return orSet;
-  }, [selectedUploadDate, uploadHistory, materialRequirements, uploadDateByUploadId]);
+  }, [selectedUploadDate, uploadHistory]);
 
   // Filtered production schedules matching the upload date and typed OR
   const filteredSchedules = useMemo(() => {
@@ -166,10 +169,12 @@ export const DashboardView: React.FC = () => {
     return registeredOrNumbers.filter((or) => or.toUpperCase().includes(q));
   }, [registeredOrNumbers, orSearchInput]);
 
-  // Actual Metrics calculated from server aggregation or local fallback
+  // Actual Metrics calculated from server aggregation (Zero truncated client fallback)
   const comparison = useMemo(() => {
-    if (serverSummary && serverSummary.totalRows > 0) {
-      const readyPct = Math.round((serverSummary.readyRows / serverSummary.totalRows) * 100);
+    if (serverSummary) {
+      const readyPct = serverSummary.totalRows > 0 
+        ? Math.round((serverSummary.readyRows / serverSummary.totalRows) * 100) 
+        : 100;
       return {
         totalRequired: serverSummary.totalRequired,
         totalReceived: serverSummary.totalReceived,
@@ -182,10 +187,20 @@ export const DashboardView: React.FC = () => {
         notReadyPercentage: 100 - readyPct,
       };
     }
-    return calculateMaterialComparisonMetrics(filteredRequirements);
-  }, [serverSummary, filteredRequirements]);
+    return {
+      totalRequired: 0,
+      totalReceived: 0,
+      shortageTotal: 0,
+      fulfillmentRatio: 0,
+      readyCount: 0,
+      notReadyCount: 0,
+      totalCount: 0,
+      readyPercentage: 0,
+      notReadyPercentage: 0,
+    };
+  }, [serverSummary]);
 
-  // Pareto Chart items from server aggregation or local fallback
+  // Pareto Chart items from server aggregation
   const paretoData: ParetoItem[] = useMemo(() => {
     if (serverSummary && serverSummary.paretoItems && serverSummary.paretoItems.length > 0) {
       const totalDeficitSum = serverSummary.paretoItems.reduce((acc, it) => acc + it.totalDeficit, 0);
@@ -205,8 +220,8 @@ export const DashboardView: React.FC = () => {
         };
       });
     }
-    return calculateParetoAnalysis(filteredRequirements);
-  }, [serverSummary, filteredRequirements]);
+    return [];
+  }, [serverSummary]);
 
   // Top materials for Kebutuhan vs Diterima bar chart
   const topMaterialsComparison = useMemo(() => {
@@ -219,33 +234,20 @@ export const DashboardView: React.FC = () => {
         received: m.received,
       }));
     }
-    const map = new Map<string, { code: string; name: string; unit: string; required: number; received: number }>();
-    for (const req of filteredRequirements) {
-      const existing = map.get(req.materialCode) || {
-        code: req.materialCode,
-        name: req.materialName,
-        unit: req.unit,
-        required: 0,
-        received: 0,
-      };
-      existing.required += req.requiredQty;
-      existing.received += req.receivedQty;
-      map.set(req.materialCode, existing);
-    }
-    return Array.from(map.values())
-      .sort((a, b) => b.required - a.required)
-      .slice(0, 6);
-  }, [serverSummary, filteredRequirements]);
+    return [];
+  }, [serverSummary]);
 
-  // Critical items
+  // Critical items matching active schedule/date filter and search input
   const criticalItems = useMemo(() => {
-    const activeOrs = new Set(filteredRequirements.map((r) => r.orNumber.toUpperCase()));
-    return materialRiskAssessments.filter(
-      (r) =>
-        (r.riskCategory === 'CRITICAL' || r.riskCategory === 'HIGH') &&
-        (activeOrs.size === 0 || activeOrs.has(r.orNumber.toUpperCase()))
-    );
-  }, [materialRiskAssessments, filteredRequirements]);
+    const q = orSearchInput.trim().toUpperCase();
+    return materialRiskAssessments.filter((r) => {
+      const isCriticalOrHigh = r.riskCategory === 'CRITICAL' || r.riskCategory === 'HIGH';
+      if (!isCriticalOrHigh) return false;
+      if (matchingOrsOnDate && !matchingOrsOnDate.has(r.orNumber.toUpperCase())) return false;
+      if (q && !r.orNumber.toUpperCase().includes(q) && !r.style.toUpperCase().includes(q)) return false;
+      return true;
+    });
+  }, [materialRiskAssessments, matchingOrsOnDate, orSearchInput]);
 
   const formatIdr = (val: number) => {
     return new Intl.NumberFormat('id-ID', {
@@ -433,13 +435,32 @@ export const DashboardView: React.FC = () => {
         )}
       </div>
 
-      {/* Message: Data tidak ditemukan when typed search yields no records */}
-      {orSearchInput.trim() && filteredRequirements.length === 0 && (
+      {/* Error Banner when RPC fails */}
+      {rpcError && (
+        <div className="p-4 bg-red-50 border border-red-300 rounded-lg text-xs text-red-900 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="w-5 h-5 text-red-600 shrink-0" />
+            <div>
+              <p className="font-bold">Gagal Mengambil Ringkasan dari Server Supabase</p>
+              <p className="text-red-700 mt-0.5">{rpcError}. Dashboard tidak menampilkan data lokal yang terpotong untuk menjaga keakuratan analisis PPIC.</p>
+            </div>
+          </div>
+          <button
+            onClick={() => loadServerSummary()}
+            className="px-3 py-1.5 bg-red-600 hover:bg-red-700 text-white rounded font-medium text-xs cursor-pointer shrink-0 ml-3"
+          >
+            Coba Lagi
+          </button>
+        </div>
+      )}
+
+      {/* Message: Data tidak ditemukan when typed search yields no records on server */}
+      {orSearchInput.trim() && !isServerSummaryLoading && !rpcError && serverSummary && serverSummary.totalRows === 0 && (
         <div className="p-4 bg-amber-50 border border-amber-300 rounded-lg text-xs text-amber-900 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
             <div>
-              <span className="font-bold">Data tidak ditemukan:</span> Tidak ada data Nomor OR atau material yang sesuai dengan kata kunci &ldquo;{orSearchInput}&rdquo;.
+              <span className="font-bold">Data tidak ditemukan:</span> Tidak ada data Nomor OR atau material di database yang sesuai dengan kata kunci &ldquo;{orSearchInput}&rdquo;.
             </div>
           </div>
           <button
