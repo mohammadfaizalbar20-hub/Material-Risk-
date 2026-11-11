@@ -1265,6 +1265,209 @@ export async function fetchDashboardSummaryFromSupabase(params?: {
   }
 }
 
+// ============================================================================
+// DEDICATED DRILLDOWN RPC TYPES & FUNCTIONS (Dashboard "Lihat Selengkapnya")
+// ============================================================================
+
+export interface AllMaterialsComparisonItem {
+  materialCode: string;
+  materialName: string;
+  category: string;
+  unit: string;
+  totalRequired: number;
+  totalReceived: number;
+  balance: number;
+  fulfillmentPercent: number;
+  isReady: boolean;
+}
+
+export interface AllMaterialsComparisonData {
+  totalUniqueMaterials: number;
+  items: AllMaterialsComparisonItem[];
+}
+
+export interface FetchAllMaterialsComparisonResult {
+  success: boolean;
+  data: AllMaterialsComparisonData | null;
+  error?: string;
+  isOffline?: boolean;
+}
+
+export interface AllParetoMitigationItem {
+  rank: number;
+  materialCode: string;
+  materialName: string;
+  unit: string;
+  totalRequired: number;
+  totalReceived: number;
+  shortageQty: number;
+  shortageValue: number;
+  contributionPercent: number;
+  cumulativePercent: number;
+  mitigationPriority: string;
+}
+
+export interface AllParetoMitigationData {
+  totalDeficitMaterials: number;
+  grandTotalShortageQty: number;
+  grandTotalShortageValue: number;
+  items: AllParetoMitigationItem[];
+}
+
+export interface FetchAllParetoMitigationResult {
+  success: boolean;
+  data: AllParetoMitigationData | null;
+  error?: string;
+  isOffline?: boolean;
+}
+
+export interface DashboardDrilldownFilterParams {
+  orQuery?: string;
+  uploadDate?: string | null;
+  dateFrom?: string | null;
+  dateTo?: string | null;
+}
+
+export async function fetchAllMaterialsComparisonFromSupabase(
+  params?: DashboardDrilldownFilterParams
+): Promise<FetchAllMaterialsComparisonResult> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    return {
+      success: false,
+      data: null,
+      isOffline: true,
+      error: 'Supabase client belum terkonfigurasi atau offline.',
+    };
+  }
+
+  try {
+    const { data, error } = await supabase.rpc('get_ppic_all_materials_comparison', {
+      p_or_query: params?.orQuery?.trim() || null,
+      p_upload_date: params?.uploadDate ? safeDbDate(params.uploadDate) : null,
+      p_date_from: params?.dateFrom ? safeDbDate(params.dateFrom) : null,
+      p_date_to: params?.dateTo ? safeDbDate(params.dateTo) : null,
+    });
+
+    if (error) {
+      console.warn('Comparison Drilldown RPC failed:', error.message);
+      return {
+        success: false,
+        data: null,
+        error: error.message || 'Kueri RPC Comparison gagal dieksekusi di database.',
+      };
+    }
+
+    if (data) {
+      const parsed: AllMaterialsComparisonData = {
+        totalUniqueMaterials: Number(data.total_unique_materials) || 0,
+        items: Array.isArray(data.items)
+          ? data.items.map((it: any) => ({
+              materialCode: String(it.material_code || ''),
+              materialName: String(it.material_name || ''),
+              category: String(it.category || 'General'),
+              unit: String(it.unit || 'Unit'),
+              totalRequired: Number(it.total_required) || 0,
+              totalReceived: Number(it.total_received) || 0,
+              balance: Number(it.balance) || 0,
+              fulfillmentPercent: Number(it.fulfillment_percent) || 0,
+              isReady: Boolean(it.is_ready),
+            }))
+          : [],
+      };
+      return {
+        success: true,
+        data: parsed,
+      };
+    }
+
+    return {
+      success: false,
+      data: null,
+      error: 'Server Supabase tidak mengembalikan data perbandingan material.',
+    };
+  } catch (err: any) {
+    console.warn('Failed to call comparison drilldown RPC:', err);
+    return {
+      success: false,
+      data: null,
+      error: err?.message || 'Gagal memanggil fungsi perbandingan material.',
+    };
+  }
+}
+
+export async function fetchAllParetoMitigationFromSupabase(
+  params?: DashboardDrilldownFilterParams
+): Promise<FetchAllParetoMitigationResult> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    return {
+      success: false,
+      data: null,
+      isOffline: true,
+      error: 'Supabase client belum terkonfigurasi atau offline.',
+    };
+  }
+
+  try {
+    const { data, error } = await supabase.rpc('get_ppic_all_pareto_mitigation', {
+      p_or_query: params?.orQuery?.trim() || null,
+      p_upload_date: params?.uploadDate ? safeDbDate(params.uploadDate) : null,
+      p_date_from: params?.dateFrom ? safeDbDate(params.dateFrom) : null,
+      p_date_to: params?.dateTo ? safeDbDate(params.dateTo) : null,
+    });
+
+    if (error) {
+      console.warn('Pareto Mitigation Drilldown RPC failed:', error.message);
+      return {
+        success: false,
+        data: null,
+        error: error.message || 'Kueri RPC Pareto Mitigasi gagal dieksekusi di database.',
+      };
+    }
+
+    if (data) {
+      const parsed: AllParetoMitigationData = {
+        totalDeficitMaterials: Number(data.total_deficit_materials) || 0,
+        grandTotalShortageQty: Number(data.grand_total_shortage_qty) || 0,
+        grandTotalShortageValue: Number(data.grand_total_shortage_value) || 0,
+        items: Array.isArray(data.items)
+          ? data.items.map((it: any) => ({
+              rank: Number(it.rank) || 0,
+              materialCode: String(it.material_code || ''),
+              materialName: String(it.material_name || ''),
+              unit: String(it.unit || 'Unit'),
+              totalRequired: Number(it.total_required) || 0,
+              totalReceived: Number(it.total_received) || 0,
+              shortageQty: Number(it.shortage_qty) || 0,
+              shortageValue: Number(it.shortage_value) || 0,
+              contributionPercent: Number(it.contribution_percent) || 0,
+              cumulativePercent: Number(it.cumulative_percent) || 0,
+              mitigationPriority: String(it.mitigation_priority || 'SECONDARY'),
+            }))
+          : [],
+      };
+      return {
+        success: true,
+        data: parsed,
+      };
+    }
+
+    return {
+      success: false,
+      data: null,
+      error: 'Server Supabase tidak mengembalikan data Pareto mitigasi.',
+    };
+  } catch (err: any) {
+    console.warn('Failed to call pareto mitigation drilldown RPC:', err);
+    return {
+      success: false,
+      data: null,
+      error: err?.message || 'Gagal memanggil fungsi Pareto mitigasi.',
+    };
+  }
+}
+
 /**
  * Pemicu manual dari sisi browser dinonaktifkan demi keamanan (Hardened Database Security).
  * Hak EXECUTE fungsi cleanup_old_uploads_rolling_4days() telah dicabut dari PUBLIC, anon, dan authenticated

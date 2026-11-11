@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect } from 'react';
+import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react';
 import { usePpic } from '../../context/PpicContext';
 import {
   calculateParetoAnalysis,
@@ -8,6 +8,12 @@ import { ParetoItem } from '../../types/ppic';
 import {
   fetchDashboardSummaryFromSupabase,
   DashboardSummaryData,
+  fetchAllMaterialsComparisonFromSupabase,
+  fetchAllParetoMitigationFromSupabase,
+  AllMaterialsComparisonData,
+  AllMaterialsComparisonItem,
+  AllParetoMitigationData,
+  AllParetoMitigationItem,
 } from '../../lib/supabase';
 import {
   CalendarClock,
@@ -23,6 +29,10 @@ import {
   Hash,
   X,
   Zap,
+  ExternalLink,
+  RefreshCw,
+  Layers,
+  FileSpreadsheet,
 } from 'lucide-react';
 
 // Helper to normalize any date/timestamp into Asia/Jakarta YYYY-MM-DD
@@ -125,6 +135,170 @@ export const DashboardView: React.FC = () => {
       isMounted = false;
     };
   }, [orSearchInput, selectedUploadDate]);
+
+  // ============================================================================
+  // DRILLDOWN MODAL STATE & CACHE MANAGEMENT ("Lihat Selengkapnya")
+  // ============================================================================
+  type DrilldownModalType = 'comparison' | 'pareto' | 'mitigation' | null;
+  const [activeDrilldownModal, setActiveDrilldownModal] = useState<DrilldownModalType>(null);
+  const [drilldownSearchTerm, setDrilldownSearchTerm] = useState<string>('');
+
+  // Composite cache key for active filters (OR/Style query and upload date)
+  const activeDrilldownFilterKey = useMemo(() => {
+    return `${orSearchInput.trim().toUpperCase()}||${selectedUploadDate || ''}`;
+  }, [orSearchInput, selectedUploadDate]);
+
+  // Comparison drilldown state & cache
+  const [comparisonCache, setComparisonCache] = useState<{
+    filterKey: string;
+    data: AllMaterialsComparisonData;
+  } | null>(null);
+  const [isComparisonLoading, setIsComparisonLoading] = useState<boolean>(false);
+  const [comparisonError, setComparisonError] = useState<string | null>(null);
+
+  // Shared Pareto & Mitigation drilldown state & cache
+  const [paretoMitigationCache, setParetoMitigationCache] = useState<{
+    filterKey: string;
+    data: AllParetoMitigationData;
+  } | null>(null);
+  const [isParetoLoading, setIsParetoLoading] = useState<boolean>(false);
+  const [paretoError, setParetoError] = useState<string | null>(null);
+
+  // Request identity refs to eliminate asynchronous race conditions
+  const comparisonReqIdRef = useRef<number>(0);
+  const paretoReqIdRef = useRef<number>(0);
+
+  // Invalidate stale caches immediately whenever filter changes
+  useEffect(() => {
+    setComparisonCache((prev) => (prev && prev.filterKey === activeDrilldownFilterKey ? prev : null));
+    setParetoMitigationCache((prev) => (prev && prev.filterKey === activeDrilldownFilterKey ? prev : null));
+  }, [activeDrilldownFilterKey]);
+
+  // Comparison fetcher with request identity protection
+  const fetchComparisonDrilldown = useCallback(async (force: boolean = false) => {
+    if (!force && comparisonCache && comparisonCache.filterKey === activeDrilldownFilterKey) {
+      return;
+    }
+    const currentReqId = ++comparisonReqIdRef.current;
+    setIsComparisonLoading(true);
+    setComparisonError(null);
+
+    const res = await fetchAllMaterialsComparisonFromSupabase({
+      orQuery: orSearchInput.trim() || undefined,
+      uploadDate: selectedUploadDate || null,
+      dateFrom: null,
+      dateTo: null,
+    });
+
+    if (currentReqId !== comparisonReqIdRef.current) return;
+
+    setIsComparisonLoading(false);
+    if (res.success && res.data) {
+      setComparisonCache({
+        filterKey: activeDrilldownFilterKey,
+        data: res.data,
+      });
+      setComparisonError(null);
+    } else {
+      setComparisonError(res.error || 'Gagal memuat seluruh komparasi material dari database.');
+    }
+  }, [activeDrilldownFilterKey, comparisonCache, orSearchInput, selectedUploadDate]);
+
+  // Pareto & Mitigation shared fetcher with request identity protection
+  const fetchParetoMitigationDrilldown = useCallback(async (force: boolean = false) => {
+    if (!force && paretoMitigationCache && paretoMitigationCache.filterKey === activeDrilldownFilterKey) {
+      return;
+    }
+    const currentReqId = ++paretoReqIdRef.current;
+    setIsParetoLoading(true);
+    setParetoError(null);
+
+    const res = await fetchAllParetoMitigationFromSupabase({
+      orQuery: orSearchInput.trim() || undefined,
+      uploadDate: selectedUploadDate || null,
+      dateFrom: null,
+      dateTo: null,
+    });
+
+    if (currentReqId !== paretoReqIdRef.current) return;
+
+    setIsParetoLoading(false);
+    if (res.success && res.data) {
+      setParetoMitigationCache({
+        filterKey: activeDrilldownFilterKey,
+        data: res.data,
+      });
+      setParetoError(null);
+    } else {
+      setParetoError(res.error || 'Gagal memuat seluruh data Pareto dan Mitigasi dari database.');
+    }
+  }, [activeDrilldownFilterKey, paretoMitigationCache, orSearchInput, selectedUploadDate]);
+
+  // Trigger lazy loading when a modal opens or when filters change while modal is open
+  useEffect(() => {
+    if (activeDrilldownModal === 'comparison') {
+      if (!comparisonCache || comparisonCache.filterKey !== activeDrilldownFilterKey) {
+        fetchComparisonDrilldown();
+      }
+    } else if (activeDrilldownModal === 'pareto' || activeDrilldownModal === 'mitigation') {
+      if (!paretoMitigationCache || paretoMitigationCache.filterKey !== activeDrilldownFilterKey) {
+        fetchParetoMitigationDrilldown();
+      }
+    }
+  }, [
+    activeDrilldownModal,
+    activeDrilldownFilterKey,
+    comparisonCache,
+    paretoMitigationCache,
+    fetchComparisonDrilldown,
+    fetchParetoMitigationDrilldown,
+  ]);
+
+  // Lock background scroll and listen for Escape key
+  useEffect(() => {
+    if (activeDrilldownModal) {
+      const originalOverflow = document.body.style.overflow;
+      document.body.style.overflow = 'hidden';
+      const handleKeyDown = (e: KeyboardEvent) => {
+        if (e.key === 'Escape') {
+          setActiveDrilldownModal(null);
+        }
+      };
+      window.addEventListener('keydown', handleKeyDown);
+      return () => {
+        document.body.style.overflow = originalOverflow;
+        window.removeEventListener('keydown', handleKeyDown);
+      };
+    }
+  }, [activeDrilldownModal]);
+
+  // In-memory filtered items for each modal
+  const filteredComparisonItems = useMemo(() => {
+    if (!comparisonCache || comparisonCache.filterKey !== activeDrilldownFilterKey) return [];
+    const q = drilldownSearchTerm.trim().toLowerCase();
+    if (!q) return comparisonCache.data.items;
+    return comparisonCache.data.items.filter(
+      (it) => it.materialCode.toLowerCase().includes(q) || it.materialName.toLowerCase().includes(q)
+    );
+  }, [comparisonCache, activeDrilldownFilterKey, drilldownSearchTerm]);
+
+  const filteredParetoItems = useMemo(() => {
+    if (!paretoMitigationCache || paretoMitigationCache.filterKey !== activeDrilldownFilterKey) return [];
+    const q = drilldownSearchTerm.trim().toLowerCase();
+    if (!q) return paretoMitigationCache.data.items;
+    return paretoMitigationCache.data.items.filter(
+      (it) => it.materialCode.toLowerCase().includes(q) || it.materialName.toLowerCase().includes(q)
+    );
+  }, [paretoMitigationCache, activeDrilldownFilterKey, drilldownSearchTerm]);
+
+  const filteredMitigationItems = useMemo(() => {
+    if (!paretoMitigationCache || paretoMitigationCache.filterKey !== activeDrilldownFilterKey) return [];
+    const q = drilldownSearchTerm.trim().toLowerCase();
+    if (!q) return paretoMitigationCache.data.items;
+    return paretoMitigationCache.data.items.filter(
+      (it) => it.materialCode.toLowerCase().includes(q) || it.materialName.toLowerCase().includes(q)
+    );
+  }, [paretoMitigationCache, activeDrilldownFilterKey, drilldownSearchTerm]);
 
   // Map upload_id ke upload_history created_at sebagai sumber tanggal utama (Client-side JOIN)
   const uploadDateByUploadId = useMemo(() => {
@@ -583,7 +757,7 @@ export const DashboardView: React.FC = () => {
       <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
         {/* Chart 1 (2 cols): Grafik Kebutuhan Material vs Diterima */}
         <div className="lg:col-span-2 bg-white rounded-lg border border-slate-200 shadow-xs p-5">
-          <div className="flex items-center justify-between pb-3 border-b border-slate-100 mb-4">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-3 border-b border-slate-100 mb-4 gap-2">
             <div>
               <h3 className="text-sm font-bold text-slate-900">
                 Grafik Komparasi: Kebutuhan Material vs Jumlah Material Diterima
@@ -592,13 +766,24 @@ export const DashboardView: React.FC = () => {
                 Membandingkan kuantitas yang dibutuhkan dengan barang fisik yang telah diterima di gudang
               </p>
             </div>
-            <div className="flex items-center gap-3 text-xs">
+            <div className="flex flex-wrap items-center gap-3 text-xs">
               <span className="flex items-center gap-1.5">
                 <span className="w-3 h-3 rounded-xs bg-slate-400"></span> Kebutuhan
               </span>
               <span className="flex items-center gap-1.5">
                 <span className="w-3 h-3 rounded-xs bg-emerald-500"></span> Diterima
               </span>
+              <button
+                onClick={() => {
+                  setDrilldownSearchTerm('');
+                  setActiveDrilldownModal('comparison');
+                }}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-md transition-colors cursor-pointer shadow-2xs ml-1"
+                title="Buka daftar lengkap seluruh material"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+                <span>Lihat Selengkapnya</span>
+              </button>
             </div>
           </div>
 
@@ -773,13 +958,24 @@ export const DashboardView: React.FC = () => {
             </p>
           </div>
 
-          <div className="flex items-center gap-4 text-xs font-medium">
+          <div className="flex flex-wrap items-center gap-3 text-xs font-medium">
             <span className="flex items-center gap-1.5">
               <span className="w-3 h-3 rounded-xs bg-red-500"></span> Nilai Kekurangan (Bar)
             </span>
             <span className="flex items-center gap-1.5">
               <span className="w-3 h-1 bg-blue-600 rounded"></span> % Kumulatif (Kurva)
             </span>
+            <button
+              onClick={() => {
+                setDrilldownSearchTerm('');
+                setActiveDrilldownModal('pareto');
+              }}
+              className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-md transition-colors cursor-pointer shadow-2xs ml-1"
+              title="Buka analisis Pareto lengkap seluruh material defisit"
+            >
+              <ExternalLink className="w-3.5 h-3.5" />
+              <span>Lihat Selengkapnya</span>
+            </button>
           </div>
         </div>
 
@@ -837,6 +1033,29 @@ export const DashboardView: React.FC = () => {
               })}
             </div>
 
+            {/* Pareto Summary Table Header & Button */}
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between pb-2 mb-2 gap-2">
+              <div className="flex items-center gap-2">
+                <span className="text-xs font-bold text-slate-800 uppercase tracking-wider">
+                  Tabel Prioritas Mitigasi Material
+                </span>
+                <span className="text-[11px] text-slate-500 font-medium">
+                  (Top 10 Ditampilkan)
+                </span>
+              </div>
+              <button
+                onClick={() => {
+                  setDrilldownSearchTerm('');
+                  setActiveDrilldownModal('mitigation');
+                }}
+                className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-md transition-colors cursor-pointer shadow-2xs self-start sm:self-auto"
+                title="Buka seluruh daftar material prioritas mitigasi"
+              >
+                <ExternalLink className="w-3.5 h-3.5" />
+                <span>Lihat Selengkapnya</span>
+              </button>
+            </div>
+
             {/* Pareto Summary Table */}
             <div className="overflow-x-auto border border-slate-200 rounded-lg">
               <table className="w-full text-left text-xs border-collapse">
@@ -889,6 +1108,688 @@ export const DashboardView: React.FC = () => {
           </div>
         )}
       </div>
+
+      {/* ======================================================================== */}
+      {/* MODAL 1: COMPARISON DRILLDOWN (Seluruh Perbandingan Material)          */}
+      {/* ======================================================================== */}
+      {activeDrilldownModal === 'comparison' && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-5 animate-in fade-in duration-150"
+          onClick={() => setActiveDrilldownModal(null)}
+        >
+          <div
+            className="bg-white rounded-xl shadow-2xl border border-slate-200 max-w-6xl w-full max-h-[92vh] flex flex-col overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header Modal */}
+            <div className="p-4 sm:p-5 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-50/70">
+              <div>
+                <div className="flex items-center gap-2">
+                  <BarChart3 className="w-5 h-5 text-blue-600" />
+                  <h2 className="text-base sm:text-lg font-bold text-slate-900">
+                    Seluruh Perbandingan Material
+                  </h2>
+                  <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-blue-100 text-blue-800">
+                    {comparisonCache?.data.totalUniqueMaterials ?? 0} Material Unik
+                  </span>
+                </div>
+                <p className="text-xs text-slate-500 mt-1">
+                  Menampilkan komparasi lengkap Kebutuhan vs Diterima untuk seluruh material unik berdasarkan filter aktif
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 self-end sm:self-auto">
+                <button
+                  onClick={() => fetchComparisonDrilldown(true)}
+                  disabled={isComparisonLoading}
+                  className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-200/60 rounded-md transition-colors cursor-pointer disabled:opacity-50"
+                  title="Perbarui data dari server"
+                >
+                  <RefreshCw className={`w-4 h-4 ${isComparisonLoading ? 'animate-spin text-blue-600' : ''}`} />
+                </button>
+                <button
+                  onClick={() => setActiveDrilldownModal(null)}
+                  className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-200/60 rounded-md transition-colors cursor-pointer"
+                  title="Tutup Modal (Esc)"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Active Filter Badges & Search Filter */}
+            <div className="p-4 border-b border-slate-200 bg-white flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="font-semibold text-slate-500">Filter Aktif:</span>
+                <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 font-mono text-[11px] border border-slate-200">
+                  OR/Style: {orSearchInput.trim() ? `"${orSearchInput.trim()}"` : 'Semua'}
+                </span>
+                <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 font-mono text-[11px] border border-slate-200">
+                  Tanggal: {selectedUploadDate || 'Semua'}
+                </span>
+              </div>
+
+              {/* Internal in-modal search */}
+              <div className="relative w-full sm:w-80">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+                <input
+                  type="text"
+                  value={drilldownSearchTerm}
+                  onChange={(e) => setDrilldownSearchTerm(e.target.value)}
+                  placeholder="Cari kode atau nama material..."
+                  className="w-full pl-9 pr-8 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                />
+                {drilldownSearchTerm && (
+                  <button
+                    onClick={() => setDrilldownSearchTerm('')}
+                    className="absolute right-2.5 top-2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Modal Body & Table */}
+            <div className="flex-1 overflow-y-auto p-4 bg-slate-50/30">
+              {isComparisonLoading && (
+                <div className="py-24 text-center">
+                  <RefreshCw className="w-8 h-8 text-blue-600 animate-spin mx-auto mb-3" />
+                  <p className="text-sm font-semibold text-slate-700">
+                    Memuat seluruh komparasi material dari server Supabase...
+                  </p>
+                  <p className="text-xs text-slate-400 mt-1">
+                    Sedang mengagregasi data langsung di database PostgreSQL
+                  </p>
+                </div>
+              )}
+
+              {comparisonError && !isComparisonLoading && (
+                <div className="my-12 p-6 bg-red-50 border border-red-200 rounded-lg text-center max-w-lg mx-auto">
+                  <AlertTriangle className="w-8 h-8 text-red-600 mx-auto mb-2" />
+                  <p className="text-sm font-bold text-red-800">Gagal Memuat Data Komparasi</p>
+                  <p className="text-xs text-red-600 mt-1 mb-4">{comparisonError}</p>
+                  <button
+                    onClick={() => fetchComparisonDrilldown(true)}
+                    className="px-4 py-1.5 bg-red-600 hover:bg-red-700 text-white text-xs font-semibold rounded-md shadow-xs transition-colors cursor-pointer"
+                  >
+                    Coba Lagi
+                  </button>
+                </div>
+              )}
+
+              {!isComparisonLoading && !comparisonError && comparisonCache && (
+                <>
+                  <div className="mb-2 flex items-center justify-between text-xs text-slate-500">
+                    <span>
+                      Menampilkan <strong className="text-slate-800 font-mono">{filteredComparisonItems.length}</strong> dari{' '}
+                      <strong className="text-slate-800 font-mono">{comparisonCache.data.items.length}</strong> material
+                    </span>
+                    {drilldownSearchTerm && (
+                      <span className="text-blue-600">
+                        Disaring dengan kata kunci: &quot;{drilldownSearchTerm}&quot;
+                      </span>
+                    )}
+                  </div>
+
+                  {filteredComparisonItems.length === 0 ? (
+                    <div className="py-20 text-center text-xs text-slate-400">
+                      {drilldownSearchTerm
+                        ? `Tidak ada material yang cocok dengan pencarian "${drilldownSearchTerm}".`
+                        : 'Tidak ada data material untuk filter yang dipilih.'}
+                    </div>
+                  ) : (
+                    <div className="border border-slate-200 rounded-lg overflow-hidden bg-white shadow-xs">
+                      <div className="overflow-x-auto max-h-[58vh]">
+                        <table className="w-full text-left text-xs border-collapse">
+                          <thead className="sticky top-0 bg-slate-100 z-10 border-b border-slate-200 shadow-2xs">
+                            <tr className="text-slate-700 font-semibold">
+                              <th className="py-2.5 px-3 text-center w-12">No.</th>
+                              <th className="py-2.5 px-3">Kode Material</th>
+                              <th className="py-2.5 px-3">Nama Material</th>
+                              <th className="py-2.5 px-3">Kategori</th>
+                              <th className="py-2.5 px-3 text-right">Kebutuhan</th>
+                              <th className="py-2.5 px-3 text-right">Diterima</th>
+                              <th className="py-2.5 px-3 text-right">Balance</th>
+                              <th className="py-2.5 px-3 text-right w-44">Fulfillment (%)</th>
+                              <th className="py-2.5 px-3 text-center">Status</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100">
+                            {filteredComparisonItems.map((item, idx) => {
+                              const isFulfilled = item.isReady;
+                              return (
+                                <tr key={item.materialCode} className="hover:bg-slate-50/80 transition-colors">
+                                  <td className="py-2.5 px-3 text-center font-mono text-slate-400">
+                                    {idx + 1}
+                                  </td>
+                                  <td className="py-2.5 px-3 font-mono font-bold text-slate-900">
+                                    {item.materialCode}
+                                  </td>
+                                  <td className="py-2.5 px-3 font-medium text-slate-800">
+                                    {item.materialName}
+                                  </td>
+                                  <td className="py-2.5 px-3">
+                                    <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-100 text-slate-700 border border-slate-200">
+                                      {item.category}
+                                    </span>
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right font-mono text-slate-700 font-semibold">
+                                    {item.totalRequired.toLocaleString('id-ID')} {item.unit}
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right font-mono text-emerald-700 font-semibold">
+                                    {item.totalReceived.toLocaleString('id-ID')} {item.unit}
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right font-mono font-bold">
+                                    <span className={item.balance < 0 ? 'text-red-600' : 'text-emerald-700'}>
+                                      {item.balance < 0
+                                        ? `-${Math.abs(item.balance).toLocaleString('id-ID')} ${item.unit}`
+                                        : `+${item.balance.toLocaleString('id-ID')} ${item.unit}`}
+                                    </span>
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right">
+                                    <div className="flex items-center justify-end gap-2">
+                                      <div className="w-20 bg-slate-200 h-2 rounded-full overflow-hidden">
+                                        <div
+                                          className={`h-full rounded-full ${
+                                            isFulfilled ? 'bg-emerald-500' : 'bg-amber-500'
+                                          }`}
+                                          style={{ width: `${Math.min(100, item.fulfillmentPercent)}%` }}
+                                        />
+                                      </div>
+                                      <span
+                                        className={`font-mono font-bold text-[11px] min-w-12 text-right ${
+                                          isFulfilled ? 'text-emerald-700' : 'text-amber-700'
+                                        }`}
+                                      >
+                                        {item.fulfillmentPercent.toFixed(1)}%
+                                      </span>
+                                    </div>
+                                  </td>
+                                  <td className="py-2.5 px-3 text-center">
+                                    <span
+                                      className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                        isFulfilled
+                                          ? 'bg-emerald-100 text-emerald-800 border border-emerald-200'
+                                          : 'bg-amber-100 text-amber-800 border border-amber-200'
+                                      }`}
+                                    >
+                                      {isFulfilled ? 'READY' : 'BELUM READY'}
+                                    </span>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+
+            {/* Footer Modal */}
+            <div className="p-3 border-t border-slate-200 bg-white flex items-center justify-between text-xs text-slate-500">
+              <span>Menampilkan seluruh material tanpa pembatasan Top 6.</span>
+              <button
+                onClick={() => setActiveDrilldownModal(null)}
+                className="px-4 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-md transition-colors cursor-pointer"
+              >
+                Tutup
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ======================================================================== */}
+      {/* MODAL 2: PARETO DRILLDOWN (Seluruh Analisis Pareto Material)             */}
+      {/* ======================================================================== */}
+      {activeDrilldownModal === 'pareto' && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-5 animate-in fade-in duration-150"
+          onClick={() => setActiveDrilldownModal(null)}
+        >
+          <div
+            className="bg-white rounded-xl shadow-2xl border border-slate-200 max-w-6xl w-full max-h-[92vh] flex flex-col overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header Modal */}
+            <div className="p-4 sm:p-5 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-50/70">
+              <div>
+                <div className="flex items-center gap-2">
+                  <BarChart3 className="w-5 h-5 text-blue-600" />
+                  <h2 className="text-base sm:text-lg font-bold text-slate-900">
+                    Seluruh Analisis Pareto Material
+                  </h2>
+                  <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-red-100 text-red-800">
+                    {paretoMitigationCache?.data.totalDeficitMaterials ?? 0} Material Defisit
+                  </span>
+                </div>
+                <p className="text-xs text-slate-500 mt-1">
+                  Seluruh material dengan kuantitas defisit positif diurutkan dari defisit terbesar (80/20 Rule)
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 self-end sm:self-auto">
+                <button
+                  onClick={() => fetchParetoMitigationDrilldown(true)}
+                  disabled={isParetoLoading}
+                  className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-200/60 rounded-md transition-colors cursor-pointer disabled:opacity-50"
+                  title="Perbarui data dari server"
+                >
+                  <RefreshCw className={`w-4 h-4 ${isParetoLoading ? 'animate-spin text-blue-600' : ''}`} />
+                </button>
+                <button
+                  onClick={() => setActiveDrilldownModal(null)}
+                  className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-200/60 rounded-md transition-colors cursor-pointer"
+                  title="Tutup Modal (Esc)"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Summary Cards */}
+            <div className="p-4 border-b border-slate-200 bg-white grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div className="p-3 bg-red-50/70 border border-red-100 rounded-lg">
+                <span className="text-[11px] font-semibold text-red-700">Total Material Defisit</span>
+                <p className="text-lg font-extrabold text-red-900 font-mono mt-0.5">
+                  {paretoMitigationCache?.data.totalDeficitMaterials ?? 0}{' '}
+                  <span className="text-xs font-normal text-red-600">Item</span>
+                </p>
+              </div>
+              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                <span className="text-[11px] font-semibold text-slate-600">Grand Total Kuantitas Defisit</span>
+                <p className="text-lg font-extrabold text-slate-900 font-mono mt-0.5">
+                  {(paretoMitigationCache?.data.grandTotalShortageQty ?? 0).toLocaleString('id-ID')}
+                </p>
+              </div>
+              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
+                <span className="text-[11px] font-semibold text-slate-600">Grand Total Nilai Kerugian Defisit</span>
+                <p className="text-lg font-extrabold text-slate-900 font-mono mt-0.5">
+                  {formatIdr(paretoMitigationCache?.data.grandTotalShortageValue ?? 0)}
+                </p>
+              </div>
+            </div>
+
+            {/* Filter Info & Search */}
+            <div className="p-3.5 border-b border-slate-200 bg-slate-50/50 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="font-semibold text-slate-500">Filter Aktif:</span>
+                <span className="px-2 py-0.5 rounded bg-white text-slate-700 font-mono text-[11px] border border-slate-200">
+                  OR/Style: {orSearchInput.trim() ? `"${orSearchInput.trim()}"` : 'Semua'}
+                </span>
+                <span className="px-2 py-0.5 rounded bg-white text-slate-700 font-mono text-[11px] border border-slate-200">
+                  Tanggal: {selectedUploadDate || 'Semua'}
+                </span>
+                <span className="text-[11px] text-slate-400 italic ml-1">
+                  (Denominator Pareto: Total defisit seluruh material filter aktif)
+                </span>
+              </div>
+
+              {/* Internal in-modal search */}
+              <div className="relative w-full sm:w-80">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+                <input
+                  type="text"
+                  value={drilldownSearchTerm}
+                  onChange={(e) => setDrilldownSearchTerm(e.target.value)}
+                  placeholder="Cari kode atau nama material defisit..."
+                  className="w-full pl-9 pr-8 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                />
+                {drilldownSearchTerm && (
+                  <button
+                    onClick={() => setDrilldownSearchTerm('')}
+                    className="absolute right-2.5 top-2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Modal Body & Table */}
+            <div className="flex-1 overflow-y-auto p-4 bg-slate-50/30">
+              {isParetoLoading && (
+                <div className="py-24 text-center">
+                  <RefreshCw className="w-8 h-8 text-blue-600 animate-spin mx-auto mb-3" />
+                  <p className="text-sm font-semibold text-slate-700">
+                    Memuat seluruh analisis Pareto material dari server Supabase...
+                  </p>
+                  <p className="text-xs text-slate-400 mt-1">
+                    Sedang menghitung ranking defisit dan kurva kumulatif di PostgreSQL
+                  </p>
+                </div>
+              )}
+
+              {paretoError && !isParetoLoading && (
+                <div className="my-12 p-6 bg-red-50 border border-red-200 rounded-lg text-center max-w-lg mx-auto">
+                  <AlertTriangle className="w-8 h-8 text-red-600 mx-auto mb-2" />
+                  <p className="text-sm font-bold text-red-800">Gagal Memuat Data Pareto</p>
+                  <p className="text-xs text-red-600 mt-1 mb-4">{paretoError}</p>
+                  <button
+                    onClick={() => fetchParetoMitigationDrilldown(true)}
+                    className="px-4 py-1.5 bg-red-600 hover:bg-red-700 text-white text-xs font-semibold rounded-md shadow-xs transition-colors cursor-pointer"
+                  >
+                    Coba Lagi
+                  </button>
+                </div>
+              )}
+
+              {!isParetoLoading && !paretoError && paretoMitigationCache && (
+                <>
+                  <div className="mb-2 flex items-center justify-between text-xs text-slate-500">
+                    <span>
+                      Menampilkan <strong className="text-slate-800 font-mono">{filteredParetoItems.length}</strong> dari{' '}
+                      <strong className="text-slate-800 font-mono">{paretoMitigationCache.data.items.length}</strong> material defisit
+                    </span>
+                    {drilldownSearchTerm && (
+                      <span className="text-blue-600">
+                        Disaring dengan kata kunci: &quot;{drilldownSearchTerm}&quot;
+                      </span>
+                    )}
+                  </div>
+
+                  {filteredParetoItems.length === 0 ? (
+                    <div className="py-20 text-center text-xs text-slate-400">
+                      {drilldownSearchTerm
+                        ? `Tidak ada material defisit yang cocok dengan pencarian "${drilldownSearchTerm}".`
+                        : 'Seluruh material pada filter ini sudah terpenuhi (Tidak ada kekurangan material).'}
+                    </div>
+                  ) : (
+                    <div className="border border-slate-200 rounded-lg overflow-hidden bg-white shadow-xs">
+                      <div className="overflow-x-auto max-h-[52vh]">
+                        <table className="w-full text-left text-xs border-collapse">
+                          <thead className="sticky top-0 bg-slate-100 z-10 border-b border-slate-200 shadow-2xs">
+                            <tr className="text-slate-700 font-semibold">
+                              <th className="py-2.5 px-3 text-center w-16">Peringkat</th>
+                              <th className="py-2.5 px-3">Kode Material</th>
+                              <th className="py-2.5 px-3">Nama Material</th>
+                              <th className="py-2.5 px-3 text-center">Satuan</th>
+                              <th className="py-2.5 px-3 text-right">Kuantitas Defisit</th>
+                              <th className="py-2.5 px-3 text-right">Nilai Defisit (Rp)</th>
+                              <th className="py-2.5 px-3 text-right w-36">% Kontribusi</th>
+                              <th className="py-2.5 px-3 text-right w-40">% Kumulatif</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100">
+                            {filteredParetoItems.map((item) => (
+                              <tr key={item.materialCode} className="hover:bg-slate-50/80 transition-colors">
+                                <td className="py-2.5 px-3 text-center font-mono font-bold text-slate-400">
+                                  #{item.rank}
+                                </td>
+                                <td className="py-2.5 px-3 font-mono font-bold text-slate-900">
+                                  {item.materialCode}
+                                </td>
+                                <td className="py-2.5 px-3 font-medium text-slate-800">
+                                  {item.materialName}
+                                </td>
+                                <td className="py-2.5 px-3 text-center font-mono text-slate-600">
+                                  {item.unit}
+                                </td>
+                                <td className="py-2.5 px-3 text-right font-mono font-bold text-red-600">
+                                  -{item.shortageQty.toLocaleString('id-ID')}
+                                </td>
+                                <td className="py-2.5 px-3 text-right font-mono font-bold text-slate-900">
+                                  {formatIdr(item.shortageValue)}
+                                </td>
+                                <td className="py-2.5 px-3 text-right">
+                                  <div className="flex items-center justify-end gap-1.5">
+                                    <div className="w-16 bg-slate-200 h-2 rounded-full overflow-hidden">
+                                      <div
+                                        className="h-full bg-red-500 rounded-full"
+                                        style={{ width: `${Math.max(3, Math.min(100, item.contributionPercent))}%` }}
+                                      />
+                                    </div>
+                                    <span className="font-mono font-semibold text-slate-700 min-w-10 text-right">
+                                      {item.contributionPercent.toFixed(1)}%
+                                    </span>
+                                  </div>
+                                </td>
+                                <td className="py-2.5 px-3 text-right">
+                                  <div className="flex items-center justify-end gap-1.5">
+                                    <div className="w-16 bg-slate-200 h-2 rounded-full overflow-hidden">
+                                      <div
+                                        className="h-full bg-blue-600 rounded-full"
+                                        style={{ width: `${Math.min(100, item.cumulativePercent)}%` }}
+                                      />
+                                    </div>
+                                    <span className="font-mono font-bold text-blue-700 min-w-12 text-right">
+                                      {item.cumulativePercent.toFixed(1)}%
+                                    </span>
+                                  </div>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+
+            {/* Footer Modal */}
+            <div className="p-3 border-t border-slate-200 bg-white flex items-center justify-between text-xs text-slate-500">
+              <span>Menampilkan seluruh material defisit positif tanpa batasan Top 10.</span>
+              <button
+                onClick={() => setActiveDrilldownModal(null)}
+                className="px-4 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-md transition-colors cursor-pointer"
+              >
+                Tutup
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ======================================================================== */}
+      {/* MODAL 3: MITIGATION PRIORITY (Seluruh Daftar Mitigation Priority)       */}
+      {/* ======================================================================== */}
+      {activeDrilldownModal === 'mitigation' && (
+        <div
+          className="fixed inset-0 z-50 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-5 animate-in fade-in duration-150"
+          onClick={() => setActiveDrilldownModal(null)}
+        >
+          <div
+            className="bg-white rounded-xl shadow-2xl border border-slate-200 max-w-6xl w-full max-h-[92vh] flex flex-col overflow-hidden"
+            onClick={(e) => e.stopPropagation()}
+          >
+            {/* Header Modal */}
+            <div className="p-4 sm:p-5 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-50/70">
+              <div>
+                <div className="flex items-center gap-2">
+                  <ShieldAlert className="w-5 h-5 text-red-600" />
+                  <h2 className="text-base sm:text-lg font-bold text-slate-900">
+                    Seluruh Daftar Mitigation Priority
+                  </h2>
+                  <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-amber-100 text-amber-800">
+                    {paretoMitigationCache?.data.totalDeficitMaterials ?? 0} Item Memerlukan Mitigasi
+                  </span>
+                </div>
+                <p className="text-xs text-slate-500 mt-1">
+                  Seluruh material prioritas mitigasi dikelompokkan berdasarkan aturan 80/20 (Vital Few vs Secondary)
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 self-end sm:self-auto">
+                <button
+                  onClick={() => fetchParetoMitigationDrilldown(true)}
+                  disabled={isParetoLoading}
+                  className="p-1.5 text-slate-500 hover:text-slate-800 hover:bg-slate-200/60 rounded-md transition-colors cursor-pointer disabled:opacity-50"
+                  title="Perbarui data dari server"
+                >
+                  <RefreshCw className={`w-4 h-4 ${isParetoLoading ? 'animate-spin text-blue-600' : ''}`} />
+                </button>
+                <button
+                  onClick={() => setActiveDrilldownModal(null)}
+                  className="p-1.5 text-slate-500 hover:text-slate-900 hover:bg-slate-200/60 rounded-md transition-colors cursor-pointer"
+                  title="Tutup Modal (Esc)"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            {/* Filter Info & Search */}
+            <div className="p-3.5 border-b border-slate-200 bg-white flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                <span className="font-semibold text-slate-500">Filter Aktif:</span>
+                <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 font-mono text-[11px] border border-slate-200">
+                  OR/Style: {orSearchInput.trim() ? `"${orSearchInput.trim()}"` : 'Semua'}
+                </span>
+                <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-700 font-mono text-[11px] border border-slate-200">
+                  Tanggal: {selectedUploadDate || 'Semua'}
+                </span>
+              </div>
+
+              {/* Internal in-modal search */}
+              <div className="relative w-full sm:w-80">
+                <Search className="w-4 h-4 text-slate-400 absolute left-3 top-2.5" />
+                <input
+                  type="text"
+                  value={drilldownSearchTerm}
+                  onChange={(e) => setDrilldownSearchTerm(e.target.value)}
+                  placeholder="Cari kode atau nama material mitigasi..."
+                  className="w-full pl-9 pr-8 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
+                />
+                {drilldownSearchTerm && (
+                  <button
+                    onClick={() => setDrilldownSearchTerm('')}
+                    className="absolute right-2.5 top-2 text-slate-400 hover:text-slate-600 cursor-pointer"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Modal Body & Table */}
+            <div className="flex-1 overflow-y-auto p-4 bg-slate-50/30">
+              {isParetoLoading && (
+                <div className="py-24 text-center">
+                  <RefreshCw className="w-8 h-8 text-blue-600 animate-spin mx-auto mb-3" />
+                  <p className="text-sm font-semibold text-slate-700">
+                    Memuat seluruh data prioritas mitigasi dari server Supabase...
+                  </p>
+                  <p className="text-xs text-slate-400 mt-1">
+                    Sedang mengagregasi prioritas penanganan mitigasi di database PostgreSQL
+                  </p>
+                </div>
+              )}
+
+              {paretoError && !isParetoLoading && (
+                <div className="my-12 p-6 bg-red-50 border border-red-200 rounded-lg text-center max-w-lg mx-auto">
+                  <AlertTriangle className="w-8 h-8 text-red-600 mx-auto mb-2" />
+                  <p className="text-sm font-bold text-red-800">Gagal Memuat Data Mitigasi</p>
+                  <p className="text-xs text-red-600 mt-1 mb-4">{paretoError}</p>
+                  <button
+                    onClick={() => fetchParetoMitigationDrilldown(true)}
+                    className="px-4 py-1.5 bg-red-600 hover:bg-red-700 text-white text-xs font-semibold rounded-md shadow-xs transition-colors cursor-pointer"
+                  >
+                    Coba Lagi
+                  </button>
+                </div>
+              )}
+
+              {!isParetoLoading && !paretoError && paretoMitigationCache && (
+                <>
+                  <div className="mb-2 flex items-center justify-between text-xs text-slate-500">
+                    <span>
+                      Menampilkan <strong className="text-slate-800 font-mono">{filteredMitigationItems.length}</strong> dari{' '}
+                      <strong className="text-slate-800 font-mono">{paretoMitigationCache.data.items.length}</strong> material prioritas mitigasi
+                    </span>
+                    {drilldownSearchTerm && (
+                      <span className="text-blue-600">
+                        Disaring dengan kata kunci: &quot;{drilldownSearchTerm}&quot;
+                      </span>
+                    )}
+                  </div>
+
+                  {filteredMitigationItems.length === 0 ? (
+                    <div className="py-20 text-center text-xs text-slate-400">
+                      {drilldownSearchTerm
+                        ? `Tidak ada material mitigasi yang cocok dengan pencarian "${drilldownSearchTerm}".`
+                        : 'Seluruh material pada filter ini sudah terpenuhi (Tidak ada kekurangan material).'}
+                    </div>
+                  ) : (
+                    <div className="border border-slate-200 rounded-lg overflow-hidden bg-white shadow-xs">
+                      <div className="overflow-x-auto max-h-[58vh]">
+                        <table className="w-full text-left text-xs border-collapse">
+                          <thead className="sticky top-0 bg-slate-100 z-10 border-b border-slate-200 shadow-2xs">
+                            <tr className="text-slate-700 font-semibold">
+                              <th className="py-2.5 px-3 text-center w-16">Peringkat</th>
+                              <th className="py-2.5 px-3">Kode Material</th>
+                              <th className="py-2.5 px-3">Nama Material</th>
+                              <th className="py-2.5 px-3 text-center">Satuan</th>
+                              <th className="py-2.5 px-3 text-right">Kebutuhan</th>
+                              <th className="py-2.5 px-3 text-right">Diterima</th>
+                              <th className="py-2.5 px-3 text-right">Shortage Qty</th>
+                              <th className="py-2.5 px-3 text-center">Prioritas Mitigasi</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100">
+                            {filteredMitigationItems.map((item) => (
+                              <tr key={item.materialCode} className="hover:bg-slate-50/80 transition-colors">
+                                <td className="py-2.5 px-3 text-center font-mono font-bold text-slate-400">
+                                  #{item.rank}
+                                </td>
+                                <td className="py-2.5 px-3 font-mono font-bold text-slate-900">
+                                  {item.materialCode}
+                                </td>
+                                <td className="py-2.5 px-3 font-medium text-slate-800">
+                                  {item.materialName}
+                                </td>
+                                <td className="py-2.5 px-3 text-center font-mono text-slate-600">
+                                  {item.unit}
+                                </td>
+                                <td className="py-2.5 px-3 text-right font-mono text-slate-700">
+                                  {item.totalRequired.toLocaleString('id-ID')}
+                                </td>
+                                <td className="py-2.5 px-3 text-right font-mono text-emerald-700">
+                                  {item.totalReceived.toLocaleString('id-ID')}
+                                </td>
+                                <td className="py-2.5 px-3 text-right font-mono font-bold text-red-600">
+                                  -{item.shortageQty.toLocaleString('id-ID')}
+                                </td>
+                                <td className="py-2.5 px-3 text-center">
+                                  <span
+                                    className={`px-2 py-0.5 rounded text-[10px] font-bold ${
+                                      item.mitigationPriority.includes('VITAL')
+                                        ? 'bg-red-100 text-red-800 border border-red-200'
+                                        : 'bg-slate-100 text-slate-600 border border-slate-200'
+                                    }`}
+                                  >
+                                    {item.mitigationPriority}
+                                  </span>
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  )}
+                </>
+              )}
+            </div>
+
+            {/* Footer Modal */}
+            <div className="p-3 border-t border-slate-200 bg-white flex items-center justify-between text-xs text-slate-500">
+              <span>Menampilkan seluruh material prioritas mitigasi tanpa batasan Top 10.</span>
+              <button
+                onClick={() => setActiveDrilldownModal(null)}
+                className="px-4 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-md transition-colors cursor-pointer"
+              >
+                Tutup
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };
