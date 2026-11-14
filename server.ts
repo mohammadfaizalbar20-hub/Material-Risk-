@@ -2,7 +2,12 @@ import express from 'express';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, Type } from '@google/genai';
+import type {
+  ExtractedPdfWorksheet,
+  ExtractedWorksheetMaterial,
+  PdfCoordinatePage,
+} from './src/utils/pdfWorksheetParser';
 
 dotenv.config();
 
@@ -31,7 +36,7 @@ function getHost(): string {
 const PORT = getPort();
 const HOST = getHost();
 
-app.use(express.json({ limit: '10mb' }));
+app.use(express.json({ limit: '25mb' }));
 
 // Initialize Google GenAI
 const apiKey = process.env.GEMINI_API_KEY;
@@ -154,65 +159,173 @@ app.post('/api/ai/sequential-workflow', async (req, res) => {
   }
 });
 
-// Endpoint for PDF Worksheet Extraction (Deterministic PDFParse + Optional AI Fallback)
+// Endpoint for PDF Worksheet Extraction (Coordinate/Text PDFParse + Gemini Visual Fallback + Cross-Check)
 app.post('/api/pdf/extract-worksheet', async (req, res) => {
   try {
-    const { fileBase64, pdfBase64, fileName = 'Worksheet.pdf' } = req.body;
-    const rawBase64 = pdfBase64 || fileBase64;
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const fileName =
+      typeof body.fileName === 'string' && body.fileName.trim()
+        ? body.fileName.trim()
+        : 'Worksheet.pdf';
 
-    if (!rawBase64) {
+    const rawInput =
+      typeof body.pdfBase64 === 'string' && body.pdfBase64.trim()
+        ? body.pdfBase64.trim()
+        : typeof body.fileBase64 === 'string' && body.fileBase64.trim()
+          ? body.fileBase64.trim()
+          : '';
+
+    if (!rawInput) {
       return res.status(400).json({
         success: false,
         error: 'Data berkas PDF tidak ditemukan atau kosong.',
       });
     }
 
-    const buffer = Buffer.from(rawBase64, 'base64');
-    let extractedText = '';
+    const cleanBase64 = rawInput.replace(/^data:application\/pdf;base64,/i, '').trim();
+    const buffer = Buffer.from(cleanBase64, 'base64');
 
-    try {
-      const { PDFParse } = await import('pdf-parse');
-      const parser = new (PDFParse as any)({ data: buffer });
-      const textResult = await parser.getText();
-      extractedText = textResult?.text || '';
-      if (typeof parser.destroy === 'function') {
-        await parser.destroy();
-      }
-    } catch (pdfErr: any) {
-      console.warn('PDFParse failed, checking fallback:', pdfErr?.message);
+    if (buffer.length < 8) {
+      return res.status(400).json({
+        success: false,
+        error: `Berkas "${fileName}" kosong atau bukan PDF yang valid.`,
+      });
     }
 
-    const { parseWorksheetText } = await import('./src/utils/pdfWorksheetParser');
-    let parseResult = parseWorksheetText(extractedText, fileName);
+    const headerProbe = buffer.subarray(0, 1024).toString('latin1');
+    if (!headerProbe.includes('%PDF-')) {
+      return res.status(400).json({
+        success: false,
+        error: `Berkas "${fileName}" tidak memiliki header PDF (%PDF-) yang valid.`,
+      });
+    }
 
-    // If deterministic parsing failed and Gemini AI is available, attempt Gemini extraction
-    const isRealKey = apiKey && apiKey !== 'MY_GEMINI_API_KEY' && apiKey.trim().length > 10;
-    if ((!parseResult.success || !parseResult.data?.materials?.length) && isRealKey && ai) {
+    let extractedText = '';
+    const pages: PdfCoordinatePage[] = [];
+    let pdfParseErrorMessage: string | null = null;
+
+    let parser: any = null;
+    try {
+      const { PDFParse } = await import('pdf-parse');
+      parser = new (PDFParse as any)({ data: buffer });
+
+      // Stage 1A: Extract text items with exact coordinates (x, y, width, height) per page
+      if (typeof parser.load === 'function') {
+        const doc = await parser.load();
+        const numPages = Number(doc?.numPages || 0);
+        for (let pageNum = 1; pageNum <= numPages; pageNum++) {
+          const page = await doc.getPage(pageNum);
+          const viewport =
+            typeof page.getViewport === 'function' ? page.getViewport({ scale: 1 }) : undefined;
+          const textContent = await page.getTextContent();
+          const items = Array.isArray(textContent?.items)
+            ? textContent.items.map((it: any) => {
+                const tr = Array.isArray(it?.transform) ? it.transform : [1, 0, 0, 1, 0, 0];
+                return {
+                  str: String(it?.str || ''),
+                  x: Number(tr[4] ?? 0),
+                  y: Number(tr[5] ?? 0),
+                  width: Number(it?.width ?? 0),
+                  height: Number(it?.height ?? Math.abs(Number(tr[3] ?? 10))),
+                };
+              })
+            : [];
+          pages.push({
+            pageNum,
+            width: viewport?.width,
+            height: viewport?.height,
+            items,
+          });
+        }
+      }
+
+      // Stage 1B: Also obtain plain text representation as supplementary text
+      if (typeof parser.getText === 'function') {
+        const textResult = await parser.getText();
+        extractedText = typeof textResult?.text === 'string' ? textResult.text : '';
+      }
+    } catch (pdfErr: any) {
+      pdfParseErrorMessage = pdfErr?.message || 'PDFParse failed';
+      console.warn('PDFParse failed, checking fallback:', pdfParseErrorMessage);
+    } finally {
+      if (parser && typeof parser.destroy === 'function') {
+        try {
+          await parser.destroy();
+        } catch {
+          // ignore cleanup error
+        }
+      }
+    }
+
+    const {
+      extractWorksheetFromPdfCoordinates,
+      parseWorksheetText,
+      reconcileWorksheetExtractions,
+      extractOrNumberFromIdentifier,
+      detectDocumentNumberLocale,
+      parsePdfNumberWithContext,
+    } = await import('./src/utils/pdfWorksheetParser');
+
+    // Run coordinate-based parser first, fallback to partial text parser if needed
+    let detData: ExtractedPdfWorksheet | null = null;
+    if (pages.length > 0) {
+      const coordResult = extractWorksheetFromPdfCoordinates(pages, fileName);
+      if (coordResult.success && coordResult.data) {
+        detData = coordResult.data;
+      }
+    }
+
+    if ((!detData || detData.materials.length === 0) && extractedText.trim()) {
+      const textFallback = parseWorksheetText(extractedText, fileName, { allowPartial: true });
+      if (textFallback.success && textFallback.data) {
+        if (!detData) {
+          detData = textFallback.data;
+        } else if (detData.materials.length === 0 && textFallback.data.materials.length > 0) {
+          detData = reconcileWorksheetExtractions(detData, textFallback.data, fileName);
+        }
+      }
+    }
+
+    const hasCompleteDet = Boolean(
+      detData &&
+        detData.orNumber &&
+        detData.style &&
+        detData.target !== null &&
+        detData.target > 0 &&
+        detData.materials.length > 0 &&
+        !detData.needsReview
+    );
+
+    const hasTextLayer =
+      extractedText.trim().length > 0 ||
+      pages.some((p) => p.items.some((it) => it.str.trim().length > 0));
+
+    // Stage 2: Gemini Visual / OCR Fallback when text is missing, incomplete, unreadable, or ambiguous
+    let aiData: ExtractedPdfWorksheet | null = null;
+    let aiErrorMessage: string | null = null;
+    const isRealKey = Boolean(
+      apiKey && apiKey !== 'MY_GEMINI_API_KEY' && apiKey.trim().length > 10
+    );
+
+    if (!hasCompleteDet && isRealKey && ai) {
       try {
-        const prompt = `Anda adalah parser PDF Worksheet garmen dan manufaktur profesional.
-Ekstrak informasi dari teks atau dokumen PDF berikut:
-1. No. OR: Ambil HANYA nomor setelah slash terakhir (Contoh: "OR/2026/09/1117" -> "1117"). Jangan gunakan nomor Worksheet atau PO.
-2. Style: Ambil nama Style pakaian/produk.
-3. Target Produksi: Ambil angka dari bagian Total Qty (Contoh: Total Qty = 74 -> target = 74).
-4. Tabel MATERIAL & KONSUMSI: Ekstrak persis 4 kolom:
-   - CODE ACC -> materialCode
-   - DESCRIPTION -> materialName
-   - UNIT -> unit
-   - TOTAL -> total (angka numerik)
-Abaikan kolom NO dan CONS. Pertahankan urutan dan jangan gabungkan material duplikat.
+        const systemInstruction = `Anda adalah sistem ekstraksi dokumen PDF Worksheet produksi garmen berpresisi tinggi.
+Tugas Anda hanya mengekstrak data yang benar-benar tertulis pada dokumen PDF tanpa mengarang atau menebak nilai yang kosong.`;
 
-Kembalikan HANYA format JSON valid tanpa markdown tambahan:
-{
-  "orNumber": "1117",
-  "style": "Style Name",
-  "target": 74,
-  "materials": [
-    { "materialCode": "...", "materialName": "...", "unit": "...", "total": 12.3 }
-  ]
-}`;
+        const prompt = `Ekstrak informasi dari dokumen PDF Worksheet ini dengan aturan ketat berikut:
+1. orNumberRaw: Ambil teks persis pada label "NO. OR" / "ORDER NO" (contoh: "OR/2026/05/1014"). JANGAN gunakan "NO. WORKSHEET" (contoh "WH/MO/22512"). Kosongkan "" jika tidak ada.
+2. worksheetNo: Ambil teks pada label "NO. WORKSHEET" (contoh: "WH/MO/22512 · Lot - 1"). Kosongkan "" jika tidak ada.
+3. style: Ambil teks persis pada label "STYLE NO" / "STYLE" (contoh: "[KAIS08-2] KAIS TOPI PRMI 05"). JANGAN gunakan nilai BUYER atau ITEM. Kosongkan "" jika tidak ada.
+4. totalQtyRaw: Ambil teks angka persis pada label "TOTAL QTY" (contoh: "2.498"). Jangan hapus titik/koma aslinya. Kosongkan "" jika tidak ada.
+5. materials: Baca HANYA tabel "MATERIAL & KONSUMSI" (biasanya di Halaman 1). Abaikan "Material Card" / halaman gambar di Halaman 2, serta abaikan baris ringkasan seperti "4 ITEM MATERIAL".
+   Untuk setiap baris material sesuai urutan di PDF (jangan gabungkan kode yang duplikat):
+   - materialCode: nilai kolom "CODE ACC"
+   - materialName: nilai kolom "DESCRIPTION"
+   - unit: nilai kolom "UNIT"
+   - totalRaw: nilai kolom "TOTAL" persis seperti tertulis (contoh "104,9160"). PENTING: jika kolom "TOTAL" kosong, kembalikan string kosong "" — JANGAN pernah mengambil angka dari kolom "CONS", "RETURN", atau "BALANCE".`;
 
-        const aiResponse = await ai.models.generateContent({
-          model: 'gemini-3.8-flash',
+        const aiPromise = ai.models.generateContent({
+          model: 'gemini-4-hydrogen',
           contents: [
             {
               role: 'user',
@@ -220,60 +333,162 @@ Kembalikan HANYA format JSON valid tanpa markdown tambahan:
                 {
                   inlineData: {
                     mimeType: 'application/pdf',
-                    data: fileBase64,
+                    data: cleanBase64,
                   },
                 },
                 { text: prompt },
               ],
             },
           ],
+          config: {
+            systemInstruction,
+            responseMimeType: 'application/json',
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                orNumberRaw: { type: Type.STRING },
+                worksheetNo: { type: Type.STRING },
+                style: { type: Type.STRING },
+                totalQtyRaw: { type: Type.STRING },
+                materials: {
+                  type: Type.ARRAY,
+                  items: {
+                    type: Type.OBJECT,
+                    properties: {
+                      materialCode: { type: Type.STRING },
+                      materialName: { type: Type.STRING },
+                      unit: { type: Type.STRING },
+                      totalRaw: { type: Type.STRING },
+                    },
+                    required: ['materialCode', 'materialName', 'unit', 'totalRaw'],
+                  },
+                },
+              },
+              required: ['orNumberRaw', 'worksheetNo', 'style', 'totalQtyRaw', 'materials'],
+            },
+          },
         });
 
-        const replyText = aiResponse.text || '';
+        const timeoutPromise = new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('Gemini extraction timeout (25s)')), 25000)
+        );
+
+        const aiResponse = (await Promise.race([aiPromise, timeoutPromise])) as any;
+        const replyText = (aiResponse?.text ?? '').trim();
         const jsonMatch = replyText.match(/\{[\s\S]*\}/);
         if (jsonMatch) {
-          const aiParsed = JSON.parse(jsonMatch[0]);
-          if (aiParsed.orNumber && aiParsed.style && aiParsed.target && Array.isArray(aiParsed.materials)) {
-            parseResult = {
-              success: true,
-              data: {
-                id: `ws-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
-                fileName,
-                orNumber: String(aiParsed.orNumber),
-                style: String(aiParsed.style),
-                target: Number(aiParsed.target),
-                materials: aiParsed.materials.map((m: any) => ({
-                  materialCode: String(m.materialCode || m.code || ''),
-                  materialName: String(m.materialName || m.description || ''),
-                  unit: String(m.unit || 'Unit'),
-                  total: Number(m.total) || 0,
-                })),
-                rawText: extractedText,
-              },
-            };
-          }
+          const parsed = JSON.parse(jsonMatch[0]);
+          const combinedRawText = [
+            extractedText,
+            parsed.totalQtyRaw || '',
+            ...(Array.isArray(parsed.materials)
+              ? parsed.materials.map((m: any) => String(m?.totalRaw || ''))
+              : []),
+          ]
+            .filter(Boolean)
+            .join('\n');
+          const locale = detectDocumentNumberLocale(combinedRawText);
+
+          const rawOr = String(parsed.orNumberRaw || '').trim();
+          const wsNo = String(parsed.worksheetNo || '').trim();
+          const styleVal = String(parsed.style || '').trim();
+          const rawQty = String(parsed.totalQtyRaw || '').trim();
+          const qtyParsed = parsePdfNumberWithContext(rawQty, locale, {
+            isIntegerQtyContext: true,
+          });
+
+          const aiMaterials: ExtractedWorksheetMaterial[] = Array.isArray(parsed.materials)
+            ? parsed.materials
+                .map((m: any): ExtractedWorksheetMaterial => {
+                  const code = String(m?.materialCode || '').trim();
+                  const name = String(m?.materialName || '').trim();
+                  const unit = String(m?.unit || '').trim();
+                  const totalRawStr = String(m?.totalRaw ?? '').trim();
+                  const totalEmpty = totalRawStr === '' || totalRawStr === '-';
+                  const parsedTot = parsePdfNumberWithContext(totalRawStr, locale);
+                  return {
+                    materialCode: code,
+                    materialName: name,
+                    unit,
+                    total: totalEmpty ? null : parsedTot.value,
+                    rawTotal: totalEmpty ? '' : parsedTot.raw || totalRawStr,
+                    isTotalAmbiguous: !totalEmpty && (parsedTot.isAmbiguous || parsedTot.value === null),
+                    needsReview:
+                      !code ||
+                      !name ||
+                      !unit ||
+                      (!totalEmpty && (parsedTot.isAmbiguous || parsedTot.value === null)),
+                    reviewNote: totalEmpty
+                      ? 'Kolom TOTAL kosong pada PDF.'
+                      : parsedTot.reason,
+                  };
+                })
+                .filter((m: ExtractedWorksheetMaterial) => Boolean(m.materialCode || m.materialName))
+            : [];
+
+          aiData = {
+            id: `ws-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+            fileName,
+            orNumber: extractOrNumberFromIdentifier(rawOr),
+            rawOrNumber: rawOr || undefined,
+            worksheetNo: wsNo || undefined,
+            style: styleVal,
+            target: qtyParsed.value !== null && qtyParsed.value > 0 ? qtyParsed.value : null,
+            rawTarget: rawQty || undefined,
+            isTargetAmbiguous: qtyParsed.isAmbiguous,
+            materials: aiMaterials,
+            extractionMethod: 'gemini',
+            rawText: extractedText || undefined,
+          };
         }
       } catch (aiErr: any) {
-        console.warn('Gemini AI fallback parsing failed:', aiErr?.message);
+        aiErrorMessage = aiErr?.message || 'Layanan AI gagal mengekstrak PDF.';
+        console.warn('Gemini AI fallback parsing failed:', aiErrorMessage);
       }
     }
 
-    if (!parseResult.success) {
+    // Stage 3: Reconcile deterministic vs AI results
+    if (!detData && !aiData) {
+      let errorMsg = `Gagal mengekstrak data Worksheet dari "${fileName}".`;
+      if (!hasTextLayer) {
+        errorMsg = isRealKey
+          ? `Dokumen "${fileName}" tidak memiliki lapisan teks (hasil scan/gambar) dan ekstraksi OCR/AI gagal${aiErrorMessage ? `: ${aiErrorMessage}` : '.'}`
+          : `Dokumen "${fileName}" tidak memiliki lapisan teks (kemungkinan PDF hasil scan/gambar) sehingga memerlukan layanan OCR/AI yang aktif.`;
+      } else if (pdfParseErrorMessage) {
+        errorMsg = `Struktur PDF "${fileName}" tidak dapat dibaca (${pdfParseErrorMessage}).`;
+      }
       return res.status(422).json({
         success: false,
-        error: parseResult.error || `Gagal mengekstrak data dari dokumen PDF ${fileName}.`,
+        error: errorMsg,
+      });
+    }
+
+    const finalWorksheet = reconcileWorksheetExtractions(detData, aiData, fileName);
+
+    const hasUsableContent = Boolean(
+      finalWorksheet.orNumber ||
+        finalWorksheet.worksheetNo ||
+        finalWorksheet.style ||
+        (finalWorksheet.target !== null && finalWorksheet.target > 0) ||
+        finalWorksheet.materials.length > 0
+    );
+
+    if (!hasUsableContent) {
+      return res.status(422).json({
+        success: false,
+        error: `Tidak ditemukan identitas Worksheet atau tabel MATERIAL & KONSUMSI pada "${fileName}".`,
       });
     }
 
     return res.json({
       success: true,
-      data: parseResult.data,
+      data: finalWorksheet,
     });
   } catch (err: any) {
     console.error('Error in /api/pdf/extract-worksheet:', err);
-    res.status(500).json({
+    return res.status(500).json({
       success: false,
-      error: `Terjadi kesalahan saat memproses PDF: ${err?.message || 'Internal error'}`,
+      error: `Terjadi kesalahan internal saat memproses PDF: ${err?.message || 'Internal error'}`,
     });
   }
 });
@@ -332,6 +547,37 @@ ${message}`;
       model: 'ppic-expert-rule-engine',
     });
   }
+});
+
+// Ensure unknown /api routes ALWAYS return JSON (never fall through to SPA/Vite HTML or plain text 404)
+app.use('/api', (req, res) => {
+  res.status(404).json({
+    success: false,
+    error: `Endpoint API ${req.method} ${req.originalUrl} tidak ditemukan.`,
+  });
+});
+
+// Structured JSON error middleware for /api (handles payload too large 413, malformed JSON 400, and 5xx)
+app.use((err: any, req: express.Request, res: express.Response, next: express.NextFunction) => {
+  if (req.path.startsWith('/api')) {
+    if (err?.type === 'entity.too.large' || err?.status === 413) {
+      return res.status(413).json({
+        success: false,
+        error: 'Ukuran berkas PDF terlalu besar untuk diproses (maksimal 25MB). Silakan kompres PDF terlebih dahulu.',
+      });
+    }
+    if (err instanceof SyntaxError && 'body' in err) {
+      return res.status(400).json({
+        success: false,
+        error: 'Format payload JSON ke server tidak valid.',
+      });
+    }
+    return res.status(err?.status || 500).json({
+      success: false,
+      error: err?.message || 'Terjadi kesalahan internal pada server API.',
+    });
+  }
+  return next(err);
 });
 
 // Development with Vite vs Production setup

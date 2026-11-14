@@ -4,11 +4,18 @@ import {
   extractOrNumberFromIdentifier,
   areOrNumbersMatching,
   parseWorksheetText,
+  parseExtractWorksheetHttpResponse,
+  detectDocumentNumberLocale,
+  parsePdfNumberWithContext,
+  extractWorksheetFromPdfCoordinates,
+  reconcileWorksheetExtractions,
+  validateExtractedWorksheet,
   matchMaterialsWithMasterData,
   findLatestUploadForOr,
   buildWorksheetSnapshot,
   refreshScheduleWorksheetsSnapshot,
   ExtractedWorksheetMaterial,
+  PdfCoordinatePage,
 } from '../src/utils/pdfWorksheetParser';
 import {
   MaterialItemRequirement,
@@ -680,4 +687,714 @@ test('10. Skenario 8 & 9: Snapshot Tersimpan Tidak Berubah Otomatis + Manual Ref
   assert.equal(refreshed.materials[1].status, null);
   assert.equal(refreshed.materials[1].isFoundInMasterData, false);
 });
+
+test('11. Safe HTTP Response Parser: JSON valid, plain text 404 ("The page could not be found"), HTML error page, 413/500, JSON rusak', () => {
+  // 1) JSON valid
+  const okRes = parseExtractWorksheetHttpResponse(
+    200,
+    'application/json; charset=utf-8',
+    JSON.stringify({
+      success: true,
+      data: {
+        id: 'ws-1',
+        fileName: 'WORKSHEET - WH_MO_22512.pdf',
+        orNumber: '1014',
+        worksheetNo: 'WH/MO/22512 · Lot - 1',
+        style: '[KAIS08-2] KAIS TOPI PRMI 05',
+        target: 2498,
+        materials: [],
+      },
+    })
+  );
+  assert.equal(okRes.success, true);
+  assert.equal(okRes.data?.orNumber, '1014');
+  assert.equal(okRes.data?.target, 2498);
+
+  // 2) Plain text "The page could not be found" (HTTP 404)
+  const plain404 = parseExtractWorksheetHttpResponse(
+    404,
+    'text/plain; charset=utf-8',
+    'The page could not be found'
+  );
+  assert.equal(plain404.success, false);
+  assert.equal(plain404.isNonJsonResponse, true);
+  assert.match(plain404.error || '', /HTTP 404/i);
+  assert.doesNotMatch(plain404.error || '', /Unexpected token/i);
+
+  // 3) HTML gateway/proxy error page (HTTP 502)
+  const html502 = parseExtractWorksheetHttpResponse(
+    502,
+    'text/html',
+    '<!DOCTYPE html><html><head><title>502 Bad Gateway</title></head><body><h1>502 Bad Gateway</h1></body></html>'
+  );
+  assert.equal(html502.success, false);
+  assert.equal(html502.isNonJsonResponse, true);
+  assert.match(html502.error || '', /502/);
+  assert.doesNotMatch(html502.error || '', /Unexpected token/i);
+
+  // 4) HTTP 413 Payload Too Large & HTTP 500 JSON rusak/terpotong
+  const err413 = parseExtractWorksheetHttpResponse(413, 'text/plain', 'Payload Too Large');
+  assert.equal(err413.success, false);
+  assert.match(err413.error || '', /413|terlalu besar/i);
+
+  const brokenJson500 = parseExtractWorksheetHttpResponse(500, 'application/json', '{"success": true, "data":');
+  assert.equal(brokenJson500.success, false);
+  assert.equal(brokenJson500.isNonJsonResponse, true);
+  assert.match(brokenJson500.error || '', /JSON.*tidak valid|500/i);
+});
+
+test('12. Format Angka Indonesia vs US: 2.498 -> 2498, 104,9160 -> 104.916, 2.498,0000 -> 2498, 88.8 -> 88.8, & deteksi ambigu', () => {
+  const idLocale = detectDocumentNumberLocale('TOTAL QTY: 2.498\n104,9160\n2.498,0000');
+  assert.equal(idLocale, 'id');
+
+  const nTotalQty = parsePdfNumberWithContext('2.498', idLocale, { isIntegerQtyContext: true });
+  assert.equal(nTotalQty.value, 2498);
+  assert.equal(nTotalQty.raw, '2.498');
+  assert.equal(nTotalQty.isAmbiguous, false);
+
+  const nDec1 = parsePdfNumberWithContext('104,9160', idLocale);
+  assert.equal(nDec1.value, 104.916);
+  assert.equal(nDec1.raw, '104,9160');
+  assert.equal(nDec1.isAmbiguous, false);
+
+  const nDec2 = parsePdfNumberWithContext('2.498,0000', idLocale);
+  assert.equal(nDec2.value, 2498);
+  assert.equal(nDec2.raw, '2.498,0000');
+  assert.equal(nDec2.isAmbiguous, false);
+
+  const usLocale = detectDocumentNumberLocale('TOTAL QTY: 74\n88.8');
+  assert.equal(usLocale, 'us');
+  const nUs = parsePdfNumberWithContext('88.8', usLocale);
+  assert.equal(nUs.value, 88.8);
+  assert.equal(nUs.raw, '88.8');
+  assert.equal(nUs.isAmbiguous, false);
+
+  // Standalone "2.498" tanpa konteks dokumen Indonesia/US harus ditandai ambigu
+  const ambig = parsePdfNumberWithContext('2.498', 'unknown', { isIntegerQtyContext: true });
+  assert.equal(ambig.value, 2498);
+  assert.equal(ambig.isAmbiguous, true);
+  assert.ok(ambig.reason);
+});
+
+test('13. Regresi WORKSHEET - WH_MO_22512.pdf (Koordinat 2 Halaman): Identitas, 4 Material, Kolom TOTAL Kosong != BALANCE, & Halaman 2 Material Card Diabaikan', () => {
+  const pages: PdfCoordinatePage[] = [
+    {
+      pageNum: 1,
+      width: 595,
+      height: 842,
+      items: [
+        // Header block (2-column layout with BUYER & ITEM distractors)
+        { str: 'NO. WORKSHEET :', x: 40, y: 780, width: 85, height: 10 },
+        { str: 'WH/MO/22512 · Lot - 1', x: 135, y: 780, width: 110, height: 10 },
+        { str: 'NO. OR :', x: 340, y: 780, width: 45, height: 10 },
+        { str: 'OR/2026/05/1014', x: 405, y: 780, width: 95, height: 10 },
+
+        { str: 'BUYER :', x: 40, y: 760, width: 42, height: 10 },
+        { str: 'PT KAIS RETAIL INDONESIA', x: 135, y: 760, width: 130, height: 10 },
+        { str: 'STYLE NO :', x: 340, y: 760, width: 55, height: 10 },
+        { str: '[KAIS08-2] KAIS TOPI PRMI 05', x: 405, y: 760, width: 145, height: 10 },
+
+        { str: 'ITEM :', x: 40, y: 740, width: 35, height: 10 },
+        { str: 'TOPI PRMI DEWASA', x: 135, y: 740, width: 95, height: 10 },
+        { str: 'TOTAL QTY :', x: 340, y: 740, width: 60, height: 10 },
+        { str: '2.498', x: 405, y: 740, width: 30, height: 10 },
+
+        // Section Title & Table Header
+        { str: 'MATERIAL & KONSUMSI', x: 40, y: 700, width: 130, height: 11 },
+        { str: 'NO', x: 30, y: 680, width: 15, height: 9 },
+        { str: 'CODE ACC', x: 55, y: 680, width: 48, height: 9 },
+        { str: 'DESCRIPTION', x: 135, y: 680, width: 65, height: 9 },
+        { str: 'CONS', x: 325, y: 680, width: 28, height: 9 },
+        { str: 'UNIT', x: 372, y: 680, width: 24, height: 9 },
+        { str: 'TOTAL', x: 418, y: 680, width: 32, height: 9 },
+        { str: 'RETURN', x: 472, y: 680, width: 38, height: 9 },
+        { str: 'BALANCE', x: 525, y: 680, width: 42, height: 9 },
+
+        // Row 1: TOTAL populated (104,9160)
+        { str: '1', x: 32, y: 660, width: 8, height: 9 },
+        { str: 'UNI-KAIS9122', x: 55, y: 660, width: 68, height: 9 },
+        { str: 'BATIK COTTON UNTUK TOPI KAIS', x: 135, y: 660, width: 155, height: 9 },
+        { str: '0,0420', x: 325, y: 660, width: 30, height: 9 },
+        { str: 'yard', x: 372, y: 660, width: 20, height: 9 },
+        { str: '104,9160', x: 416, y: 660, width: 40, height: 9 },
+        { str: '0', x: 485, y: 660, width: 8, height: 9 },
+        { str: '104,9160', x: 526, y: 660, width: 40, height: 9 },
+
+        // Row 2: TOTAL empty while BALANCE has 2.498,0000
+        { str: '2', x: 32, y: 640, width: 8, height: 9 },
+        { str: 'UNI-ACC10141', x: 55, y: 640, width: 70, height: 9 },
+        { str: 'HANGTAG TERATAI', x: 135, y: 640, width: 95, height: 9 },
+        { str: '1,0000', x: 325, y: 640, width: 30, height: 9 },
+        { str: 'Pcs', x: 374, y: 640, width: 16, height: 9 },
+        { str: '0', x: 485, y: 640, width: 8, height: 9 },
+        { str: '2.498,0000', x: 525, y: 640, width: 46, height: 9 },
+
+        // Row 3: TOTAL empty while BALANCE has 2.498,0000
+        { str: '3', x: 32, y: 620, width: 8, height: 9 },
+        { str: 'UNI-ACC9174', x: 55, y: 620, width: 65, height: 9 },
+        { str: 'TAG PIN 75 MILI', x: 135, y: 620, width: 85, height: 9 },
+        { str: '1,0000', x: 325, y: 620, width: 30, height: 9 },
+        { str: 'Pcs', x: 374, y: 620, width: 16, height: 9 },
+        { str: '0', x: 485, y: 620, width: 8, height: 9 },
+        { str: '2.498,0000', x: 525, y: 620, width: 46, height: 9 },
+
+        // Row 4: TOTAL populated
+        { str: '4', x: 32, y: 600, width: 8, height: 9 },
+        { str: 'UNI-KAIS9123', x: 55, y: 600, width: 68, height: 9 },
+        { str: 'COTTON POLOS COL. NAVY UNTUK TOPI KAIS', x: 135, y: 600, width: 175, height: 9 },
+        { str: '0,1000', x: 325, y: 600, width: 30, height: 9 },
+        { str: 'yard', x: 372, y: 600, width: 20, height: 9 },
+        { str: '249,8000', x: 416, y: 600, width: 40, height: 9 },
+        { str: '0', x: 485, y: 600, width: 8, height: 9 },
+        { str: '249,8000', x: 526, y: 600, width: 40, height: 9 },
+
+        // Summary line & footer
+        { str: '4 ITEM MATERIAL', x: 40, y: 575, width: 90, height: 9 },
+        { str: 'Page 1 of 2', x: 510, y: 30, width: 50, height: 8 },
+      ],
+    },
+    {
+      pageNum: 2,
+      width: 595,
+      height: 842,
+      items: [
+        { str: 'Material Card', x: 40, y: 780, width: 80, height: 12 },
+        { str: 'Gambar material card belum tersedia', x: 180, y: 500, width: 220, height: 11 },
+        { str: 'Page 2 of 2', x: 510, y: 30, width: 50, height: 8 },
+      ],
+    },
+  ];
+
+  const result = extractWorksheetFromPdfCoordinates(pages, 'WORKSHEET - WH_MO_22512.pdf');
+  assert.equal(result.success, true);
+  assert.ok(result.data);
+
+  // Verifikasi Identitas tidak tertukar
+  assert.equal(result.data.orNumber, '1014');
+  assert.equal(result.data.rawOrNumber, 'OR/2026/05/1014');
+  assert.equal(result.data.worksheetNo, 'WH/MO/22512 · Lot - 1');
+  assert.equal(result.data.style, '[KAIS08-2] KAIS TOPI PRMI 05');
+  assert.equal(result.data.target, 2498);
+  assert.equal(result.data.rawTarget, '2.498');
+
+  // Verifikasi tepat 4 baris material dalam urutan asli (tanpa baris ringkasan / Material Card)
+  assert.equal(result.data.materials.length, 4);
+  assert.deepEqual(
+    result.data.materials.map((m) => m.materialCode),
+    ['UNI-KAIS9122', 'UNI-ACC10141', 'UNI-ACC9174', 'UNI-KAIS9123']
+  );
+
+  // Row 1: desimal koma Indonesia presisi
+  assert.equal(result.data.materials[0].materialName, 'BATIK COTTON UNTUK TOPI KAIS');
+  assert.equal(result.data.materials[0].unit, 'yard');
+  assert.equal(result.data.materials[0].total, 104.916);
+  assert.equal(result.data.materials[0].rawTotal, '104,9160');
+
+  // Row 2 & 3: TOTAL kosong tetap null, TIDAK mengambil BALANCE 2.498,0000!
+  assert.equal(result.data.materials[1].materialName, 'HANGTAG TERATAI');
+  assert.equal(result.data.materials[1].unit, 'Pcs');
+  assert.equal(result.data.materials[1].total, null);
+  assert.equal(result.data.materials[2].materialName, 'TAG PIN 75 MILI');
+  assert.equal(result.data.materials[2].total, null);
+
+  // Row 4: tetap terbaca lengkap
+  assert.equal(result.data.materials[3].materialName, 'COTTON POLOS COL. NAVY UNTUK TOPI KAIS');
+  assert.equal(result.data.materials[3].unit, 'yard');
+  assert.equal(result.data.materials[3].total, 249.8);
+});
+
+test('14. Regresi Teks Tabular (No. OR tidak tertukar NO. WORKSHEET, Style tidak ambil "NO"/BUYER, Deskripsi mengandung UNIT/TOTAL tetap terbaca)', () => {
+  const tabularText = `
+NO. WORKSHEET : WH/MO/22512 · Lot - 1
+NO. OR : OR/2026/05/1014
+BUYER : PT KAIS RETAIL INDONESIA
+STYLE NO : [KAIS08-2] KAIS TOPI PRMI 05
+ITEM : TOPI PRMI
+TOTAL QTY : 2.498
+
+MATERIAL & KONSUMSI
+NO\tCODE ACC\tDESCRIPTION\tCONS\tUNIT\tTOTAL\tRETURN\tBALANCE
+1\tUNI-KAIS9122\tBATIK COTTON UNIT TOTAL TEST\t0,0420\tyard\t104,9160\t0\t104,9160
+2\tUNI-ACC10141\tHANGTAG TERATAI\t1,0000\tPcs\t\t0\t2.498,0000
+3\tUNI-ACC9174\tTAG PIN 75 MILI\t1,0000\tPcs\t\t0\t2.498,0000
+4\tUNI-KAIS9123\tCOTTON POLOS COL. NAVY\t0,1000\tyard\t249,8000\t0\t249,8000
+4 ITEM MATERIAL
+
+Material Card
+Gambar material card belum tersedia
+`;
+
+  const parsed = parseWorksheetText(tabularText, 'WORKSHEET - WH_MO_22512.pdf');
+  assert.equal(parsed.success, true);
+  assert.ok(parsed.data);
+  assert.equal(parsed.data.orNumber, '1014');
+  assert.equal(parsed.data.worksheetNo, 'WH/MO/22512 · Lot - 1');
+  assert.equal(parsed.data.style, '[KAIS08-2] KAIS TOPI PRMI 05');
+  assert.equal(parsed.data.target, 2498);
+  assert.equal(parsed.data.materials.length, 4);
+  assert.equal(parsed.data.materials[0].materialName, 'BATIK COTTON UNIT TOTAL TEST');
+  assert.equal(parsed.data.materials[0].total, 104.916);
+  assert.equal(parsed.data.materials[1].total, null);
+  assert.equal(parsed.data.materials[2].total, null);
+  assert.equal(parsed.data.materials[3].total, 249.8);
+});
+
+test('15. PDF Scan / Tanpa Text Layer + Rekonsiliasi & Flagging Konflik antara Teks Deterministik vs OCR/AI', () => {
+  // 1) PDF tanpa lapisan teks
+  const blankScanPages: PdfCoordinatePage[] = [{ pageNum: 1, items: [] }];
+  const scanRes = extractWorksheetFromPdfCoordinates(blankScanPages, 'ScanOnly.pdf');
+  assert.equal(scanRes.success, false);
+  assert.match(scanRes.error || '', /tidak berisi lapisan teks|scan/i);
+
+  // 2) Rekonsiliasi ketika hasil teks dan OCR/AI berbeda -> wajib menandai needsReview & fieldWarnings!
+  const detWs = {
+    id: 'ws-det',
+    fileName: 'Conflict.pdf',
+    orNumber: '1014',
+    rawOrNumber: 'OR/2026/05/1014',
+    worksheetNo: 'WH/MO/22512 · Lot - 1',
+    style: '[KAIS08-2] KAIS TOPI PRMI 05',
+    target: 2498,
+    rawTarget: '2.498',
+    materials: [
+      { materialCode: 'UNI-KAIS9122', materialName: 'BATIK COTTON', unit: 'yard', total: 104.916, rawTotal: '104,9160' },
+      { materialCode: 'UNI-ACC10141', materialName: 'HANGTAG TERATAI', unit: 'Pcs', total: null, rawTotal: '' },
+    ],
+  };
+
+  const aiWs = {
+    id: 'ws-ai',
+    fileName: 'Conflict.pdf',
+    orNumber: '1015', // berbeda dengan det!
+    rawOrNumber: 'OR/2026/05/1015',
+    worksheetNo: 'WH/MO/22512 · Lot - 1',
+    style: '[KAIS08-2] KAIS TOPI PRMI 05',
+    target: 2.498, // AI salah baca titik ribuan jadi desimal!
+    rawTarget: '2.498',
+    materials: [
+      { materialCode: 'UNI-KAIS9122', materialName: 'BATIK COTTON', unit: 'yard', total: 104.916, rawTotal: '104,9160' },
+      { materialCode: 'UNI-ACC10141', materialName: 'HANGTAG TERATAI', unit: 'Pcs', total: 2498, rawTotal: '2.498,0000' },
+    ],
+  };
+
+  const reconciled = reconcileWorksheetExtractions(detWs, aiWs, 'Conflict.pdf');
+  assert.equal(reconciled.extractionMethod, 'hybrid');
+  assert.equal(reconciled.needsReview, true);
+  assert.ok(reconciled.fieldWarnings?.some((w) => w.field === 'orNumber'));
+  assert.ok(reconciled.fieldWarnings?.some((w) => w.field === 'target'));
+  // Baris 2 (TOTAL kosong pada sumber PDF) TIDAK boleh diisi dari angka Gemini (2498)
+  assert.equal(reconciled.materials[1].total, null);
+  assert.equal(reconciled.materials[1].rawTotal, '');
+  assert.equal(reconciled.materials[1].totalStatus, 'empty');
+  assert.match(reconciled.materials[1].reviewNote || '', /kosong pada sumber PDF/i);
+});
+
+test('16. Ekstraksi Real PDF Binary Buffer via pdf-parse (PDFParse.load -> getTextContent -> extractWorksheetFromPdfCoordinates)', async () => {
+  // Bangun PDF binary valid sederhana dengan sintaks PDF 1.4 standar (multi-halaman: Halaman 1 Worksheet, Halaman 2 Material Card)
+  const buildSimplePdf = (pageStreams: string[]): Buffer => {
+    const objects: string[] = [];
+    // 1: Catalog, 2: Pages, 3: Font
+    objects.push('1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n');
+    const pageObjNums = pageStreams.map((_, idx) => 4 + idx * 2);
+    objects.push(
+      `2 0 obj\n<< /Type /Pages /Kids [${pageObjNums.map((n) => `${n} 0 R`).join(' ')}] /Count ${pageStreams.length} >>\nendobj\n`
+    );
+    objects.push('3 0 obj\n<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>\nendobj\n');
+
+    pageStreams.forEach((stream, idx) => {
+      const pageNum = 4 + idx * 2;
+      const contentNum = pageNum + 1;
+      objects.push(
+        `${pageNum} 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents ${contentNum} 0 R >>\nendobj\n`
+      );
+      const len = Buffer.byteLength(stream, 'utf8');
+      objects.push(
+        `${contentNum} 0 obj\n<< /Length ${len} >>\nstream\n${stream}\nendstream\nendobj\n`
+      );
+    });
+
+    let pdf = '%PDF-1.4\n';
+    const offsets: number[] = [0];
+    for (const obj of objects) {
+      offsets.push(Buffer.byteLength(pdf, 'utf8'));
+      pdf += obj;
+    }
+    const xrefPos = Buffer.byteLength(pdf, 'utf8');
+    pdf += `xref\n0 ${objects.length + 1}\n0000000000 65535 f \n`;
+    for (let i = 1; i <= objects.length; i++) {
+      pdf += `${String(offsets[i]).padStart(10, '0')} 00000 n \n`;
+    }
+    pdf += `trailer\n<< /Size ${objects.length + 1} /Root 1 0 R >>\nstartxref\n${xrefPos}\n%%EOF\n`;
+    return Buffer.from(pdf, 'utf8');
+  };
+
+  const escapePdfStr = (s: string) => s.replace(/\\/g, '\\\\').replace(/\(/g, '\\(').replace(/\)/g, '\\)');
+  const drawAt = (x: number, y: number, text: string) =>
+    `BT /F1 9 Tf 1 0 0 1 ${x} ${y} Tm (${escapePdfStr(text)}) Tj ET`;
+
+  const page1Stream = [
+    drawAt(40, 740, 'NO. WORKSHEET :'),
+    drawAt(135, 740, 'WH/MO/22512 - Lot 1'),
+    drawAt(330, 740, 'NO. OR :'),
+    drawAt(395, 740, 'OR/2026/05/1014'),
+    drawAt(40, 720, 'BUYER : PT KAIS'),
+    drawAt(330, 720, 'STYLE NO :'),
+    drawAt(395, 720, '[KAIS08-2] KAIS TOPI PRMI 05'),
+    drawAt(330, 700, 'TOTAL QTY :'),
+    drawAt(395, 700, '2.498'),
+    drawAt(40, 665, 'MATERIAL & KONSUMSI'),
+    drawAt(30, 645, 'NO'),
+    drawAt(60, 645, 'CODE ACC'),
+    drawAt(140, 645, 'DESCRIPTION'),
+    drawAt(330, 645, 'CONS'),
+    drawAt(380, 645, 'UNIT'),
+    drawAt(425, 645, 'TOTAL'),
+    drawAt(480, 645, 'RETURN'),
+    drawAt(535, 645, 'BALANCE'),
+    drawAt(30, 625, '1'),
+    drawAt(60, 625, 'UNI-KAIS9122'),
+    drawAt(140, 625, 'BATIK COTTON UNTUK TOPI KAIS'),
+    drawAt(330, 625, '0,0420'),
+    drawAt(380, 625, 'yard'),
+    drawAt(425, 625, '104,9160'),
+    drawAt(480, 625, '0'),
+    drawAt(535, 625, '104,9160'),
+    drawAt(30, 605, '2'),
+    drawAt(60, 605, 'UNI-ACC10141'),
+    drawAt(140, 605, 'HANGTAG TERATAI'),
+    drawAt(330, 605, '1,0000'),
+    drawAt(380, 605, 'Pcs'),
+    drawAt(480, 605, '0'),
+    drawAt(535, 605, '2.498,0000'),
+    drawAt(40, 580, '2 ITEM MATERIAL'),
+  ].join('\n');
+
+  const page2Stream = [
+    drawAt(40, 740, 'Material Card'),
+    drawAt(180, 500, 'Gambar material card belum tersedia'),
+  ].join('\n');
+
+  const pdfBuffer = buildSimplePdf([page1Stream, page2Stream]);
+  const { PDFParse } = await import('pdf-parse');
+  const parser = new (PDFParse as any)({ data: pdfBuffer });
+  try {
+    const doc = await parser.load();
+    const pages: PdfCoordinatePage[] = [];
+    for (let pageNum = 1; pageNum <= doc.numPages; pageNum++) {
+      const page = await doc.getPage(pageNum);
+      const tc = await page.getTextContent();
+      pages.push({
+        pageNum,
+        items: tc.items.map((it: any) => ({
+          str: String(it.str || ''),
+          x: Number(it.transform?.[4] ?? 0),
+          y: Number(it.transform?.[5] ?? 0),
+          width: Number(it.width ?? 0),
+          height: Number(it.height ?? 9),
+        })),
+      });
+    }
+
+    const extracted = extractWorksheetFromPdfCoordinates(pages, 'WORKSHEET - WH_MO_22512.pdf');
+    assert.equal(extracted.success, true);
+    assert.equal(extracted.data?.orNumber, '1014');
+    assert.equal(extracted.data?.worksheetNo, 'WH/MO/22512 - Lot 1');
+    assert.equal(extracted.data?.style, '[KAIS08-2] KAIS TOPI PRMI 05');
+    assert.equal(extracted.data?.target, 2498);
+    assert.equal(extracted.data?.materials.length, 2);
+    assert.equal(extracted.data?.materials[0].total, 104.916);
+    assert.equal(extracted.data?.materials[1].total, null);
+
+    // Validasi: gagal jika data wajib hilang
+    const badCheck = validateExtractedWorksheet({
+      id: 'ws-bad',
+      fileName: 'Bad.pdf',
+      orNumber: '',
+      style: '',
+      target: null,
+      materials: [],
+    });
+    assert.equal(badCheck.needsReview, true);
+    assert.ok(badCheck.fieldWarnings.some((w) => w.severity === 'error'));
+  } finally {
+    if (typeof parser.destroy === 'function') {
+      await parser.destroy();
+    }
+  }
+});
+
+test('17. Regresi Kasus A: Deterministik TOTAL kosong + Gemini mengembalikan angka -> TOTAL tetap null, tidak ambil tebakan AI', () => {
+  const detWs = {
+    id: 'ws-a-det',
+    fileName: 'KasusA.pdf',
+    orNumber: '1014',
+    rawOrNumber: 'OR/2026/05/1014',
+    worksheetNo: 'WH/MO/22512 · Lot - 1',
+    style: '[KAIS08-2] KAIS TOPI PRMI 05',
+    target: 2498,
+    rawTarget: '2.498',
+    materials: [
+      {
+        materialCode: 'UNI-ACC10141',
+        materialName: 'HANGTAG TERATAI',
+        unit: 'Pcs',
+        total: null,
+        rawTotal: '',
+        totalStatus: 'empty' as const,
+        needsReview: false,
+      },
+      {
+        materialCode: 'UNI-ACC9174',
+        materialName: 'TAG PIN 75 MILI',
+        unit: 'Pcs',
+        total: null,
+        rawTotal: '',
+        totalStatus: 'empty' as const,
+        needsReview: false,
+      },
+    ],
+  };
+
+  const aiWs = {
+    id: 'ws-a-ai',
+    fileName: 'KasusA.pdf',
+    orNumber: '1014',
+    rawOrNumber: 'OR/2026/05/1014',
+    worksheetNo: 'WH/MO/22512 · Lot - 1',
+    style: '[KAIS08-2] KAIS TOPI PRMI 05',
+    target: 2498,
+    rawTarget: '2.498',
+    materials: [
+      {
+        materialCode: 'UNI-ACC10141',
+        materialName: 'HANGTAG TERATAI',
+        unit: 'Pcs',
+        total: 2498,
+        rawTotal: '2.498,0000',
+      },
+      {
+        materialCode: 'UNI-ACC9174',
+        materialName: 'TAG PIN 75 MILI',
+        unit: 'Pcs',
+        total: 2498,
+        rawTotal: '2.498,0000',
+      },
+    ],
+  };
+
+  const reconciled = reconcileWorksheetExtractions(detWs, aiWs, 'KasusA.pdf');
+
+  assert.equal(reconciled.materials.length, 2);
+  assert.deepEqual(
+    reconciled.materials.map((m) => m.materialCode),
+    ['UNI-ACC10141', 'UNI-ACC9174']
+  );
+  assert.deepEqual(
+    reconciled.materials.map((m) => m.materialName),
+    ['HANGTAG TERATAI', 'TAG PIN 75 MILI']
+  );
+  assert.deepEqual(
+    reconciled.materials.map((m) => m.unit),
+    ['Pcs', 'Pcs']
+  );
+
+  for (const m of reconciled.materials) {
+    assert.equal(m.total, null);
+    assert.equal(m.rawTotal, '');
+    assert.equal(m.totalStatus, 'empty');
+    assert.match(m.reviewNote || '', /TOTAL kosong pada sumber PDF/i);
+  }
+});
+
+test('18. Regresi Kasus B: Deterministik & Gemini sama-sama menemukan TOTAL -> nilai dipertahankan, warning muncul jika berbeda', () => {
+  const detWs = {
+    id: 'ws-b-det',
+    fileName: 'KasusB.pdf',
+    orNumber: '1014',
+    style: '[KAIS08-2] KAIS TOPI PRMI 05',
+    target: 2498,
+    materials: [
+      { materialCode: 'UNI-KAIS9122', materialName: 'BATIK COTTON', unit: 'yard', total: 104.916, rawTotal: '104,9160', totalStatus: 'present' as const },
+      { materialCode: 'UNI-KAIS9123', materialName: 'COTTON POLOS', unit: 'yard', total: 249.8, rawTotal: '249,8000', totalStatus: 'present' as const },
+    ],
+  };
+
+  const aiSame = {
+    id: 'ws-b-ai-same',
+    fileName: 'KasusB.pdf',
+    orNumber: '1014',
+    style: '[KAIS08-2] KAIS TOPI PRMI 05',
+    target: 2498,
+    materials: [
+      { materialCode: 'UNI-KAIS9122', materialName: 'BATIK COTTON', unit: 'yard', total: 104.916, rawTotal: '104,9160' },
+      { materialCode: 'UNI-KAIS9123', materialName: 'COTTON POLOS', unit: 'yard', total: 249.8, rawTotal: '249,8000' },
+    ],
+  };
+
+  const sameResult = reconcileWorksheetExtractions(detWs, aiSame, 'KasusB.pdf');
+  assert.equal(sameResult.materials[0].total, 104.916);
+  assert.equal(sameResult.materials[1].total, 249.8);
+  assert.equal(sameResult.needsReview, false);
+  assert.equal(sameResult.fieldWarnings?.length, 0);
+
+  const aiDiff = {
+    ...aiSame,
+    materials: [
+      { materialCode: 'UNI-KAIS9122', materialName: 'BATIK COTTON', unit: 'yard', total: 104.916, rawTotal: '104,9160' },
+      { materialCode: 'UNI-KAIS9123', materialName: 'COTTON POLOS', unit: 'yard', total: 250, rawTotal: '250,0000' },
+    ],
+  };
+
+  const diffResult = reconcileWorksheetExtractions(detWs, aiDiff, 'KasusB.pdf');
+  assert.equal(diffResult.materials[0].total, 104.916);
+  assert.equal(diffResult.materials[1].total, 249.8);
+  assert.equal(diffResult.needsReview, true);
+  assert.equal(diffResult.materials[1].needsReview, true);
+  assert.ok(diffResult.fieldWarnings?.some((w) => w.field === 'materials[1].total'));
+});
+
+test('19. Regresi Kasus C: Kolom TOTAL terbaca sebagai angka -> nilai tetap terbaca sesuai angka aslinya', () => {
+  const pages: PdfCoordinatePage[] = [
+    {
+      pageNum: 1,
+      items: [
+        { str: 'NO. OR : OR/2026/05/1014', x: 40, y: 740, width: 150, height: 10 },
+        { str: 'STYLE NO : [KAIS08-2] KAIS TOPI PRMI 05', x: 40, y: 720, width: 200, height: 10 },
+        { str: 'TOTAL QTY : 2.498', x: 40, y: 700, width: 120, height: 10 },
+        { str: 'MATERIAL & KONSUMSI', x: 40, y: 670, width: 140, height: 10 },
+        { str: 'CODE ACC', x: 40, y: 650, width: 60, height: 9 },
+        { str: 'DESCRIPTION', x: 130, y: 650, width: 120, height: 9 },
+        { str: 'CONS', x: 320, y: 650, width: 40, height: 9 },
+        { str: 'UNIT', x: 375, y: 650, width: 35, height: 9 },
+        { str: 'TOTAL', x: 430, y: 650, width: 45, height: 9 },
+        { str: 'RETURN', x: 490, y: 650, width: 45, height: 9 },
+        { str: 'BALANCE', x: 545, y: 650, width: 50, height: 9 },
+        { str: 'UNI-KAIS9122', x: 40, y: 630, width: 70, height: 9 },
+        { str: 'BATIK COTTON', x: 130, y: 630, width: 110, height: 9 },
+        { str: '0,0420', x: 320, y: 630, width: 40, height: 9 },
+        { str: 'yard', x: 375, y: 630, width: 25, height: 9 },
+        { str: '104,9160', x: 430, y: 630, width: 45, height: 9 },
+        { str: '0', x: 490, y: 630, width: 15, height: 9 },
+        { str: '104,9160', x: 545, y: 630, width: 45, height: 9 },
+      ],
+    },
+  ];
+
+  const extracted = extractWorksheetFromPdfCoordinates(pages, 'KasusC.pdf');
+  assert.equal(extracted.success, true);
+  assert.ok(extracted.data);
+  assert.equal(extracted.data.materials[0].total, 104.916);
+  assert.equal(extracted.data.materials[0].rawTotal, '104,9160');
+  assert.equal(extracted.data.materials[0].totalStatus, 'present');
+
+  const reconciled = reconcileWorksheetExtractions(extracted.data, null, 'KasusC.pdf');
+  assert.equal(reconciled.materials[0].total, 104.916);
+  assert.equal(reconciled.materials[0].totalStatus, 'present');
+});
+
+test('20. Regresi Kasus D: Kolom BALANCE dan RETURN berisi angka saat TOTAL kosong -> angka BALANCE/RETURN tidak pernah masuk ke TOTAL', () => {
+  const pages: PdfCoordinatePage[] = [
+    {
+      pageNum: 1,
+      items: [
+        { str: 'NO. OR : OR/2026/05/1014', x: 40, y: 740, width: 150, height: 10 },
+        { str: 'STYLE NO : [KAIS08-2] KAIS TOPI PRMI 05', x: 40, y: 720, width: 200, height: 10 },
+        { str: 'TOTAL QTY : 2.498', x: 40, y: 700, width: 120, height: 10 },
+        { str: 'MATERIAL & KONSUMSI', x: 40, y: 670, width: 140, height: 10 },
+        { str: 'CODE ACC', x: 40, y: 650, width: 60, height: 9 },
+        { str: 'DESCRIPTION', x: 130, y: 650, width: 120, height: 9 },
+        { str: 'CONS', x: 320, y: 650, width: 40, height: 9 },
+        { str: 'UNIT', x: 375, y: 650, width: 35, height: 9 },
+        { str: 'TOTAL', x: 430, y: 650, width: 45, height: 9 },
+        { str: 'RETURN', x: 490, y: 650, width: 45, height: 9 },
+        { str: 'BALANCE', x: 545, y: 650, width: 50, height: 9 },
+        // Baris dengan TOTAL kosong, RETURN = 15, BALANCE = 2.498,0000
+        { str: 'UNI-ACC10141', x: 40, y: 630, width: 70, height: 9 },
+        { str: 'HANGTAG TERATAI', x: 130, y: 630, width: 110, height: 9 },
+        { str: '1,0000', x: 320, y: 630, width: 40, height: 9 },
+        { str: 'Pcs', x: 375, y: 630, width: 25, height: 9 },
+        { str: '15,0000', x: 490, y: 630, width: 40, height: 9 },
+        { str: '2.498,0000', x: 545, y: 630, width: 50, height: 9 },
+      ],
+    },
+  ];
+
+  const extracted = extractWorksheetFromPdfCoordinates(pages, 'KasusD.pdf');
+  assert.equal(extracted.success, true);
+  assert.ok(extracted.data);
+  assert.equal(extracted.data.materials.length, 1);
+  assert.equal(extracted.data.materials[0].total, null);
+  assert.equal(extracted.data.materials[0].rawTotal, '');
+  assert.equal(extracted.data.materials[0].totalStatus, 'empty');
+
+  // Simulasikan Gemini salah mengambil angka BALANCE (2498) atau RETURN (15) sebagai TOTAL
+  const aiMisreadBalance = {
+    ...extracted.data,
+    id: 'ws-d-ai',
+    materials: [
+      {
+        materialCode: 'UNI-ACC10141',
+        materialName: 'HANGTAG TERATAI',
+        unit: 'Pcs',
+        total: 2498,
+        rawTotal: '2.498,0000',
+      },
+    ],
+  };
+
+  const reconciled = reconcileWorksheetExtractions(extracted.data, aiMisreadBalance, 'KasusD.pdf');
+  assert.equal(reconciled.materials[0].total, null);
+  assert.equal(reconciled.materials[0].rawTotal, '');
+  assert.equal(reconciled.materials[0].totalStatus, 'empty');
+  assert.match(reconciled.materials[0].reviewNote || '', /kosong pada sumber PDF/i);
+});
+
+test('21. Pembedaan TOTAL kosong vs TOTAL gagal terbaca (unreadable): tidak menebak angka dan wajib beri peringatan pemeriksaan', () => {
+  // Kasus 1: sel TOTAL berisi teks rusak non-numerik ("???") pada koordinat kolom TOTAL
+  const garbledPages: PdfCoordinatePage[] = [
+    {
+      pageNum: 1,
+      items: [
+        { str: 'NO. OR : OR/2026/05/1014', x: 40, y: 740, width: 150, height: 10 },
+        { str: 'STYLE NO : [KAIS08-2] KAIS TOPI PRMI 05', x: 40, y: 720, width: 200, height: 10 },
+        { str: 'TOTAL QTY : 2.498', x: 40, y: 700, width: 120, height: 10 },
+        { str: 'MATERIAL & KONSUMSI', x: 40, y: 670, width: 140, height: 10 },
+        { str: 'CODE ACC', x: 40, y: 650, width: 60, height: 9 },
+        { str: 'DESCRIPTION', x: 130, y: 650, width: 120, height: 9 },
+        { str: 'UNIT', x: 375, y: 650, width: 35, height: 9 },
+        { str: 'TOTAL', x: 430, y: 650, width: 45, height: 9 },
+        { str: 'UNI-ACC10141', x: 40, y: 630, width: 70, height: 9 },
+        { str: 'HANGTAG TERATAI', x: 130, y: 630, width: 110, height: 9 },
+        { str: 'Pcs', x: 375, y: 630, width: 25, height: 9 },
+        { str: '???', x: 430, y: 630, width: 25, height: 9 },
+      ],
+    },
+  ];
+
+  const garbledRes = extractWorksheetFromPdfCoordinates(garbledPages, 'UnreadableTotal.pdf');
+  assert.equal(garbledRes.success, true);
+  assert.ok(garbledRes.data);
+  assert.equal(garbledRes.data.materials[0].total, null);
+  assert.equal(garbledRes.data.materials[0].totalStatus, 'unreadable');
+  assert.equal(garbledRes.data.materials[0].needsReview, true);
+  assert.equal(garbledRes.data.needsReview, true);
+  assert.ok(garbledRes.data.fieldWarnings?.some((w) => w.field === 'materials[0].total'));
+
+  // Rekonsiliasi dengan Gemini tetap tidak boleh menebak angka untuk baris unreadable
+  const aiGuess = {
+    ...garbledRes.data,
+    id: 'ws-u-ai',
+    materials: [
+      { materialCode: 'UNI-ACC10141', materialName: 'HANGTAG TERATAI', unit: 'Pcs', total: 999, rawTotal: '999' },
+    ],
+  };
+  const reconciledUnreadable = reconcileWorksheetExtractions(garbledRes.data, aiGuess, 'UnreadableTotal.pdf');
+  assert.equal(reconciledUnreadable.materials[0].total, null);
+  assert.equal(reconciledUnreadable.materials[0].totalStatus, 'unreadable');
+  assert.equal(reconciledUnreadable.materials[0].needsReview, true);
+  assert.equal(reconciledUnreadable.needsReview, true);
+  assert.ok(reconciledUnreadable.fieldWarnings?.some((w) => w.field === 'materials[0].total'));
+});
+
+
 
