@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useState, useMemo, useEffect } from 'react';
+import React, { createContext, useContext, useState, useMemo, useEffect, useRef } from 'react';
 import {
   Material,
   Warehouse,
@@ -42,10 +42,17 @@ import {
   UploadProgressCallbackInfo,
   deleteRequirementsFromSupabase,
   logDeletionToSupabase,
-  saveScheduleToSupabase,
+  createScheduleInSupabase,
+  updateScheduleInSupabase,
   deleteScheduleFromSupabase,
   seedLocalDataToSupabase,
 } from '../lib/supabase';
+import {
+  ScheduleCrudResult,
+  createScheduleWithPersistence,
+  updateScheduleWithPersistence,
+  deleteScheduleWithPersistence,
+} from '../utils/scheduleCrudLogic';
 
 export type AppMenu =
   | 'Dashboard'
@@ -81,14 +88,14 @@ interface PpicContextType {
 
   // Production Schedules (Production Planning Board / Gantt)
   productionSchedules: ProductionSchedule[];
-  addProductionSchedule: (sch: Omit<ProductionSchedule, 'id'>) => ProductionSchedule;
-  updateProductionSchedule: (id: string, updates: Partial<ProductionSchedule>) => void;
-  deleteProductionSchedule: (id: string) => void;
+  addProductionSchedule: (sch: Omit<ProductionSchedule, 'id'> & { id?: string }) => Promise<ScheduleCrudResult>;
+  updateProductionSchedule: (id: string, updates: Partial<ProductionSchedule>) => Promise<ScheduleCrudResult>;
+  deleteProductionSchedule: (id: string) => Promise<ScheduleCrudResult>;
   scheduleConflicts: Map<string, ScheduleConflict>;
   workOrders: ProductionSchedule[]; // Alias for backward compatibility
-  addWorkOrder: (wo: any) => void;
-  updateWorkOrder: (id: string, updates: any) => void;
-  deleteWorkOrder: (id: string) => void;
+  addWorkOrder: (wo: any) => Promise<ScheduleCrudResult>;
+  updateWorkOrder: (id: string, updates: any) => Promise<ScheduleCrudResult>;
+  deleteWorkOrder: (id: string) => Promise<ScheduleCrudResult>;
 
   // Material Requirements (Per OR & Style)
   materialRequirements: MaterialItemRequirement[];
@@ -315,6 +322,7 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       return INITIAL_PRODUCTION_SCHEDULES;
     }
   });
+  const productionSchedulesRef = useRef<ProductionSchedule[]>(productionSchedules);
 
   // Master Materials & Warehouses
   const [materials, setMaterials] = useState<Material[]>(() => {
@@ -378,6 +386,7 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
   }, [materialRequirements]);
 
   useEffect(() => {
+    productionSchedulesRef.current = productionSchedules;
     try {
       localStorage.setItem(`${LOCAL_STORAGE_KEY}_schedules`, JSON.stringify(productionSchedules));
     } catch (e) {
@@ -1304,45 +1313,101 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     return calculateMaterialComparisonMetrics(materialRequirements);
   }, [materialRequirements]);
 
-  // Schedule CRUD
-  const addProductionSchedule = (sch: Omit<ProductionSchedule, 'id'>): ProductionSchedule => {
-    const newSch: ProductionSchedule = {
-      ...sch,
-      id: `sch-${Date.now()}-${Math.floor(Math.random() * 1000)}`,
-      status: sch.status || 'Terjadwal',
-    };
-
-    setProductionSchedules((prev) => [...prev, newSch]);
-
-    // Automatically remember OR <-> Style relation
-    saveOrStyleRelation(sch.orNumber, sch.style);
-
-    if (getSupabaseCredentials().isConfigured) {
-      saveScheduleToSupabase(newSch);
+  const commitProductionSchedules = (
+    updater: (prev: ProductionSchedule[]) => ProductionSchedule[]
+  ): ProductionSchedule[] => {
+    const next = updater(productionSchedulesRef.current);
+    productionSchedulesRef.current = next;
+    setProductionSchedules(next);
+    try {
+      localStorage.setItem(`${LOCAL_STORAGE_KEY}_schedules`, JSON.stringify(next));
+    } catch (e) {
+      console.error(e);
     }
-
-    return newSch;
+    return next;
   };
 
-  const updateProductionSchedule = (id: string, updates: Partial<ProductionSchedule>) => {
-    setProductionSchedules((prev) => {
-      const next = prev.map((s) => (s.id === id ? { ...s, ...updates } : s));
-      const target = next.find((s) => s.id === id);
-      if (target && getSupabaseCredentials().isConfigured) {
-        saveScheduleToSupabase(target);
-      }
-      return next;
+  // Schedule CRUD
+  const addProductionSchedule = async (
+    sch: Omit<ProductionSchedule, 'id'> & { id?: string }
+  ): Promise<ScheduleCrudResult> => {
+    const creds = getSupabaseCredentials();
+    const res = await createScheduleWithPersistence(productionSchedulesRef.current, sch, {
+      isConfigured: creds.isConfigured,
+      createSchedule: createScheduleInSupabase,
+      updateSchedule: updateScheduleInSupabase,
+      deleteSchedule: deleteScheduleFromSupabase,
     });
+
+    if (!res.success || !res.schedule) {
+      return {
+        success: false,
+        error: res.error || 'Gagal menyimpan jadwal produksi.',
+      };
+    }
+
+    const savedSchedule = res.schedule;
+    commitProductionSchedules((prev) =>
+      prev.some((s) => s.id === savedSchedule.id)
+        ? prev.map((s) => (s.id === savedSchedule.id ? savedSchedule : s))
+        : [...prev, savedSchedule]
+    );
+
+    // Automatically remember OR <-> Style relation
+    saveOrStyleRelation(savedSchedule.orNumber, savedSchedule.style);
+
+    return { success: true, schedule: savedSchedule };
+  };
+
+  const updateProductionSchedule = async (
+    id: string,
+    updates: Partial<ProductionSchedule>
+  ): Promise<ScheduleCrudResult> => {
+    const creds = getSupabaseCredentials();
+    const res = await updateScheduleWithPersistence(productionSchedulesRef.current, id, updates, {
+      isConfigured: creds.isConfigured,
+      createSchedule: createScheduleInSupabase,
+      updateSchedule: updateScheduleInSupabase,
+      deleteSchedule: deleteScheduleFromSupabase,
+    });
+
+    if (!res.success || !res.schedule) {
+      return {
+        success: false,
+        error: res.error || 'Gagal memperbarui jadwal produksi.',
+      };
+    }
+
+    const updatedSchedule = res.schedule;
+    commitProductionSchedules((prev) =>
+      prev.map((s) => (s.id === updatedSchedule.id ? updatedSchedule : s))
+    );
+
     if (updates.orNumber && updates.style) {
       saveOrStyleRelation(updates.orNumber, updates.style);
     }
+
+    return { success: true, schedule: updatedSchedule };
   };
 
-  const deleteProductionSchedule = (id: string) => {
-    setProductionSchedules((prev) => prev.filter((s) => s.id !== id));
-    if (getSupabaseCredentials().isConfigured) {
-      deleteScheduleFromSupabase(id);
+  const deleteProductionSchedule = async (id: string): Promise<ScheduleCrudResult> => {
+    const creds = getSupabaseCredentials();
+    const res = await deleteScheduleWithPersistence(productionSchedulesRef.current, id, {
+      isConfigured: creds.isConfigured,
+      createSchedule: createScheduleInSupabase,
+      updateSchedule: updateScheduleInSupabase,
+      deleteSchedule: deleteScheduleFromSupabase,
+    });
+
+    if (!res.success) {
+      return {
+        success: false,
+        error: res.error || 'Gagal menghapus jadwal produksi.',
+      };
     }
+
+    commitProductionSchedules((prev) => prev.filter((s) => s.id !== id));
+    return { success: true };
   };
 
   // Requirement CRUD

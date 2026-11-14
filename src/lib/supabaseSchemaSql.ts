@@ -79,6 +79,7 @@ CREATE INDEX IF NOT EXISTS idx_mat_req_or_trgm ON public.material_requirements U
 CREATE INDEX IF NOT EXISTS idx_mat_req_style_trgm ON public.material_requirements USING gin (style gin_trgm_ops);
 
 -- 5. TABEL: production_schedules (Penjadwalan Produksi / Gantt Board)
+-- CATATAN: Tabel ini dan seluruh lampiran PDF Worksheet / Snapshot dikecualikan dari Rolling 4 Hari.
 CREATE TABLE IF NOT EXISTS public.production_schedules (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     or_number TEXT NOT NULL,
@@ -89,11 +90,59 @@ CREATE TABLE IF NOT EXISTS public.production_schedules (
     target INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'Terjadwal',
     notes TEXT,
+    worksheets_snapshot JSONB,
     created_at TIMESTAMPTZ DEFAULT NOW(),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_schedules_or ON public.production_schedules(or_number);
 CREATE INDEX IF NOT EXISTS idx_schedules_dates ON public.production_schedules(production_date, finish_date);
+
+-- 5B. TABEL: production_schedule_worksheets (Dokumen PDF Worksheet Terlampir pada Jadwal)
+-- TIDAK memiliki FK ON DELETE CASCADE ke upload_history agar tetap utuh saat Rolling 4 Hari berjalan.
+CREATE TABLE IF NOT EXISTS public.production_schedule_worksheets (
+    id TEXT PRIMARY KEY,
+    schedule_id UUID NOT NULL REFERENCES public.production_schedules(id) ON DELETE CASCADE,
+    file_name TEXT NOT NULL,
+    or_number TEXT NOT NULL,
+    style TEXT NOT NULL,
+    target INTEGER NOT NULL DEFAULT 0,
+    matched_upload_id TEXT,
+    matched_upload_date DATE,
+    matched_upload_time TEXT,
+    matched_upload_created_at TIMESTAMPTZ,
+    last_synced_at TIMESTAMPTZ,
+    uploaded_at TIMESTAMPTZ DEFAULT NOW(),
+    created_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sched_ws_schedule_id ON public.production_schedule_worksheets(schedule_id);
+CREATE INDEX IF NOT EXISTS idx_sched_ws_or ON public.production_schedule_worksheets(or_number);
+
+-- 5C. TABEL: production_schedule_material_snapshots (Snapshot Historis Ketersediaan Material PDF)
+-- Menyimpan nilai Diterima dan Status pada saat jadwal disimpan / di-refresh manual.
+-- Dikecualikan penuh dari Rolling 4 Hari dan tidak terikat FK ke upload_history.
+CREATE TABLE IF NOT EXISTS public.production_schedule_material_snapshots (
+    id TEXT PRIMARY KEY,
+    schedule_id UUID NOT NULL REFERENCES public.production_schedules(id) ON DELETE CASCADE,
+    worksheet_id TEXT NOT NULL,
+    row_order INTEGER NOT NULL DEFAULT 0,
+    or_number TEXT NOT NULL,
+    style TEXT NOT NULL,
+    material_code TEXT NOT NULL,
+    material_name TEXT NOT NULL,
+    unit TEXT NOT NULL,
+    pdf_total NUMERIC(14, 2) NOT NULL DEFAULT 0,
+    received_qty NUMERIC(14, 2),
+    status TEXT,
+    is_found_in_master_data BOOLEAN NOT NULL DEFAULT FALSE,
+    matched_upload_id TEXT,
+    matched_upload_date DATE,
+    matched_upload_time TEXT,
+    matched_upload_created_at TIMESTAMPTZ,
+    matched_at TIMESTAMPTZ DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_sched_mat_snap_schedule_id ON public.production_schedule_material_snapshots(schedule_id);
+CREATE INDEX IF NOT EXISTS idx_sched_mat_snap_ws_id ON public.production_schedule_material_snapshots(worksheet_id);
+CREATE INDEX IF NOT EXISTS idx_sched_mat_snap_or_code ON public.production_schedule_material_snapshots(or_number, material_code);
 
 -- 6. TABEL: master_materials (Katalog Master Material)
 CREATE TABLE IF NOT EXISTS public.master_materials (
@@ -180,6 +229,7 @@ BEGIN
   ALTER TABLE IF EXISTS public.production_schedules ALTER COLUMN style TYPE TEXT;
   ALTER TABLE IF EXISTS public.production_schedules ALTER COLUMN production_line TYPE TEXT;
   ALTER TABLE IF EXISTS public.production_schedules ALTER COLUMN status TYPE TEXT;
+  ALTER TABLE IF EXISTS public.production_schedules ADD COLUMN IF NOT EXISTS worksheets_snapshot JSONB;
 
   ALTER TABLE IF EXISTS public.master_materials ALTER COLUMN code TYPE TEXT;
   ALTER TABLE IF EXISTS public.master_materials ALTER COLUMN name TYPE TEXT;
@@ -208,6 +258,8 @@ ALTER TABLE public.or_style_relations ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.upload_history ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.material_requirements ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.production_schedules ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.production_schedule_worksheets ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.production_schedule_material_snapshots ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.master_materials ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.warehouse_stock ENABLE ROW LEVEL SECURITY;
 ALTER TABLE public.deletion_history ENABLE ROW LEVEL SECURITY;
@@ -240,6 +292,20 @@ DROP POLICY IF EXISTS "Akses tim production_schedules" ON public.production_sche
 DROP POLICY IF EXISTS "Auth_access_production_schedules" ON public.production_schedules 
     TO authenticated 
     USING (auth.uid() IS NOT NULL) 
+    WITH CHECK (auth.uid() IS NOT NULL);
+
+-- 4B. production_schedule_worksheets
+DROP POLICY IF EXISTS "Auth_access_production_schedule_worksheets" ON public.production_schedule_worksheets;
+CREATE POLICY "Auth_access_production_schedule_worksheets" ON public.production_schedule_worksheets
+    TO authenticated
+    USING (auth.uid() IS NOT NULL)
+    WITH CHECK (auth.uid() IS NOT NULL);
+
+-- 4C. production_schedule_material_snapshots
+DROP POLICY IF EXISTS "Auth_access_production_schedule_material_snapshots" ON public.production_schedule_material_snapshots;
+CREATE POLICY "Auth_access_production_schedule_material_snapshots" ON public.production_schedule_material_snapshots
+    TO authenticated
+    USING (auth.uid() IS NOT NULL)
     WITH CHECK (auth.uid() IS NOT NULL);
 
 -- 5. master_materials
@@ -428,6 +494,10 @@ BEGIN
       );
 
     IF v_target_upload_ids IS NOT NULL AND array_length(v_target_upload_ids, 1) > 0 THEN
+        -- PENGECUALIAN ROLLING 4 HARI:
+        -- Data Jadwal Produksi (production_schedules), PDF Worksheet (production_schedule_worksheets),
+        -- dan Snapshot Material (production_schedule_material_snapshots) TIDAK PERNAH dihapus oleh proses ini.
+
         -- 2. Hapus detail material_requirements yang terkait dengan upload_id tersebut terlebih dahulu
         WITH deleted_mats AS (
             DELETE FROM public.material_requirements
@@ -917,6 +987,10 @@ BEGIN
       );
 
     IF v_target_upload_ids IS NOT NULL AND array_length(v_target_upload_ids, 1) > 0 THEN
+        -- PENGECUALIAN ROLLING 4 HARI:
+        -- Data Jadwal Produksi (production_schedules), PDF Worksheet (production_schedule_worksheets),
+        -- dan Snapshot Material (production_schedule_material_snapshots) TIDAK PERNAH dihapus oleh proses ini.
+
         -- 2. Hapus detail material_requirements yang terkait dengan upload_id tersebut terlebih dahulu
         WITH deleted_mats AS (
             DELETE FROM public.material_requirements

@@ -8,6 +8,16 @@ import {
   UploadHistoryItem,
   DeletionHistoryItem,
 } from '../types/ppic';
+import { isValidUuid, generateUuid } from '../utils/uuid';
+import {
+  WORKSHEET_PAYLOAD_PREFIX,
+  buildScheduleNotesPayload,
+  buildScheduleWorksheetsSnapshotArray,
+  buildAtomicSnapshotSyncPayload,
+  executeAtomicSnapshotSync,
+} from '../utils/scheduleSnapshotSync';
+
+export { isValidUuid, generateUuid };
 
 // Keys for environment variables or manual configuration in Settings
 const STORAGE_SUPABASE_URL_KEY = 'ppic_supabase_url_custom';
@@ -43,27 +53,7 @@ export function safeDbDate(val?: string | null): string {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Jakarta' }).format(new Date());
 }
 
-/**
- * Validates whether a string is an RFC4122 v4 UUID
- */
-export function isValidUuid(str?: string | null): boolean {
-  if (!str || typeof str !== 'string') return false;
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(str.trim());
-}
 
-/**
- * Generates an RFC4122 v4 compliant UUID
- */
-export function generateUuid(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    const v = c === 'x' ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
-}
 
 /**
  * Deterministically generates an RFC4122-compliant UUID for a row in an upload session.
@@ -345,6 +335,26 @@ export function mapModelToDbRequirement(model: MaterialItemRequirement): any {
 }
 
 export function mapDbScheduleToModel(row: any): ProductionSchedule {
+  let userNotes: string | undefined = row.notes || undefined;
+  let worksheets: any = undefined;
+
+  if (row.notes && typeof row.notes === 'string' && row.notes.startsWith(WORKSHEET_PAYLOAD_PREFIX)) {
+    try {
+      const payload = JSON.parse(row.notes.slice(WORKSHEET_PAYLOAD_PREFIX.length));
+      userNotes = payload.userNotes || undefined;
+      worksheets =
+        Array.isArray(payload.worksheets) && payload.worksheets.length > 0
+          ? payload.worksheets
+          : undefined;
+    } catch {
+      userNotes = row.notes;
+    }
+  }
+
+  if (!worksheets && Array.isArray(row.worksheets_snapshot) && row.worksheets_snapshot.length > 0) {
+    worksheets = row.worksheets_snapshot;
+  }
+
   return {
     id: row.id,
     orNumber: row.or_number,
@@ -354,21 +364,23 @@ export function mapDbScheduleToModel(row: any): ProductionSchedule {
     finishDate: row.finish_date,
     target: Number(row.target) || 0,
     status: row.status,
-    notes: row.notes || undefined,
+    notes: userNotes,
+    worksheets,
   };
 }
 
 export function mapModelToDbSchedule(model: ProductionSchedule): any {
   return {
-    id: model.id && model.id.includes('-') && model.id.length >= 32 ? model.id : undefined,
+    id: isValidUuid(model.id) ? model.id.trim() : undefined,
     or_number: model.orNumber,
     style: model.style,
     production_line: model.productionLine,
     production_date: safeDbDate(model.productionDate),
     finish_date: safeDbDate(model.finishDate),
-    target: model.target,
+    target: Math.round(Number(model.target) || 0),
     status: model.status || 'Terjadwal',
-    notes: model.notes || null,
+    notes: buildScheduleNotesPayload(model),
+    worksheets_snapshot: buildScheduleWorksheetsSnapshotArray(model),
   };
 }
 
@@ -1763,46 +1775,301 @@ export async function logDeletionToSupabase(logItem: DeletionHistoryItem): Promi
   }
 }
 
-export async function saveScheduleToSupabase(schedule: ProductionSchedule): Promise<{ success: boolean; id?: string }> {
+export async function syncScheduleSnapshotsAtomically(
+  supabase: SupabaseClient,
+  scheduleId: string,
+  schedule: ProductionSchedule
+): Promise<{ success: boolean; error?: string }> {
+  return executeAtomicSnapshotSync(
+    scheduleId,
+    schedule,
+    {
+      callSyncRpc: async (payload) =>
+        supabase.rpc('sync_production_schedule_snapshots', {
+          p_schedule_id: payload.p_schedule_id,
+          p_notes: payload.p_notes,
+          p_worksheets_snapshot: payload.p_worksheets_snapshot,
+          p_worksheets: payload.p_worksheets,
+          p_material_snapshots: payload.p_material_snapshots,
+        }),
+    },
+    safeDbDate
+  );
+}
+
+/**
+ * Fetches ONLY the latest Excel upload transactions and their material_requirements rows
+ * independently for each requested No. OR from Supabase.
+ */
+export async function fetchLatestUploadMaterialsForOrs(
+  orNumbers: string[]
+): Promise<{
+  connected: boolean;
+  uploadHistory: UploadHistoryItem[];
+  materialRequirements: MaterialItemRequirement[];
+} | null> {
   const supabase = getSupabaseClient();
-  if (!supabase) return { success: false };
+  if (!supabase) return null;
 
   try {
-    const row = mapModelToDbSchedule(schedule);
-    if (!row.id) {
-      delete row.id;
-      const { data, error } = await supabase
-        .from('production_schedules')
-        .insert(row)
-        .select('id')
-        .single();
-      if (error) throw error;
-      return { success: true, id: data.id };
-    } else {
-      const { error } = await supabase
-        .from('production_schedules')
-        .upsert(row, { onConflict: 'id' });
-      if (error) throw error;
-      return { success: true, id: schedule.id };
+    const cleanOrs = Array.from(
+      new Set(orNumbers.map((o) => (o || '').trim()).filter(Boolean))
+    );
+    if (cleanOrs.length === 0) {
+      return { connected: true, uploadHistory: [], materialRequirements: [] };
     }
+
+    const { data: histRows, error: histErr } = await supabase
+      .from('upload_history')
+      .select('*')
+      .neq('status', 'Gagal')
+      .order('created_at', { ascending: false })
+      .order('update_date', { ascending: false })
+      .order('id', { ascending: false })
+      .limit(2000);
+
+    if (histErr) {
+      console.warn('Failed to fetch upload_history for latest OR resolution:', histErr.message);
+      return null;
+    }
+
+    const mappedHist = (histRows || []).map(mapDbUploadHistoryToModel);
+    const { findLatestUploadForOr } = await import('../utils/pdfWorksheetParser');
+
+    const selectedUploadIds = new Set<string>();
+    const selectedHist: UploadHistoryItem[] = [];
+
+    for (const orNum of cleanOrs) {
+      const resolution = findLatestUploadForOr(orNum, [], mappedHist);
+      if (resolution.latestUpload) {
+        if (!selectedUploadIds.has(resolution.latestUpload.id)) {
+          selectedUploadIds.add(resolution.latestUpload.id);
+          selectedHist.push(resolution.latestUpload);
+        }
+      }
+    }
+
+    const allReqs: MaterialItemRequirement[] = [];
+    const uploadIds = Array.from(selectedUploadIds);
+
+    if (uploadIds.length > 0) {
+      // Paginated fetch strictly scoped to selected latest upload_ids
+      let offset = 0;
+      const chunkSize = 1000;
+      let hasMore = true;
+
+      while (hasMore) {
+        const { data: reqRows, error: reqErr } = await supabase
+          .from('material_requirements')
+          .select('*')
+          .in('upload_id', uploadIds)
+          .order('id', { ascending: true })
+          .range(offset, offset + chunkSize - 1);
+
+        if (reqErr) {
+          console.warn('Failed to fetch latest upload material_requirements:', reqErr.message);
+          return null;
+        }
+
+        const chunk = reqRows || [];
+        for (const r of chunk) {
+          allReqs.push(mapDbRequirementToModel(r));
+        }
+
+        if (chunk.length < chunkSize) {
+          hasMore = false;
+        } else {
+          offset += chunk.length;
+        }
+      }
+    }
+
+    return {
+      connected: true,
+      uploadHistory: selectedHist,
+      materialRequirements: allReqs,
+    };
   } catch (e) {
-    console.error('Failed to save schedule to Supabase:', e);
-    return { success: false };
+    console.warn('Error resolving latest upload materials from Supabase:', e);
+    return null;
   }
 }
 
-export async function deleteScheduleFromSupabase(id: string): Promise<boolean> {
+export async function createScheduleInSupabase(
+  schedule: ProductionSchedule
+): Promise<{ success: boolean; id?: string; error?: string }> {
   const supabase = getSupabaseClient();
-  if (!supabase) return false;
+  if (!supabase) return { success: false, error: 'Koneksi Supabase belum terkonfigurasi.' };
+
+  if (!isValidUuid(schedule.id)) {
+    return { success: false, error: 'ID jadwal baru harus berupa UUID yang valid sebelum disimpan ke Supabase.' };
+  }
+
+  const cleanId = schedule.id.trim();
+  const normalizedSchedule: ProductionSchedule = { ...schedule, id: cleanId };
+  const preValidation = buildAtomicSnapshotSyncPayload(cleanId, normalizedSchedule, safeDbDate);
+  if (preValidation.success === false) {
+    return { success: false, error: preValidation.error };
+  }
+
   try {
-    const { error } = await supabase
+    const row = mapModelToDbSchedule(normalizedSchedule);
+    row.id = cleanId;
+
+    const { data, error } = await supabase
+      .from('production_schedules')
+      .insert(row)
+      .select('id')
+      .single();
+
+    if (error) {
+      return { success: false, error: error.message || 'Gagal menyimpan jadwal produksi baru ke Supabase.' };
+    }
+
+    if (!data?.id || !isValidUuid(data.id)) {
+      return { success: false, error: 'Supabase tidak mengembalikan UUID jadwal yang valid setelah INSERT.' };
+    }
+
+    const syncRes = await syncScheduleSnapshotsAtomically(supabase, data.id, {
+      ...normalizedSchedule,
+      id: data.id,
+    });
+    if (!syncRes.success) {
+      // Roll back the brand-new schedule row so no half-synced schedule remains and UUID retries succeed cleanly
+      await supabase.from('production_schedules').delete().eq('id', data.id);
+      return {
+        success: false,
+        error: syncRes.error || 'Gagal menyinkronkan snapshot worksheet secara atomik ke Supabase.',
+      };
+    }
+
+    return { success: true, id: data.id };
+  } catch (e: any) {
+    console.error('Failed to insert schedule to Supabase:', e);
+    return { success: false, error: e?.message || 'Gagal menyimpan jadwal produksi baru ke Supabase.' };
+  }
+}
+
+export async function updateScheduleInSupabase(
+  schedule: ProductionSchedule
+): Promise<{ success: boolean; id?: string; error?: string }> {
+  const supabase = getSupabaseClient();
+  if (!supabase) return { success: false, error: 'Koneksi Supabase belum terkonfigurasi.' };
+
+  if (!isValidUuid(schedule.id)) {
+    return {
+      success: false,
+      error: `ID jadwal "${schedule.id}" bukan UUID Supabase yang valid. Pembaruan dibatalkan untuk mencegah duplikasi baris.`,
+    };
+  }
+
+  const cleanId = schedule.id.trim();
+  const normalizedSchedule: ProductionSchedule = { ...schedule, id: cleanId };
+  const preValidation = buildAtomicSnapshotSyncPayload(cleanId, normalizedSchedule, safeDbDate);
+  if (preValidation.success === false) {
+    return { success: false, error: preValidation.error };
+  }
+
+  try {
+    const row = mapModelToDbSchedule(normalizedSchedule);
+    // Notes and worksheets_snapshot are updated atomically together with normalized tables inside RPC
+    const {
+      id: _ignoredId,
+      notes: _deferredNotes,
+      worksheets_snapshot: _deferredSnapshot,
+      ...metadataFields
+    } = row;
+
+    const { data, error } = await supabase
+      .from('production_schedules')
+      .update(metadataFields)
+      .eq('id', cleanId)
+      .select('id')
+      .maybeSingle();
+
+    if (error) {
+      return { success: false, error: error.message || 'Gagal memperbarui jadwal produksi di Supabase.' };
+    }
+
+    if (!data?.id) {
+      return {
+        success: false,
+        error: 'Jadwal produksi tidak ditemukan di Supabase (0 baris diperbarui).',
+      };
+    }
+
+    const syncRes = await syncScheduleSnapshotsAtomically(supabase, data.id, {
+      ...normalizedSchedule,
+      id: data.id,
+    });
+    if (!syncRes.success) {
+      return {
+        success: false,
+        error: syncRes.error || 'Gagal menyinkronkan snapshot worksheet secara atomik ke Supabase.',
+      };
+    }
+
+    return { success: true, id: data.id };
+  } catch (e: any) {
+    console.error('Failed to update schedule in Supabase:', e);
+    return { success: false, error: e?.message || 'Gagal memperbarui jadwal produksi di Supabase.' };
+  }
+}
+
+export async function saveScheduleToSupabase(
+  schedule: ProductionSchedule,
+  mode?: 'create' | 'update'
+): Promise<{ success: boolean; id?: string; error?: string }> {
+  if (mode === 'create') {
+    return createScheduleInSupabase(schedule);
+  }
+  if (mode === 'update') {
+    return updateScheduleInSupabase(schedule);
+  }
+  return isValidUuid(schedule.id)
+    ? updateScheduleInSupabase(schedule)
+    : {
+        success: false,
+        error: `ID jadwal "${schedule.id}" bukan UUID Supabase yang valid.`,
+      };
+}
+
+export async function deleteScheduleFromSupabase(
+  id: string
+): Promise<{ success: boolean; error?: string }> {
+  const supabase = getSupabaseClient();
+  if (!supabase) return { success: false, error: 'Koneksi Supabase belum terkonfigurasi.' };
+
+  if (!isValidUuid(id)) {
+    return {
+      success: false,
+      error: `ID jadwal "${id}" bukan UUID Supabase yang valid. Penghapusan dibatalkan.`,
+    };
+  }
+
+  try {
+    const cleanId = id.trim();
+    const { data, error } = await supabase
       .from('production_schedules')
       .delete()
-      .eq('id', id);
-    return !error;
-  } catch (e) {
+      .eq('id', cleanId)
+      .select('id');
+
+    if (error) {
+      return { success: false, error: error.message || 'Gagal menghapus jadwal produksi dari Supabase.' };
+    }
+
+    if (!data || data.length === 0) {
+      return {
+        success: false,
+        error: 'Jadwal produksi tidak ditemukan di Supabase atau izin hapus ditolak (0 baris terhapus).',
+      };
+    }
+
+    return { success: true };
+  } catch (e: any) {
     console.error('Failed to delete schedule from Supabase:', e);
-    return false;
+    return { success: false, error: e?.message || 'Gagal menghapus jadwal produksi dari Supabase.' };
   }
 }
 

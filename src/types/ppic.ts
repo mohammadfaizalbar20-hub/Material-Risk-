@@ -32,6 +32,40 @@ export interface OrStyleRelation {
   createdAt: string;
 }
 
+export interface WorksheetMaterialItem {
+  id?: string;
+  materialCode: string;
+  materialName: string;
+  unit: string;
+  total: number;
+  receivedQty?: number | null; // null jika tidak ditemukan di upload Excel terbaru
+  status?: 'READY' | 'BELUM READY' | null; // null jika tidak ditemukan di upload Excel terbaru
+  isFoundInMasterData?: boolean;
+  // Provenance snapshot dari transaksi upload Excel terbaru pada saat simpan / refresh
+  matchedUploadId?: string | null;
+  matchedUploadDate?: string | null;
+  matchedUploadTime?: string | null;
+  matchedUploadCreatedAt?: string | null;
+  matchedAt?: string | null;
+}
+
+export interface WorksheetPdfItem {
+  id: string;
+  fileName: string;
+  orNumber: string;
+  style: string;
+  target: number;
+  materials: WorksheetMaterialItem[];
+  error?: string;
+  uploadedAt?: string;
+  // Provenance transaksi upload Excel terbaru untuk No. OR PDF ini
+  matchedUploadId?: string | null;
+  matchedUploadDate?: string | null;
+  matchedUploadTime?: string | null;
+  matchedUploadCreatedAt?: string | null;
+  lastSyncedAt?: string | null;
+}
+
 export interface ProductionSchedule {
   id: string;
   orNumber: string;
@@ -42,6 +76,7 @@ export interface ProductionSchedule {
   target: number; // Positif
   status?: 'Terjadwal' | 'Sedang Berjalan' | 'Selesai' | 'Tertunda';
   notes?: string;
+  worksheets?: WorksheetPdfItem[]; // Multiple PDF Worksheets attached to this schedule
 }
 
 // Backward compatibility alias

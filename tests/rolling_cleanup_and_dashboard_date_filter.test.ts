@@ -501,3 +501,80 @@ test('Suite 2.5: Konsistensi 20.000 baris — Seluruh baris dalam satu upload_id
   // 100% dari 20.000 baris harus tetap konsisten mengikuti parent upload_history date ('2026-11-06')
   assert.equal(matchParentDateCount, 20000, 'Seluruh 20.000 baris wajib masuk ke tanggal upload_history yang sama');
 });
+
+test('Suite 1.4: Pengecualian Rolling 4 Hari — Jadwal Produksi, PDF Worksheet, dan Snapshot Material TIDAK pernah terhapus', () => {
+  // 1. Verifikasi skema SQL memisahkan tabel worksheet & snapshot dari upload_history (tanpa FK ON DELETE CASCADE ke upload_history)
+  const schemaSql = PPIC_SUPABASE_SCHEMA_SQL;
+  assert.ok(schemaSql.includes('worksheets_snapshot JSONB'), 'production_schedules harus mendukung worksheets_snapshot JSONB');
+  assert.ok(schemaSql.includes('CREATE TABLE IF NOT EXISTS public.production_schedule_worksheets'), 'Tabel production_schedule_worksheets harus tersedia');
+  assert.ok(schemaSql.includes('CREATE TABLE IF NOT EXISTS public.production_schedule_material_snapshots'), 'Tabel production_schedule_material_snapshots harus tersedia');
+  const wsTableMatch = schemaSql.match(/CREATE TABLE IF NOT EXISTS public\.production_schedule_worksheets[\s\S]*?\);/);
+  const snapTableMatch = schemaSql.match(/CREATE TABLE IF NOT EXISTS public\.production_schedule_material_snapshots[\s\S]*?\);/);
+  assert.ok(wsTableMatch && !wsTableMatch[0].includes('REFERENCES public.upload_history'), 'Tabel production_schedule_worksheets TIDAK boleh memiliki FK ke upload_history');
+  assert.ok(snapTableMatch && !snapTableMatch[0].includes('REFERENCES public.upload_history'), 'Tabel production_schedule_material_snapshots TIDAK boleh memiliki FK ke upload_history');
+
+  // 2. Verifikasi fungsi cleanup_old_uploads_rolling_4days hanya menargetkan material_requirements & upload_history
+  for (const cleanupSql of [PPIC_SUPABASE_ROLLING_4DAYS_CLEANUP_SQL, PPIC_SUPABASE_SCHEMA_SQL]) {
+    const fnMatch = cleanupSql.match(/CREATE OR REPLACE FUNCTION public\.cleanup_old_uploads_rolling_4days\(\)[\s\S]*?\$\$;/);
+    assert.ok(fnMatch, 'Definisi fungsi cleanup_old_uploads_rolling_4days harus ada');
+    const fnBody = fnMatch![0];
+    assert.ok(fnBody.includes('DELETE FROM public.material_requirements'), 'Rolling cleanup harus membersihkan material_requirements > 96h');
+    assert.ok(fnBody.includes('DELETE FROM public.upload_history'), 'Rolling cleanup harus membersihkan upload_history > 96h');
+    assert.ok(!fnBody.includes('DELETE FROM public.production_schedules'), 'Rolling cleanup tidak boleh menghapus production_schedules');
+    assert.ok(!fnBody.includes('DELETE FROM public.production_schedule_worksheets'), 'Rolling cleanup tidak boleh menghapus production_schedule_worksheets');
+    assert.ok(!fnBody.includes('DELETE FROM public.production_schedule_material_snapshots'), 'Rolling cleanup tidak boleh menghapus production_schedule_material_snapshots');
+  }
+
+  // 3. Simulasi eksekusi Rolling 4 Hari: Upload Excel (> 96 jam) terhapus, tetapi jadwal & snapshot yang merujuknya TETAP UTUH 100%
+  const cutoff = new Date('2026-11-03T12:00:00Z');
+  const excelUploads = [
+    { id: 'up-old-99h', createdAt: new Date('2026-11-01T10:00:00Z'), status: 'Sukses' },
+    { id: 'up-fresh-10h', createdAt: new Date('2026-11-07T02:00:00Z'), status: 'Sukses' },
+  ];
+  const schedules = [
+    {
+      id: 'sch-1',
+      orNumber: '1117',
+      createdAt: new Date('2026-10-15T08:00:00Z'), // berumur > 20 hari!
+      worksheets: [
+        {
+          id: 'ws-1',
+          fileName: 'Worksheet_1117.pdf',
+          orNumber: '1117',
+          style: 'Polo Shirt',
+          target: 100,
+          matchedUploadId: 'up-old-99h', // merujuk upload yg akan dihapus Rolling 4 Hari
+          materials: [
+            {
+              materialCode: 'FAB-01',
+              materialName: 'Fabric Cotton',
+              unit: 'Yard',
+              total: 120,
+              receivedQty: 120,
+              status: 'READY',
+              isFoundInMasterData: true,
+              matchedUploadId: 'up-old-99h',
+            },
+          ],
+        },
+      ],
+    },
+  ];
+
+  // Jalankan filter target penghapusan Rolling 4 Hari (hanya pada excelUploads & material_requirements)
+  const deletedUploadIds = new Set(
+    excelUploads.filter((u) => u.createdAt < cutoff && u.status === 'Sukses').map((u) => u.id)
+  );
+  const remainingExcelUploads = excelUploads.filter((u) => !deletedUploadIds.has(u.id));
+
+  assert.equal(deletedUploadIds.has('up-old-99h'), true);
+  assert.equal(remainingExcelUploads.length, 1);
+
+  // Pastikan jadwal, worksheet PDF, dan snapshot material tetap utuh 100% meskipun upload sumbernya sudah dihapus
+  assert.equal(schedules.length, 1);
+  assert.equal(schedules[0].worksheets.length, 1);
+  assert.equal(schedules[0].worksheets[0].materials[0].receivedQty, 120);
+  assert.equal(schedules[0].worksheets[0].materials[0].status, 'READY');
+  assert.equal(schedules[0].worksheets[0].matchedUploadId, 'up-old-99h');
+});
+

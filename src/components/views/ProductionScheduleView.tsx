@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { usePpic } from '../../context/PpicContext';
-import { ProductionSchedule, ScheduleConflict } from '../../types/ppic';
+import { ProductionSchedule, ScheduleConflict, WorksheetPdfItem, WorksheetMaterialItem } from '../../types/ppic';
 import {
   Calendar,
   ChevronLeft,
@@ -20,8 +20,27 @@ import {
   ShieldAlert,
   Search,
   Hash,
+  Upload,
+  FileText,
+  Paperclip,
+  Loader2,
+  CheckCircle2,
+  FileCheck,
+  FileWarning,
+  RefreshCw,
+  Sparkles,
 } from 'lucide-react';
 import { getIndonesianHolidayInfo, DayHolidayInfo } from '../../utils/indonesianHolidays';
+import {
+  buildWorksheetSnapshot,
+  refreshScheduleWorksheetsSnapshot,
+  WorksheetMaterialMatched,
+} from '../../utils/pdfWorksheetParser';
+import {
+  fetchLatestUploadMaterialsForOrs,
+  getSupabaseCredentials,
+} from '../../lib/supabase';
+import { generateUuid } from '../../utils/uuid';
 
 export const ProductionScheduleView: React.FC = () => {
   const {
@@ -38,7 +57,35 @@ export const ProductionScheduleView: React.FC = () => {
     setSelectedScheduleId,
     registeredOrNumbers,
     getOrSummary,
+    materialRequirements,
+    uploadHistory,
   } = usePpic();
+
+  // Multi-PDF Worksheet state for Schedule Form
+  interface FormPdfItem {
+    id: string;
+    file?: File;
+    fileName: string;
+    status: 'parsing' | 'success' | 'error';
+    error?: string;
+    orNumber?: string;
+    style?: string;
+    target?: number;
+    materials?: WorksheetMaterialItem[];
+    matchedUploadId?: string | null;
+    matchedUploadDate?: string | null;
+    matchedUploadTime?: string | null;
+    matchedUploadCreatedAt?: string | null;
+    lastSyncedAt?: string | null;
+  }
+
+  const [uploadedPdfs, setUploadedPdfs] = useState<FormPdfItem[]>([]);
+  const [selectedPreviewPdfId, setSelectedPreviewPdfId] = useState<string | null>(null);
+  const [isProcessingPdfs, setIsProcessingPdfs] = useState<boolean>(false);
+  const [detailSelectedWsId, setDetailSelectedWsId] = useState<string | null>(null);
+  const [isRefreshingSnapshot, setIsRefreshingSnapshot] = useState<boolean>(false);
+  const [refreshFeedback, setRefreshFeedback] = useState<{ type: 'success' | 'info' | 'error'; message: string } | null>(null);
+  const [isRefreshingFormPreview, setIsRefreshingFormPreview] = useState<boolean>(false);
 
   // Calendar Month Navigation: Default to November 2026 (matching demo dataset) or current date
   const [currentYear, setCurrentYear] = useState<number>(2026);
@@ -72,6 +119,12 @@ export const ProductionScheduleView: React.FC = () => {
   });
 
   const [formValidationError, setFormValidationError] = useState<string | null>(null);
+  const [createDraftId, setCreateDraftId] = useState<string>(() => generateUuid());
+  const [isSubmittingForm, setIsSubmittingForm] = useState<boolean>(false);
+  const [isDeletingSchedule, setIsDeletingSchedule] = useState<boolean>(false);
+  const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [detailActionError, setDetailActionError] = useState<string | null>(null);
+  const [crudFeedback, setCrudFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
 
   // Predefined Lines per user request: Line 1, 3, 4, 5, 6, 7
   const defaultLines = useMemo(() => {
@@ -219,6 +272,10 @@ export const ProductionScheduleView: React.FC = () => {
   const openCreateModal = () => {
     setModalMode('create');
     setEditingScheduleId(null);
+    setCreateDraftId(generateUuid());
+    setIsSubmittingForm(false);
+    setUploadedPdfs([]);
+    setSelectedPreviewPdfId(null);
     setFormData({
       orNumber: availableOrList[0] || 'OR-2026-001',
       productionDate: `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-05`,
@@ -229,13 +286,36 @@ export const ProductionScheduleView: React.FC = () => {
       status: 'Terjadwal',
     });
     setFormValidationError(null);
+    setCrudFeedback(null);
     setIsModalOpen(true);
   };
 
-  // Open Edit Modal
+  // Open Edit Modal (mempertahankan snapshot tersimpan tanpa auto-rematch)
   const openEditModal = (sch: ProductionSchedule) => {
     setModalMode('edit');
     setEditingScheduleId(sch.id);
+    setIsSubmittingForm(false);
+    if (sch.worksheets && sch.worksheets.length > 0) {
+      const existing: FormPdfItem[] = sch.worksheets.map((ws) => ({
+        id: ws.id,
+        fileName: ws.fileName,
+        status: 'success' as const,
+        orNumber: ws.orNumber,
+        style: ws.style,
+        target: ws.target,
+        materials: ws.materials,
+        matchedUploadId: ws.matchedUploadId ?? null,
+        matchedUploadDate: ws.matchedUploadDate ?? null,
+        matchedUploadTime: ws.matchedUploadTime ?? null,
+        matchedUploadCreatedAt: ws.matchedUploadCreatedAt ?? null,
+        lastSyncedAt: ws.lastSyncedAt ?? ws.uploadedAt ?? null,
+      }));
+      setUploadedPdfs(existing);
+      setSelectedPreviewPdfId(existing[0]?.id || null);
+    } else {
+      setUploadedPdfs([]);
+      setSelectedPreviewPdfId(null);
+    }
     setFormData({
       orNumber: sch.orNumber,
       productionDate: sch.productionDate,
@@ -246,13 +326,291 @@ export const ProductionScheduleView: React.FC = () => {
       status: sch.status || 'Terjadwal',
     });
     setFormValidationError(null);
+    setDetailActionError(null);
+    setConfirmDeleteId(null);
     setActiveDetailSchedule(null);
+    setRefreshFeedback(null);
+    setCrudFeedback(null);
     setIsModalOpen(true);
   };
 
+  // Handler for uploading one or multiple PDF Worksheets
+  const handlePdfFilesUpload = async (fileList: FileList | File[]) => {
+    const rawFiles = Array.from(fileList);
+    const pdfFiles = rawFiles.filter(
+      (f) => f.name.toLowerCase().endsWith('.pdf') || f.type === 'application/pdf'
+    );
+    if (pdfFiles.length === 0) {
+      setFormValidationError('Hanya file berformat PDF yang didukung untuk Worksheet.');
+      return;
+    }
+
+    setIsProcessingPdfs(true);
+    setFormValidationError(null);
+
+    const newItems: FormPdfItem[] = pdfFiles.map((f) => ({
+      id: `ws-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+      file: f,
+      fileName: f.name,
+      status: 'parsing',
+    }));
+
+    setUploadedPdfs((prev) => [...prev, ...newItems]);
+    if (!selectedPreviewPdfId && newItems.length > 0) {
+      setSelectedPreviewPdfId(newItems[0].id);
+    }
+
+    for (const item of newItems) {
+      try {
+        const base64Data = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => {
+            const res = reader.result as string;
+            const b64 = res.includes(',') ? res.split(',')[1] : res;
+            resolve(b64);
+          };
+          reader.onerror = reject;
+          reader.readAsDataURL(item.file!);
+        });
+
+        const res = await fetch('/api/pdf/extract-worksheet', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            pdfBase64: base64Data,
+            fileName: item.fileName,
+          }),
+        });
+
+        const data = await res.json();
+        if (!res.ok || !data.success) {
+          throw new Error(data?.error || `Gagal mengekstrak PDF (${res.status})`);
+        }
+
+        const extracted = data.data;
+        const extractedOr = extracted.orNumber || formData.orNumber;
+
+        // Ambil data upload Excel paling terbaru khusus No. OR PDF ini (Supabase -> fallback state lokal)
+        let reqSource = materialRequirements;
+        let histSource = uploadHistory;
+        if (getSupabaseCredentials().isConfigured && extractedOr) {
+          const remoteLatest = await fetchLatestUploadMaterialsForOrs([extractedOr]);
+          if (remoteLatest?.connected && remoteLatest.uploadHistory.length > 0) {
+            histSource = remoteLatest.uploadHistory;
+            reqSource = remoteLatest.materialRequirements;
+          }
+        }
+
+        const baseWs: WorksheetPdfItem = {
+          id: item.id,
+          fileName: item.fileName,
+          orNumber: extractedOr,
+          style: extracted.style || '',
+          target: extracted.target || 0,
+          materials: extracted.materials || [],
+          uploadedAt: new Date().toISOString(),
+        };
+        const snapshotted = buildWorksheetSnapshot(baseWs, reqSource, histSource);
+
+        setUploadedPdfs((prev) => {
+          const updated = prev.map((p) => {
+            if (p.id === item.id) {
+              return {
+                ...p,
+                status: 'success' as const,
+                orNumber: snapshotted.orNumber,
+                style: snapshotted.style,
+                target: snapshotted.target,
+                materials: snapshotted.materials,
+                matchedUploadId: snapshotted.matchedUploadId,
+                matchedUploadDate: snapshotted.matchedUploadDate,
+                matchedUploadTime: snapshotted.matchedUploadTime,
+                matchedUploadCreatedAt: snapshotted.matchedUploadCreatedAt,
+                lastSyncedAt: snapshotted.lastSyncedAt,
+              };
+            }
+            return p;
+          });
+
+          // Auto-fill form values from the extracted PDF if default or multiple
+          const validItems = updated.filter((p) => p.status === 'success');
+          if (validItems.length > 0) {
+            setFormData((prevForm) => {
+              const totalTarget = validItems.reduce((acc, p) => acc + (p.target || 0), 0);
+              const firstValid = validItems[0];
+              const shouldUpdateOr = !prevForm.orNumber || prevForm.orNumber === 'OR-2026-001';
+              const shouldUpdateStyle = !prevForm.style || prevForm.style === 'Casual Cotton Shirt Men Navy';
+              return {
+                ...prevForm,
+                orNumber: shouldUpdateOr ? (firstValid.orNumber || prevForm.orNumber) : prevForm.orNumber,
+                style: shouldUpdateStyle ? (firstValid.style || prevForm.style) : prevForm.style,
+                target: totalTarget > 0 ? totalTarget : prevForm.target,
+              };
+            });
+          }
+
+          return updated;
+        });
+      } catch (err: any) {
+        setUploadedPdfs((prev) =>
+          prev.map((p) =>
+            p.id === item.id
+              ? {
+                  ...p,
+                  status: 'error' as const,
+                  error: err.message || 'Gagal mengekstrak worksheet PDF',
+                }
+              : p
+          )
+        );
+      }
+    }
+
+    setIsProcessingPdfs(false);
+  };
+
+  // Manual Refresh untuk preview PDF pada modal Form (hanya dijalankan atas aksi user)
+  const handleRefreshFormPdfSnapshots = async () => {
+    const successPdfs = uploadedPdfs.filter((p) => p.status === 'success' && p.materials && p.materials.length > 0);
+    if (successPdfs.length === 0) return;
+
+    setIsRefreshingFormPreview(true);
+    try {
+      let reqSource = materialRequirements;
+      let histSource = uploadHistory;
+      if (getSupabaseCredentials().isConfigured) {
+        const ors = successPdfs.map((p) => p.orNumber || formData.orNumber).filter(Boolean);
+        const remoteLatest = await fetchLatestUploadMaterialsForOrs(ors);
+        if (remoteLatest?.connected && remoteLatest.uploadHistory.length > 0) {
+          histSource = remoteLatest.uploadHistory;
+          reqSource = remoteLatest.materialRequirements;
+        }
+      }
+
+      const nowIso = new Date().toISOString();
+      setUploadedPdfs((prev) =>
+        prev.map((p) => {
+          if (p.status !== 'success' || !p.materials) return p;
+          const refreshed = buildWorksheetSnapshot(
+            {
+              id: p.id,
+              fileName: p.fileName,
+              orNumber: p.orNumber || formData.orNumber,
+              style: p.style || formData.style,
+              target: p.target || 0,
+              materials: p.materials,
+              uploadedAt: p.lastSyncedAt || nowIso,
+            },
+            reqSource,
+            histSource,
+            nowIso
+          );
+          return {
+            ...p,
+            materials: refreshed.materials,
+            matchedUploadId: refreshed.matchedUploadId,
+            matchedUploadDate: refreshed.matchedUploadDate,
+            matchedUploadTime: refreshed.matchedUploadTime,
+            matchedUploadCreatedAt: refreshed.matchedUploadCreatedAt,
+            lastSyncedAt: refreshed.lastSyncedAt,
+          };
+        })
+      );
+    } finally {
+      setIsRefreshingFormPreview(false);
+    }
+  };
+
+  // Manual Refresh eksplisit untuk Detail Jadwal Produksi tersimpan (hanya saat user klik tombol)
+  const handleRefreshScheduleSnapshot = async () => {
+    if (!activeDetailSchedule || !activeDetailSchedule.worksheets || activeDetailSchedule.worksheets.length === 0) {
+      return;
+    }
+
+    setIsRefreshingSnapshot(true);
+    setRefreshFeedback(null);
+    try {
+      let reqSource = materialRequirements;
+      let histSource = uploadHistory;
+
+      if (getSupabaseCredentials().isConfigured) {
+        const orList = activeDetailSchedule.worksheets.map((ws) => ws.orNumber).filter(Boolean);
+        const remoteLatest = await fetchLatestUploadMaterialsForOrs(orList);
+        if (remoteLatest?.connected && remoteLatest.uploadHistory.length > 0) {
+          histSource = remoteLatest.uploadHistory;
+          reqSource = remoteLatest.materialRequirements;
+        }
+      }
+
+      const refreshedWorksheets = refreshScheduleWorksheetsSnapshot(
+        activeDetailSchedule.worksheets,
+        reqSource,
+        histSource
+      );
+
+      const updateResult = await updateProductionSchedule(activeDetailSchedule.id, {
+        worksheets: refreshedWorksheets,
+      });
+
+      if (!updateResult.success) {
+        setRefreshFeedback({
+          type: 'error',
+          message: updateResult.error || 'Gagal menyimpan hasil refresh snapshot ke database.',
+        });
+        return;
+      }
+
+      setActiveDetailSchedule((prev) =>
+        prev ? { ...(updateResult.schedule || prev), worksheets: refreshedWorksheets } : null
+      );
+
+      const matchedOrsCount = refreshedWorksheets.filter((w) => Boolean(w.matchedUploadId || w.matchedUploadDate)).length;
+      setRefreshFeedback({
+        type: 'success',
+        message:
+          matchedOrsCount > 0
+            ? `Snapshot berhasil disinkronkan ulang terhadap upload Excel terbaru (${matchedOrsCount}/${refreshedWorksheets.length} worksheet memiliki upload aktif).`
+            : 'Sinkronisasi selesai: belum ditemukan transaksi upload Excel aktif di Master Data untuk No. OR pada jadwal ini (Diterima/Status disetel ke "-").',
+      });
+    } catch (err: any) {
+      setRefreshFeedback({
+        type: 'error',
+        message: err?.message || 'Gagal menyegarkan snapshot ketersediaan material.',
+      });
+    } finally {
+      setIsRefreshingSnapshot(false);
+    }
+  };
+
+  // Remove a PDF from upload queue
+  const handleRemovePdf = (pdfId: string) => {
+    setUploadedPdfs((prev) => {
+      const next = prev.filter((p) => p.id !== pdfId);
+      if (selectedPreviewPdfId === pdfId) {
+        setSelectedPreviewPdfId(next[0]?.id || null);
+      }
+      return next;
+    });
+  };
+
+  // Manually re-sync total targets from PDFs to Form
+  const handleSyncPdfDataToForm = () => {
+    const valid = uploadedPdfs.filter((p) => p.status === 'success');
+    if (valid.length === 0) return;
+    const totalTarget = valid.reduce((acc, p) => acc + (p.target || 0), 0);
+    const firstValid = valid[0];
+    setFormData((prev) => ({
+      ...prev,
+      target: totalTarget > 0 ? totalTarget : prev.target,
+      orNumber: firstValid.orNumber || prev.orNumber,
+      style: firstValid.style || prev.style,
+    }));
+  };
+
   // Submit Form (Validation: finish >= start, target > 0, allow conflicts)
-  const handleSubmitForm = (e: React.FormEvent) => {
+  const handleSubmitForm = async (e: React.FormEvent) => {
     e.preventDefault();
+    if (isSubmittingForm || isProcessingPdfs) return;
     setFormValidationError(null);
 
     if (!formData.orNumber.trim()) {
@@ -276,8 +634,50 @@ export const ProductionScheduleView: React.FC = () => {
       return;
     }
 
-    if (modalMode === 'create') {
-      addProductionSchedule({
+    // Simpan snapshot permanen untuk setiap worksheet & materialnya
+    const saveTimestamp = new Date().toISOString();
+    const validWorksheets: WorksheetPdfItem[] = uploadedPdfs
+      .filter((p) => p.status === 'success' && p.materials && p.materials.length > 0)
+      .map((p) => {
+        const hasExistingSnapshot = Boolean(
+          p.lastSyncedAt ||
+            (p.materials || []).some((m) => m.isFoundInMasterData !== undefined || m.matchedAt)
+        );
+        if (hasExistingSnapshot) {
+          return {
+            id: p.id,
+            fileName: p.fileName,
+            orNumber: p.orNumber || formData.orNumber,
+            style: p.style || formData.style,
+            target: p.target || 0,
+            materials: p.materials || [],
+            uploadedAt: p.lastSyncedAt || saveTimestamp,
+            matchedUploadId: p.matchedUploadId ?? null,
+            matchedUploadDate: p.matchedUploadDate ?? null,
+            matchedUploadTime: p.matchedUploadTime ?? null,
+            matchedUploadCreatedAt: p.matchedUploadCreatedAt ?? null,
+            lastSyncedAt: p.lastSyncedAt || saveTimestamp,
+          };
+        }
+        return buildWorksheetSnapshot(
+          {
+            id: p.id,
+            fileName: p.fileName,
+            orNumber: p.orNumber || formData.orNumber,
+            style: p.style || formData.style,
+            target: p.target || 0,
+            materials: p.materials || [],
+            uploadedAt: saveTimestamp,
+          },
+          materialRequirements,
+          uploadHistory,
+          saveTimestamp
+        );
+      });
+
+    setIsSubmittingForm(true);
+    try {
+      const payload = {
         orNumber: formData.orNumber.trim().toUpperCase(),
         productionDate: formData.productionDate,
         finishDate: formData.finishDate,
@@ -285,30 +685,67 @@ export const ProductionScheduleView: React.FC = () => {
         style: formData.style.trim(),
         target: Number(formData.target),
         status: formData.status,
+        worksheets: validWorksheets.length > 0 ? validWorksheets : undefined,
+      };
+
+      const result =
+        modalMode === 'create'
+          ? await addProductionSchedule({ id: createDraftId, ...payload })
+          : editingScheduleId
+            ? await updateProductionSchedule(editingScheduleId, payload)
+            : { success: false, error: 'ID jadwal yang akan diperbarui tidak ditemukan.' };
+
+      if (!result.success) {
+        setFormValidationError(result.error || 'Gagal menyimpan jadwal produksi.');
+        return;
+      }
+
+      // Save relation for main schedule OR and each worksheet's OR
+      saveOrStyleRelation(payload.orNumber, payload.style);
+      validWorksheets.forEach((ws) => {
+        if (ws.orNumber && ws.style) {
+          saveOrStyleRelation(ws.orNumber.trim().toUpperCase(), ws.style.trim());
+        }
       });
-    } else if (editingScheduleId) {
-      updateProductionSchedule(editingScheduleId, {
-        orNumber: formData.orNumber.trim().toUpperCase(),
-        productionDate: formData.productionDate,
-        finishDate: formData.finishDate,
-        productionLine: formData.productionLine,
-        style: formData.style.trim(),
-        target: Number(formData.target),
-        status: formData.status,
+
+      setCrudFeedback({
+        type: 'success',
+        message:
+          modalMode === 'create'
+            ? `Jadwal produksi ${payload.orNumber} berhasil disimpan.`
+            : `Perubahan jadwal produksi ${payload.orNumber} berhasil disimpan.`,
       });
+      setIsModalOpen(false);
+    } catch (err: any) {
+      setFormValidationError(err?.message || 'Terjadi kesalahan saat menyimpan jadwal produksi.');
+    } finally {
+      setIsSubmittingForm(false);
     }
-
-    // Save relation
-    saveOrStyleRelation(formData.orNumber.trim().toUpperCase(), formData.style.trim());
-
-    setIsModalOpen(false);
   };
 
-  // Delete Schedule
-  const handleDeleteSchedule = (id: string) => {
-    if (confirm('Apakah Anda yakin ingin menghapus jadwal produksi ini?')) {
-      deleteProductionSchedule(id);
+  // Delete Schedule (inline confirmation + await persistence result)
+  const confirmDeleteSchedule = async (id: string) => {
+    if (isDeletingSchedule) return;
+    setIsDeletingSchedule(true);
+    setDetailActionError(null);
+    try {
+      const res = await deleteProductionSchedule(id);
+      if (!res.success) {
+        setConfirmDeleteId(null);
+        setDetailActionError(res.error || 'Gagal menghapus jadwal produksi.');
+        return;
+      }
+      setConfirmDeleteId(null);
       setActiveDetailSchedule(null);
+      setCrudFeedback({
+        type: 'success',
+        message: 'Jadwal produksi berhasil dihapus.',
+      });
+    } catch (err: any) {
+      setConfirmDeleteId(null);
+      setDetailActionError(err?.message || 'Terjadi kesalahan saat menghapus jadwal produksi.');
+    } finally {
+      setIsDeletingSchedule(false);
     }
   };
 
@@ -383,6 +820,35 @@ export const ProductionScheduleView: React.FC = () => {
         </div>
       </div>
 
+      {/* CRUD Feedback Banner */}
+      {crudFeedback && (
+        <div
+          role="status"
+          className={`p-3 rounded-lg border text-xs flex items-center justify-between gap-2 ${
+            crudFeedback.type === 'success'
+              ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+              : 'bg-rose-50 border-rose-200 text-rose-800'
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            {crudFeedback.type === 'success' ? (
+              <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+            ) : (
+              <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+            )}
+            <span>{crudFeedback.message}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setCrudFeedback(null)}
+            className="text-slate-500 hover:text-slate-700 p-0.5"
+            aria-label="Tutup notifikasi"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* Global Collision Notification Banner if any conflicts exist */}
       {conflictsList.length > 0 && (
         <div className="p-4 bg-amber-50 border border-amber-300 rounded-lg shadow-2xs">
@@ -401,7 +867,13 @@ export const ProductionScheduleView: React.FC = () => {
                     key={c.scheduleId}
                     onClick={() => {
                       const sch = productionSchedules.find((s) => s.id === c.scheduleId);
-                      if (sch) setActiveDetailSchedule(sch);
+                      if (sch) {
+                        setDetailSelectedWsId(null);
+                        setRefreshFeedback(null);
+                        setDetailActionError(null);
+                        setConfirmDeleteId(null);
+                        setActiveDetailSchedule(sch);
+                      }
                     }}
                     className="inline-flex items-center gap-1 text-[11px] font-mono bg-white hover:bg-amber-100 px-2 py-0.5 rounded border border-amber-300 text-amber-900 shadow-2xs"
                   >
@@ -707,17 +1179,23 @@ export const ProductionScheduleView: React.FC = () => {
                           const colors = getBlockColor(sch, hasConflict);
 
                           return (
-                            <div
+                            <button
+                              type="button"
                               key={sch.id}
+                              aria-label={`Detail jadwal ${sch.orNumber} ${sch.style}`}
                               onClick={(e) => {
                                 e.stopPropagation();
+                                setDetailSelectedWsId(null);
+                                setRefreshFeedback(null);
+                                setDetailActionError(null);
+                                setConfirmDeleteId(null);
                                 setActiveDetailSchedule(sch);
                               }}
                               style={{
                                 left: `${leftPct}%`,
                                 width: `${widthPct}%`,
                               }}
-                              className={`relative pointer-events-auto h-9 rounded-md shadow-xs p-1.5 cursor-pointer transition-all duration-150 flex items-center justify-between text-xs font-semibold overflow-hidden group ${colors.bg} ${colors.border} ${colors.text}`}
+                              className={`relative pointer-events-auto h-9 rounded-md shadow-xs p-1.5 cursor-pointer transition-all duration-150 flex items-center justify-between text-left text-xs font-semibold overflow-hidden group ${colors.bg} ${colors.border} ${colors.text}`}
                               title={`${sch.orNumber} - ${sch.style} | Target: ${sch.target} | ${sch.productionDate} s/d ${sch.finishDate}${hasConflict ? ' [BENTROK DENGAN ' + conflict?.conflictingWith.map(cw => cw.orNumber).join(', ') + ']' : ''}`}
                             >
                               <div className="flex items-center gap-1.5 truncate">
@@ -733,6 +1211,15 @@ export const ProductionScheduleView: React.FC = () => {
                               </div>
 
                               <div className="flex items-center gap-1 shrink-0 ml-1">
+                                {sch.worksheets && sch.worksheets.length > 0 && (
+                                  <span
+                                    className="text-[10px] bg-white/30 backdrop-blur-xs px-1 py-0.2 rounded flex items-center gap-0.5 font-bold"
+                                    title={`${sch.worksheets.length} PDF Worksheet terlampir`}
+                                  >
+                                    <Paperclip className="w-2.5 h-2.5" />
+                                    <span>{sch.worksheets.length}</span>
+                                  </span>
+                                )}
                                 <span className={`text-[10px] font-mono px-1 py-0.2 rounded font-bold ${colors.badge}`}>
                                   {sch.target.toLocaleString('id-ID')}
                                 </span>
@@ -742,7 +1229,7 @@ export const ProductionScheduleView: React.FC = () => {
                               {hasConflict && (
                                 <span className="absolute top-0.5 right-0.5 w-2 h-2 rounded-full bg-red-400 animate-ping" />
                               )}
-                            </div>
+                            </button>
                           );
                         })}
                       </div>
@@ -798,9 +1285,9 @@ export const ProductionScheduleView: React.FC = () => {
       {/* Schedule Detail Modal */}
       {activeDetailSchedule && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
-          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-lg overflow-hidden animate-in fade-in zoom-in-95 duration-150">
+          <div className={`bg-white rounded-xl shadow-2xl border border-slate-200 w-full ${activeDetailSchedule.worksheets && activeDetailSchedule.worksheets.length > 0 ? 'max-w-4xl max-h-[92vh] overflow-y-auto' : 'max-w-lg'} overflow-hidden animate-in fade-in zoom-in-95 duration-150`}>
             {/* Modal Header */}
-            <div className="p-4 bg-slate-900 text-white flex items-center justify-between">
+            <div className="p-4 bg-slate-900 text-white flex items-center justify-between sticky top-0 z-20">
               <div className="flex items-center gap-2">
                 <Calendar className="w-4 h-4 text-blue-400" />
                 <h3 className="text-sm font-bold">Detail Jadwal Produksi</h3>
@@ -875,6 +1362,236 @@ export const ProductionScheduleView: React.FC = () => {
                 </div>
               </div>
 
+              {/* Attached PDF Worksheets Section (Menampilkan Snapshot Tersimpan - Tanpa Auto-Rematch) */}
+              {activeDetailSchedule.worksheets && activeDetailSchedule.worksheets.length > 0 && (() => {
+                const wsList = activeDetailSchedule.worksheets;
+                const activeWs = wsList.find((w) => w.id === detailSelectedWsId) || wsList[0];
+                const snapshotRows: WorksheetMaterialMatched[] = (activeWs.materials || []).map((m, idx) => ({
+                  id: m.id || `wsm-${idx + 1}`,
+                  materialCode: m.materialCode,
+                  materialName: m.materialName,
+                  unit: m.unit,
+                  total: m.total,
+                  receivedQty: m.receivedQty !== undefined ? m.receivedQty : null,
+                  status: m.status !== undefined ? m.status : null,
+                  isFoundInMasterData: Boolean(
+                    m.isFoundInMasterData ?? (m.receivedQty !== null && m.receivedQty !== undefined)
+                  ),
+                  matchedUploadId: m.matchedUploadId ?? activeWs.matchedUploadId ?? null,
+                  matchedUploadDate: m.matchedUploadDate ?? activeWs.matchedUploadDate ?? null,
+                  matchedUploadTime: m.matchedUploadTime ?? activeWs.matchedUploadTime ?? null,
+                  matchedUploadCreatedAt: m.matchedUploadCreatedAt ?? activeWs.matchedUploadCreatedAt ?? null,
+                  matchedAt: m.matchedAt ?? activeWs.lastSyncedAt ?? null,
+                }));
+                const readyCount = snapshotRows.filter((m) => m.status === 'READY').length;
+                const notReadyCount = snapshotRows.filter((m) => m.status === 'BELUM READY').length;
+                const notFoundCount = snapshotRows.filter((m) => !m.isFoundInMasterData).length;
+                const uploadSourceLabel = activeWs.matchedUploadDate
+                  ? `${activeWs.matchedUploadDate}${activeWs.matchedUploadTime ? ` · ${activeWs.matchedUploadTime}` : ''}`
+                  : activeWs.matchedUploadId
+                    ? `Upload ID ${activeWs.matchedUploadId.slice(0, 8)}`
+                    : 'Belum ada upload Excel untuk OR ini saat snapshot';
+                const syncedTimeLabel = activeWs.lastSyncedAt
+                  ? new Intl.DateTimeFormat('id-ID', {
+                      timeZone: 'Asia/Jakarta',
+                      day: '2-digit',
+                      month: 'short',
+                      year: 'numeric',
+                      hour: '2-digit',
+                      minute: '2-digit',
+                    }).format(new Date(activeWs.lastSyncedAt)) + ' WIB'
+                  : null;
+
+                return (
+                  <div className="pt-3 border-t border-slate-200 space-y-3">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <div className="flex items-center gap-2">
+                        <Paperclip className="w-4 h-4 text-blue-600" />
+                        <h4 className="text-xs font-bold text-slate-900">
+                          Worksheet PDF Terlampir ({wsList.length} File)
+                        </h4>
+                        <span className="text-[10px] px-2 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-200 font-semibold">
+                          Snapshot Tersimpan
+                        </span>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <span className="text-[11px] text-slate-500">
+                          Total Target: {wsList.reduce((acc, w) => acc + (w.target || 0), 0).toLocaleString('id-ID')} pcs
+                        </span>
+                        <button
+                          type="button"
+                          onClick={handleRefreshScheduleSnapshot}
+                          disabled={isRefreshingSnapshot}
+                          className="px-2.5 py-1 text-[11px] font-semibold bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white rounded-md shadow-2xs transition-colors flex items-center gap-1.5 cursor-pointer"
+                          title="Sinkronkan ulang Diterima & Status terhadap upload Excel terbaru per masing-masing No. OR"
+                        >
+                          <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingSnapshot ? 'animate-spin' : ''}`} />
+                          <span>{isRefreshingSnapshot ? 'Menyegarkan...' : 'Refresh Ketersediaan Material'}</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Inline Feedback after Manual Refresh */}
+                    {refreshFeedback && (
+                      <div
+                        className={`p-2.5 rounded-lg border text-[11px] flex items-center gap-2 ${
+                          refreshFeedback.type === 'success'
+                            ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                            : refreshFeedback.type === 'error'
+                              ? 'bg-rose-50 border-rose-200 text-rose-800'
+                              : 'bg-blue-50 border-blue-200 text-blue-800'
+                        }`}
+                      >
+                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                        <span>{refreshFeedback.message}</span>
+                      </div>
+                    )}
+
+                    {/* Worksheet Tabs if multiple */}
+                    {wsList.length > 1 && (
+                      <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
+                        {wsList.map((ws, idx) => {
+                          const isSelected = (activeWs.id === ws.id);
+                          return (
+                            <button
+                              key={ws.id || idx}
+                              type="button"
+                              onClick={() => setDetailSelectedWsId(ws.id)}
+                              className={`px-2.5 py-1 text-xs rounded-md font-medium whitespace-nowrap transition-colors flex items-center gap-1.5 ${
+                                isSelected
+                                  ? 'bg-blue-600 text-white font-bold shadow-xs'
+                                  : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                              }`}
+                            >
+                              <FileText className="w-3.5 h-3.5" />
+                              <span>{ws.fileName}</span>
+                              <span className={`text-[10px] px-1.5 py-0.2 rounded-full ${isSelected ? 'bg-blue-700 text-blue-100' : 'bg-slate-200 text-slate-600'}`}>
+                                OR {ws.orNumber}
+                              </span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    )}
+
+                    {/* Active Worksheet Overview Card */}
+                    <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                        <div className="flex items-center gap-2">
+                          <span className="font-bold text-slate-800">{activeWs.fileName}</span>
+                          <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-blue-100 text-blue-800 font-bold">
+                            No. OR: {activeWs.orNumber}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-3 text-xs">
+                          <span className="text-slate-600">
+                            Style: <strong>{activeWs.style}</strong>
+                          </span>
+                          <span className="text-slate-600">
+                            Target (Total Qty): <strong className="font-mono text-slate-900">{activeWs.target.toLocaleString('id-ID')} pcs</strong>
+                          </span>
+                        </div>
+                      </div>
+
+                      {/* Status Badges & Provenance */}
+                      <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] pt-1 border-t border-slate-200/60">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <span className="text-slate-500 font-medium">Material ({snapshotRows.length} item):</span>
+                          <span className="px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 font-semibold">
+                            READY: {readyCount}
+                          </span>
+                          <span className="px-2 py-0.5 rounded bg-rose-50 text-rose-700 border border-rose-200 font-semibold">
+                            BELUM READY: {notReadyCount}
+                          </span>
+                          {notFoundCount > 0 && (
+                            <span className="px-2 py-0.5 rounded bg-slate-100 text-slate-600 border border-slate-200">
+                              Tidak Ditemukan: {notFoundCount}
+                            </span>
+                          )}
+                        </div>
+                        <div className="flex flex-wrap items-center gap-2 text-[10px] text-slate-500">
+                          <span>
+                            Sumber Upload: <strong className="text-slate-700 font-mono">{uploadSourceLabel}</strong>
+                          </span>
+                          {syncedTimeLabel && (
+                            <span>· Disinkronkan: <strong className="text-slate-700">{syncedTimeLabel}</strong></span>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+
+                    {/* Exact 6-Column Material Table */}
+                    <div className="border border-slate-200 rounded-lg overflow-hidden">
+                      <div className="max-h-60 overflow-y-auto">
+                        <table className="w-full text-left text-xs border-collapse">
+                          <thead className="bg-slate-100 text-slate-700 font-semibold text-[11px] uppercase tracking-wider sticky top-0 z-10 border-b border-slate-200">
+                            <tr>
+                              <th className="py-2 px-3">Kode Material</th>
+                              <th className="py-2 px-3">Nama Material</th>
+                              <th className="py-2 px-2 text-center">Satuan</th>
+                              <th className="py-2 px-3 text-right">Total</th>
+                              <th className="py-2 px-3 text-right">Diterima</th>
+                              <th className="py-2 px-3 text-center">Status</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-100">
+                            {snapshotRows.map((item, idx) => (
+                              <tr key={item.id || idx} className="hover:bg-slate-50 transition-colors">
+                                <td className="py-2 px-3 font-mono font-medium text-slate-900 whitespace-nowrap">
+                                  {item.materialCode}
+                                </td>
+                                <td className="py-2 px-3 text-slate-800">
+                                  {item.materialName}
+                                </td>
+                                <td className="py-2 px-2 text-center text-slate-600 font-mono text-[11px]">
+                                  {item.unit}
+                                </td>
+                                <td className="py-2 px-3 text-right font-mono font-semibold text-slate-900">
+                                  {item.total.toLocaleString('id-ID')}
+                                </td>
+                                <td className="py-2 px-3 text-right font-mono text-slate-900">
+                                  {item.receivedQty !== null && item.receivedQty !== undefined ? (
+                                    <span className="font-bold">{item.receivedQty.toLocaleString('id-ID')}</span>
+                                  ) : (
+                                    <span className="text-slate-400">-</span>
+                                  )}
+                                </td>
+                                <td className="py-2 px-3 text-center whitespace-nowrap">
+                                  {item.status === 'READY' ? (
+                                    <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
+                                      READY
+                                    </span>
+                                  ) : item.status === 'BELUM READY' ? (
+                                    <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold bg-rose-100 text-rose-800 border border-rose-300">
+                                      BELUM READY
+                                    </span>
+                                  ) : (
+                                    <span className="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-100 text-slate-500 border border-slate-300" title="Tidak ditemukan di upload Excel terbaru untuk No. OR ini">
+                                      -
+                                    </span>
+                                  )}
+                                </td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Detail Action Error Banner */}
+              {detailActionError && (
+                <div
+                  role="alert"
+                  className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-800 flex items-start gap-2"
+                >
+                  <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                  <span>{detailActionError}</span>
+                </div>
+              )}
+
               {/* Action buttons */}
               <div className="pt-3 border-t border-slate-200 flex flex-wrap items-center justify-between gap-2">
                 <button
@@ -883,25 +1600,56 @@ export const ProductionScheduleView: React.FC = () => {
                     setActiveMenu('Material Risk Analysis');
                     setActiveDetailSchedule(null);
                   }}
-                  className="px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 rounded flex items-center gap-1.5"
+                  disabled={isDeletingSchedule}
+                  className="px-3 py-1.5 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 disabled:opacity-50 rounded flex items-center gap-1.5"
                 >
                   <ShieldAlert className="w-3.5 h-3.5" />
                   Cek Risiko Material OR Ini
                 </button>
 
                 <div className="flex items-center gap-2">
-                  <button
-                    type="button"
-                    onClick={() => handleDeleteSchedule(activeDetailSchedule.id)}
-                    className="px-3 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50 rounded flex items-center gap-1"
-                  >
-                    <Trash2 className="w-3.5 h-3.5" />
-                    Hapus
-                  </button>
+                  {confirmDeleteId === activeDetailSchedule.id ? (
+                    <div className="flex items-center gap-1.5 bg-rose-50 border border-rose-200 px-2.5 py-1 rounded">
+                      <span className="text-[11px] font-semibold text-rose-800">
+                        Yakin hapus?
+                      </span>
+                      <button
+                        type="button"
+                        onClick={() => confirmDeleteSchedule(activeDetailSchedule.id)}
+                        disabled={isDeletingSchedule}
+                        className="px-2 py-1 text-[11px] font-bold bg-red-600 hover:bg-red-700 disabled:opacity-60 text-white rounded flex items-center gap-1"
+                      >
+                        {isDeletingSchedule && <Loader2 className="w-3 h-3 animate-spin" />}
+                        <span>{isDeletingSchedule ? 'Menghapus...' : 'Ya, Hapus'}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setConfirmDeleteId(null)}
+                        disabled={isDeletingSchedule}
+                        className="px-2 py-1 text-[11px] font-medium text-slate-600 hover:bg-slate-200 rounded"
+                      >
+                        Batal
+                      </button>
+                    </div>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDetailActionError(null);
+                        setConfirmDeleteId(activeDetailSchedule.id);
+                      }}
+                      disabled={isDeletingSchedule}
+                      className="px-3 py-1.5 text-xs font-medium text-red-700 hover:bg-red-50 disabled:opacity-50 rounded flex items-center gap-1"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      Hapus
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => openEditModal(activeDetailSchedule)}
-                    className="px-3 py-1.5 text-xs font-semibold bg-slate-900 hover:bg-slate-800 text-white rounded flex items-center gap-1"
+                    disabled={isDeletingSchedule}
+                    className="px-3 py-1.5 text-xs font-semibold bg-slate-900 hover:bg-slate-800 disabled:opacity-50 text-white rounded flex items-center gap-1"
                   >
                     <Edit2 className="w-3.5 h-3.5" />
                     Edit Jadwal
@@ -913,12 +1661,12 @@ export const ProductionScheduleView: React.FC = () => {
         </div>
       )}
 
-      {/* Add / Edit Schedule Form Modal (6 Required Fields) */}
+      {/* Add / Edit Schedule Form Modal */}
       {isModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
-          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-lg max-h-[92vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-150">
+          <div className={`bg-white rounded-xl shadow-2xl border border-slate-200 w-full ${uploadedPdfs.length > 0 ? 'max-w-4xl' : 'max-w-xl'} max-h-[92vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-150`}>
             {/* Header */}
-            <div className="p-4 bg-slate-900 text-white flex items-center justify-between sticky top-0 z-10">
+            <div className="p-4 bg-slate-900 text-white flex items-center justify-between sticky top-0 z-20">
               <div className="flex items-center gap-2">
                 <Calendar className="w-4 h-4 text-blue-400" />
                 <h3 className="text-sm font-bold">
@@ -926,8 +1674,11 @@ export const ProductionScheduleView: React.FC = () => {
                 </h3>
               </div>
               <button
+                type="button"
+                disabled={isSubmittingForm}
                 onClick={() => setIsModalOpen(false)}
-                className="text-slate-400 hover:text-white"
+                aria-label="Tutup modal jadwal"
+                className="text-slate-400 hover:text-white disabled:opacity-40"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -965,6 +1716,324 @@ export const ProductionScheduleView: React.FC = () => {
                   </p>
                 </div>
               )}
+
+              {/* SECTION: Upload PDF Worksheet (Multiple Files Supported) */}
+              <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <div className="w-7 h-7 rounded-lg bg-blue-100 flex items-center justify-center text-blue-600">
+                      <FileText className="w-4 h-4" />
+                    </div>
+                    <div>
+                      <h4 className="text-xs font-bold text-slate-900 flex items-center gap-1.5">
+                        Upload PDF Worksheet (Multi-File)
+                        <span className="text-[10px] px-1.5 py-0.2 rounded font-normal bg-blue-50 text-blue-700 border border-blue-200">
+                          Opsional / Otomatis
+                        </span>
+                      </h4>
+                      <p className="text-[11px] text-slate-500">
+                        Ekstraksi otomatis No. OR, Style, Target Produksi (Total Qty), dan Kebutuhan Material dari dokumen PDF Worksheet.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Dropzone Upload Button */}
+                <div>
+                  <label
+                    htmlFor="worksheet-pdf-input"
+                    className={`border-2 border-dashed rounded-lg p-3.5 flex flex-col items-center justify-center cursor-pointer transition-colors ${
+                      isProcessingPdfs
+                        ? 'border-blue-400 bg-blue-50/50'
+                        : 'border-slate-300 hover:border-blue-500 hover:bg-white bg-slate-50/60'
+                    }`}
+                  >
+                    <input
+                      id="worksheet-pdf-input"
+                      type="file"
+                      accept=".pdf,application/pdf"
+                      multiple
+                      disabled={isProcessingPdfs}
+                      className="hidden"
+                      onChange={(e) => {
+                        if (e.target.files && e.target.files.length > 0) {
+                          handlePdfFilesUpload(e.target.files);
+                          e.target.value = '';
+                        }
+                      }}
+                    />
+                    {isProcessingPdfs ? (
+                      <div className="flex items-center gap-2 text-xs font-semibold text-blue-700">
+                        <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
+                        <span>Mengekstrak teks PDF & mencocokkan dengan Master Data...</span>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col items-center text-center gap-1">
+                        <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
+                          <Upload className="w-4 h-4 text-blue-600" />
+                          <span>Klik untuk memilih atau seret beberapa file PDF Worksheet ke sini</span>
+                        </div>
+                        <span className="text-[10px] text-slate-400">
+                          Mendukung satu atau banyak file PDF sekaligus (No. OR boleh sama maupun berbeda)
+                        </span>
+                      </div>
+                    )}
+                  </label>
+                </div>
+
+                {/* Uploaded PDF List */}
+                {uploadedPdfs.length > 0 && (
+                  <div className="space-y-2 pt-1">
+                    <div className="flex items-center justify-between text-xs">
+                      <span className="font-semibold text-slate-700">
+                        File Terunggah ({uploadedPdfs.length} PDF):
+                      </span>
+                      {uploadedPdfs.some((p) => p.status === 'success') && (
+                        <button
+                          type="button"
+                          onClick={handleSyncPdfDataToForm}
+                          className="text-[11px] font-semibold text-blue-700 hover:text-blue-800 flex items-center gap-1"
+                        >
+                          <RefreshCw className="w-3 h-3" />
+                          Sinkronkan Ulang ke Form
+                        </button>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
+                      {uploadedPdfs.map((pdf) => {
+                        const isSelected = selectedPreviewPdfId === pdf.id;
+                        return (
+                          <div
+                            key={pdf.id}
+                            onClick={() => setSelectedPreviewPdfId(pdf.id)}
+                            className={`p-2.5 rounded-lg border text-xs cursor-pointer transition-all flex items-start justify-between gap-2 ${
+                              isSelected
+                                ? 'bg-white border-blue-500 shadow-xs ring-1 ring-blue-500'
+                                : 'bg-white hover:bg-slate-100/60 border-slate-200'
+                            }`}
+                          >
+                            <div className="min-w-0 flex-1">
+                              <div className="flex items-center gap-1.5">
+                                <FileText className={`w-3.5 h-3.5 shrink-0 ${isSelected ? 'text-blue-600' : 'text-slate-400'}`} />
+                                <span className="font-bold text-slate-800 truncate" title={pdf.fileName}>
+                                  {pdf.fileName}
+                                </span>
+                              </div>
+
+                              {pdf.status === 'parsing' && (
+                                <div className="flex items-center gap-1 text-[11px] text-blue-600 mt-1">
+                                  <Loader2 className="w-3 h-3 animate-spin" />
+                                  <span>Mengekstrak data...</span>
+                                </div>
+                              )}
+
+                              {pdf.status === 'error' && (
+                                <div className="text-[11px] text-red-600 mt-1 flex items-center gap-1">
+                                  <AlertTriangle className="w-3 h-3 shrink-0" />
+                                  <span className="truncate">{pdf.error}</span>
+                                </div>
+                              )}
+
+                              {pdf.status === 'success' && (
+                                <div className="space-y-1 mt-1 text-[11px]">
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    <span className="px-1.5 py-0.2 rounded font-mono font-bold bg-blue-50 text-blue-700 border border-blue-200">
+                                      OR: {pdf.orNumber || '-'}
+                                    </span>
+                                    <span className="px-1.5 py-0.2 rounded font-mono font-bold bg-slate-100 text-slate-800 border border-slate-200">
+                                      Target: {pdf.target?.toLocaleString('id-ID') || 0} pcs
+                                    </span>
+                                    <span className="px-1.5 py-0.2 rounded font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
+                                      {pdf.materials?.length || 0} Material
+                                    </span>
+                                  </div>
+                                  <p className="text-slate-600 truncate text-[10px]">
+                                    Style: {pdf.style || '-'}
+                                  </p>
+                                </div>
+                              )}
+                            </div>
+
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                handleRemovePdf(pdf.id);
+                              }}
+                              className="text-slate-400 hover:text-red-600 p-1 rounded hover:bg-red-50 transition-colors shrink-0"
+                              title="Hapus PDF ini"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+
+                    {/* Aggregated Target Banner */}
+                    {uploadedPdfs.some((p) => p.status === 'success') && (() => {
+                      const valid = uploadedPdfs.filter((p) => p.status === 'success');
+                      const totalTarget = valid.reduce((acc, p) => acc + (p.target || 0), 0);
+                      return (
+                        <div className="p-2.5 bg-blue-50 border border-blue-200 rounded-lg flex flex-wrap items-center justify-between gap-2 text-xs text-blue-900">
+                          <div className="flex items-center gap-1.5 font-medium">
+                            <Sparkles className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                            <span>
+                              Total Akumulasi Target ({valid.length} PDF): <strong className="font-mono font-bold">{totalTarget.toLocaleString('id-ID')} pcs</strong>
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            onClick={handleSyncPdfDataToForm}
+                            className="px-2.5 py-1 text-[11px] font-bold bg-blue-600 hover:bg-blue-700 text-white rounded shadow-2xs transition-colors"
+                          >
+                            Gunakan sebagai Target Jadwal
+                          </button>
+                        </div>
+                      );
+                    })()}
+
+                    {/* Preview Table for Selected PDF (Mandatory 6 Columns - menggunakan hasil pencocokan upload Excel terbaru per OR) */}
+                    {(() => {
+                      const activePdf = uploadedPdfs.find((p) => p.id === selectedPreviewPdfId) || uploadedPdfs.find((p) => p.status === 'success');
+                      if (!activePdf || activePdf.status !== 'success' || !activePdf.materials || activePdf.materials.length === 0) {
+                        return null;
+                      }
+
+                      const matched: WorksheetMaterialMatched[] = activePdf.materials.map((m, idx) => ({
+                        id: m.id || `wsm-${idx + 1}`,
+                        materialCode: m.materialCode,
+                        materialName: m.materialName,
+                        unit: m.unit,
+                        total: m.total,
+                        receivedQty: m.receivedQty !== undefined ? m.receivedQty : null,
+                        status: m.status !== undefined ? m.status : null,
+                        isFoundInMasterData: Boolean(
+                          m.isFoundInMasterData ?? (m.receivedQty !== null && m.receivedQty !== undefined)
+                        ),
+                        matchedUploadId: m.matchedUploadId ?? activePdf.matchedUploadId ?? null,
+                        matchedUploadDate: m.matchedUploadDate ?? activePdf.matchedUploadDate ?? null,
+                        matchedUploadTime: m.matchedUploadTime ?? activePdf.matchedUploadTime ?? null,
+                        matchedUploadCreatedAt: m.matchedUploadCreatedAt ?? activePdf.matchedUploadCreatedAt ?? null,
+                        matchedAt: m.matchedAt ?? activePdf.lastSyncedAt ?? null,
+                      }));
+                      const readyCount = matched.filter((m) => m.status === 'READY').length;
+                      const notReadyCount = matched.filter((m) => m.status === 'BELUM READY').length;
+                      const notFoundCount = matched.filter((m) => !m.isFoundInMasterData).length;
+                      const uploadBadgeLabel = activePdf.matchedUploadDate
+                        ? `Upload Terbaru: ${activePdf.matchedUploadDate}${activePdf.matchedUploadTime ? ` ${activePdf.matchedUploadTime}` : ''}`
+                        : 'Belum ada upload Excel untuk OR ini';
+
+                      return (
+                        <div className="mt-3 bg-white border border-slate-200 rounded-lg p-3 space-y-2">
+                          <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
+                            <div className="flex items-center gap-1.5">
+                              <Eye className="w-3.5 h-3.5 text-blue-600" />
+                              <span className="font-bold text-slate-800">
+                                Preview Material: {activePdf.fileName}
+                              </span>
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2 text-[11px]">
+                              <span className="text-slate-500">OR: <strong className="font-mono">{activePdf.orNumber}</strong></span>
+                              <span className="text-slate-300">|</span>
+                              <span className="text-slate-500">Target: <strong className="font-mono">{activePdf.target?.toLocaleString('id-ID')} pcs</strong></span>
+                              <span className="text-slate-300">|</span>
+                              <span className="px-1.5 py-0.2 rounded bg-emerald-50 text-emerald-700 font-semibold border border-emerald-200">READY: {readyCount}</span>
+                              <span className="px-1.5 py-0.2 rounded bg-rose-50 text-rose-700 font-semibold border border-rose-200">BELUM READY: {notReadyCount}</span>
+                              {notFoundCount > 0 && (
+                                <span className="px-1.5 py-0.2 rounded bg-slate-100 text-slate-600 border border-slate-200">Tidak Ditemukan: {notFoundCount}</span>
+                              )}
+                              <button
+                                type="button"
+                                onClick={handleRefreshFormPdfSnapshots}
+                                disabled={isRefreshingFormPreview}
+                                className="px-2 py-0.5 text-[10px] font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 rounded flex items-center gap-1 cursor-pointer"
+                                title="Periksa ulang kecocokan terhadap upload Excel terbaru per OR"
+                              >
+                                <RefreshCw className={`w-3 h-3 ${isRefreshingFormPreview ? 'animate-spin' : ''}`} />
+                                <span>Refresh Ketersediaan</span>
+                              </button>
+                            </div>
+                          </div>
+
+                          <div className="text-[10px] text-slate-500 flex items-center justify-between">
+                            <span>Sumber Pencocokan: <strong className="font-mono text-slate-700">{uploadBadgeLabel}</strong></span>
+                          </div>
+
+                          {/* Mandatory 6-Column Table */}
+                          <div className="border border-slate-200 rounded-md overflow-hidden">
+                            <div className="max-h-52 overflow-y-auto">
+                              <table className="w-full text-left text-xs border-collapse">
+                                <thead className="bg-slate-100 text-slate-700 font-semibold text-[11px] uppercase tracking-wider sticky top-0 z-10 border-b border-slate-200">
+                                  <tr>
+                                    <th className="py-2 px-3">Kode Material</th>
+                                    <th className="py-2 px-3">Nama Material</th>
+                                    <th className="py-2 px-2 text-center">Satuan</th>
+                                    <th className="py-2 px-3 text-right">Total</th>
+                                    <th className="py-2 px-3 text-right">Diterima</th>
+                                    <th className="py-2 px-3 text-center">Status</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-100">
+                                  {matched.map((item, idx) => (
+                                    <tr key={item.id || idx} className="hover:bg-slate-50 transition-colors">
+                                      <td className="py-1.5 px-3 font-mono font-medium text-slate-900 whitespace-nowrap">
+                                        {item.materialCode}
+                                      </td>
+                                      <td className="py-1.5 px-3 text-slate-800">
+                                        {item.materialName}
+                                      </td>
+                                      <td className="py-1.5 px-2 text-center text-slate-600 font-mono text-[11px]">
+                                        {item.unit}
+                                      </td>
+                                      <td className="py-1.5 px-3 text-right font-mono font-semibold text-slate-900">
+                                        {item.total.toLocaleString('id-ID')}
+                                      </td>
+                                      <td className="py-1.5 px-3 text-right font-mono text-slate-900">
+                                        {item.receivedQty !== null && item.receivedQty !== undefined ? (
+                                          <span className="font-bold">{item.receivedQty.toLocaleString('id-ID')}</span>
+                                        ) : (
+                                          <span className="text-slate-400">-</span>
+                                        )}
+                                      </td>
+                                      <td className="py-1.5 px-3 text-center whitespace-nowrap">
+                                        {item.status === 'READY' ? (
+                                          <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
+                                            READY
+                                          </span>
+                                        ) : item.status === 'BELUM READY' ? (
+                                          <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold bg-rose-100 text-rose-800 border border-rose-300">
+                                            BELUM READY
+                                          </span>
+                                        ) : (
+                                          <span className="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-100 text-slate-500 border border-slate-300" title="Tidak ditemukan di upload Excel terbaru untuk No. OR ini">
+                                            -
+                                          </span>
+                                        )}
+                                      </td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                          <p className="text-[10px] text-slate-400 italic">
+                            * Pencocokan hanya mengambil data dari transaksi upload Excel terbaru untuk OR {activePdf.orNumber}. Hasil ini akan disimpan sebagai snapshot permanen saat jadwal disimpan.
+                          </p>
+                        </div>
+                      );
+                    })()}
+                  </div>
+                )}
+              </div>
+
+              {/* Form Divider */}
+              <div className="pt-2 border-t border-slate-200">
+                <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400 block mb-2">
+                  Formulir Jadwal Produksi (6 Kolom Wajib)
+                </span>
+              </div>
 
               {/* Field 1: Nomor OR */}
               <div>
@@ -1012,11 +2081,11 @@ export const ProductionScheduleView: React.FC = () => {
                   )}
                 </div>
                 <p className="text-[11px] text-slate-400 mt-1">
-                  Pilih dari Nomor OR yang terdaftar di Upload Excel. Style akan terisi otomatis secara konsisten.
+                  Pilih dari Nomor OR yang terdaftar di Upload Excel atau isi sesuai No. OR Worksheet PDF.
                 </p>
               </div>
 
-              {/* Field 5: Style (Placed near OR for visual clarity) */}
+              {/* Field 5: Style */}
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1">
                   2. Style *
@@ -1097,7 +2166,7 @@ export const ProductionScheduleView: React.FC = () => {
                   className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md font-mono font-bold focus:outline-hidden focus:ring-2 focus:ring-blue-500"
                 />
                 <p className="text-[11px] text-slate-400 mt-1">
-                  Target harus berupa angka positif (&gt; 0).
+                  Target terakumulasi otomatis dari seluruh PDF Worksheet yang diunggah (atau dapat disesuaikan manual).
                 </p>
               </div>
 
@@ -1105,17 +2174,29 @@ export const ProductionScheduleView: React.FC = () => {
               <div className="pt-3 border-t border-slate-200 flex items-center justify-end gap-2">
                 <button
                   type="button"
+                  disabled={isSubmittingForm}
                   onClick={() => setIsModalOpen(false)}
-                  className="px-4 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 rounded-md"
+                  className="px-4 py-2 text-xs font-medium text-slate-700 hover:bg-slate-100 disabled:opacity-50 rounded-md"
                 >
                   Batal
                 </button>
                 <button
                   type="submit"
-                  className="px-4 py-2 text-xs font-bold bg-blue-600 hover:bg-blue-700 text-white rounded-md shadow-xs transition-colors flex items-center gap-1.5"
+                  disabled={isProcessingPdfs || isSubmittingForm}
+                  className="px-4 py-2 text-xs font-bold bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-md shadow-xs transition-colors flex items-center gap-1.5"
                 >
-                  <CheckCircle className="w-4 h-4" />
-                  {modalMode === 'create' ? 'Simpan Jadwal' : 'Simpan Perubahan'}
+                  {isSubmittingForm ? (
+                    <Loader2 className="w-4 h-4 animate-spin" />
+                  ) : (
+                    <CheckCircle className="w-4 h-4" />
+                  )}
+                  <span>
+                    {isSubmittingForm
+                      ? 'Menyimpan...'
+                      : modalMode === 'create'
+                        ? 'Simpan Jadwal'
+                        : 'Simpan Perubahan'}
+                  </span>
                 </button>
               </div>
             </form>

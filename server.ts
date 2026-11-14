@@ -154,6 +154,130 @@ app.post('/api/ai/sequential-workflow', async (req, res) => {
   }
 });
 
+// Endpoint for PDF Worksheet Extraction (Deterministic PDFParse + Optional AI Fallback)
+app.post('/api/pdf/extract-worksheet', async (req, res) => {
+  try {
+    const { fileBase64, pdfBase64, fileName = 'Worksheet.pdf' } = req.body;
+    const rawBase64 = pdfBase64 || fileBase64;
+
+    if (!rawBase64) {
+      return res.status(400).json({
+        success: false,
+        error: 'Data berkas PDF tidak ditemukan atau kosong.',
+      });
+    }
+
+    const buffer = Buffer.from(rawBase64, 'base64');
+    let extractedText = '';
+
+    try {
+      const { PDFParse } = await import('pdf-parse');
+      const parser = new (PDFParse as any)({ data: buffer });
+      const textResult = await parser.getText();
+      extractedText = textResult?.text || '';
+      if (typeof parser.destroy === 'function') {
+        await parser.destroy();
+      }
+    } catch (pdfErr: any) {
+      console.warn('PDFParse failed, checking fallback:', pdfErr?.message);
+    }
+
+    const { parseWorksheetText } = await import('./src/utils/pdfWorksheetParser');
+    let parseResult = parseWorksheetText(extractedText, fileName);
+
+    // If deterministic parsing failed and Gemini AI is available, attempt Gemini extraction
+    const isRealKey = apiKey && apiKey !== 'MY_GEMINI_API_KEY' && apiKey.trim().length > 10;
+    if ((!parseResult.success || !parseResult.data?.materials?.length) && isRealKey && ai) {
+      try {
+        const prompt = `Anda adalah parser PDF Worksheet garmen dan manufaktur profesional.
+Ekstrak informasi dari teks atau dokumen PDF berikut:
+1. No. OR: Ambil HANYA nomor setelah slash terakhir (Contoh: "OR/2026/09/1117" -> "1117"). Jangan gunakan nomor Worksheet atau PO.
+2. Style: Ambil nama Style pakaian/produk.
+3. Target Produksi: Ambil angka dari bagian Total Qty (Contoh: Total Qty = 74 -> target = 74).
+4. Tabel MATERIAL & KONSUMSI: Ekstrak persis 4 kolom:
+   - CODE ACC -> materialCode
+   - DESCRIPTION -> materialName
+   - UNIT -> unit
+   - TOTAL -> total (angka numerik)
+Abaikan kolom NO dan CONS. Pertahankan urutan dan jangan gabungkan material duplikat.
+
+Kembalikan HANYA format JSON valid tanpa markdown tambahan:
+{
+  "orNumber": "1117",
+  "style": "Style Name",
+  "target": 74,
+  "materials": [
+    { "materialCode": "...", "materialName": "...", "unit": "...", "total": 12.3 }
+  ]
+}`;
+
+        const aiResponse = await ai.models.generateContent({
+          model: 'gemini-3.8-flash',
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  inlineData: {
+                    mimeType: 'application/pdf',
+                    data: fileBase64,
+                  },
+                },
+                { text: prompt },
+              ],
+            },
+          ],
+        });
+
+        const replyText = aiResponse.text || '';
+        const jsonMatch = replyText.match(/\{[\s\S]*\}/);
+        if (jsonMatch) {
+          const aiParsed = JSON.parse(jsonMatch[0]);
+          if (aiParsed.orNumber && aiParsed.style && aiParsed.target && Array.isArray(aiParsed.materials)) {
+            parseResult = {
+              success: true,
+              data: {
+                id: `ws-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+                fileName,
+                orNumber: String(aiParsed.orNumber),
+                style: String(aiParsed.style),
+                target: Number(aiParsed.target),
+                materials: aiParsed.materials.map((m: any) => ({
+                  materialCode: String(m.materialCode || m.code || ''),
+                  materialName: String(m.materialName || m.description || ''),
+                  unit: String(m.unit || 'Unit'),
+                  total: Number(m.total) || 0,
+                })),
+                rawText: extractedText,
+              },
+            };
+          }
+        }
+      } catch (aiErr: any) {
+        console.warn('Gemini AI fallback parsing failed:', aiErr?.message);
+      }
+    }
+
+    if (!parseResult.success) {
+      return res.status(422).json({
+        success: false,
+        error: parseResult.error || `Gagal mengekstrak data dari dokumen PDF ${fileName}.`,
+      });
+    }
+
+    return res.json({
+      success: true,
+      data: parseResult.data,
+    });
+  } catch (err: any) {
+    console.error('Error in /api/pdf/extract-worksheet:', err);
+    res.status(500).json({
+      success: false,
+      error: `Terjadi kesalahan saat memproses PDF: ${err?.message || 'Internal error'}`,
+    });
+  }
+});
+
 // Endpoint for General AI Chat
 app.post('/api/ai/chat', async (req, res) => {
   try {
