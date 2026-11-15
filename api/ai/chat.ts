@@ -1,11 +1,11 @@
-import { handleAiChatPayload } from '../../src/server/aiHandlers';
+import { handleAiChatPayload } from '../../src/server/aiHandlers.js';
 import {
   HttpPayloadError,
   readParsedRequestBody,
   sendJson,
   type VercelLikeRequest,
   type VercelLikeResponse,
-} from '../../src/server/vercelHttp';
+} from '../../src/server/vercelHttp.js';
 
 export default async function handler(
   req: VercelLikeRequest,

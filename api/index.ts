@@ -1,15 +1,15 @@
-import { handleExtractWorksheetHttpRequest } from '../src/server/pdfWorksheetHandler';
+import { handleExtractWorksheetHttpRequest } from '../src/server/pdfWorksheetHandler.js';
 import {
   generateSequentialPpicReport,
   handleAiChatPayload,
-} from '../src/server/aiHandlers';
+} from '../src/server/aiHandlers.js';
 import {
   HttpPayloadError,
   readParsedRequestBody,
   sendJson,
   type VercelLikeRequest,
   type VercelLikeResponse,
-} from '../src/server/vercelHttp';
+} from '../src/server/vercelHttp.js';
 
 function resolveApiPathname(req: VercelLikeRequest): string {
   const rawUrl = (req.url || '/api').split('?')[0];

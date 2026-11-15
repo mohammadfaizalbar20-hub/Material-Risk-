@@ -3,11 +3,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { Readable, Writable } from 'node:stream';
-import extractWorksheetHandler from '../api/pdf/extract-worksheet';
-import apiIndexHandler from '../api/index';
-import aiChatHandler from '../api/ai/chat';
-import sequentialWorkflowHandler from '../api/ai/sequential-workflow';
-import type { VercelLikeRequest, VercelLikeResponse } from '../src/server/vercelHttp';
+import extractWorksheetHandler from '../api/pdf/extract-worksheet.js';
+import apiIndexHandler from '../api/index.js';
+import aiChatHandler from '../api/ai/chat.js';
+import sequentialWorkflowHandler from '../api/ai/sequential-workflow.js';
+import type { VercelLikeRequest, VercelLikeResponse } from '../src/server/vercelHttp.js';
 
 function buildSampleWorksheetPdfBuffer(): Buffer {
   const objects: string[] = [];
@@ -348,3 +348,127 @@ test('6. Esbuild bundling verification: seluruh entry point /api/*.ts terkompila
   assert.equal(buildResult.errors.length, 0);
   assert.equal(buildResult.outputFiles.length, entryPoints.length);
 });
+
+test('7. Simulasi Node.js ESM murni (/var/task): transpile file-by-file ke .js tanpa .ts dan eksekusi handler PDF langsung di Node ESM', async () => {
+  const os = await import('node:os');
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execFileAsync = promisify(execFile);
+  const esbuild = await import('esbuild');
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'vercel-esm-sim-'));
+  try {
+    const sourceFiles = [
+      'api/pdf/extract-worksheet.ts',
+      'api/ai/chat.ts',
+      'api/ai/sequential-workflow.ts',
+      'api/index.ts',
+      'src/server/pdfWorksheetHandler.ts',
+      'src/server/aiHandlers.ts',
+      'src/server/vercelHttp.ts',
+      'src/utils/pdfWorksheetParser.ts',
+    ];
+
+    // Write package.json with "type": "module" & symlink node_modules (mimicking /var/task)
+    fs.writeFileSync(path.join(tmpRoot, 'package.json'), JSON.stringify({ type: 'module' }));
+    fs.symlinkSync(
+      path.resolve(process.cwd(), 'node_modules'),
+      path.join(tmpRoot, 'node_modules'),
+      'dir'
+    );
+
+    // Transpile each .ts file individually -> .js (no bundling!)
+    for (const relPath of sourceFiles) {
+      const srcCode = fs.readFileSync(path.resolve(process.cwd(), relPath), 'utf8');
+      const transformed = await esbuild.transform(srcCode, {
+        loader: 'ts',
+        format: 'esm',
+        target: 'node22',
+      });
+
+      // Verify ZERO relative imports lack .js/.mjs/.json extension or point to .ts
+      const relImports = [...transformed.code.matchAll(/(?:from|import\s*\()\s*['"](\.[^'"]+)['"]/g)].map(
+        (m) => m[1]
+      );
+      for (const spec of relImports) {
+        assert.ok(
+          spec.endsWith('.js') || spec.endsWith('.mjs') || spec.endsWith('.json'),
+          `Relative import "${spec}" in ${relPath} must have .js/.mjs/.json extension for Vercel Node ESM`
+        );
+      }
+
+      const outJsPath = path.join(tmpRoot, relPath.replace(/\.ts$/, '.js'));
+      fs.mkdirSync(path.dirname(outJsPath), { recursive: true });
+      fs.writeFileSync(outJsPath, transformed.code, 'utf8');
+    }
+
+    // Run pure `node` (NO tsx, NO hooks!) on compiled /api/pdf/extract-worksheet.js & /api/index.js
+    const pdfBase64 = buildSampleWorksheetPdfBuffer().toString('base64');
+    const runnerScript = `
+      import assert from 'node:assert/strict';
+      import { Readable, Writable } from 'node:stream';
+      import extractHandler from './api/pdf/extract-worksheet.js';
+      import indexHandler from './api/index.js';
+      import chatHandler from './api/ai/chat.js';
+      import seqHandler from './api/ai/sequential-workflow.js';
+
+      async function invoke(fn, method, url, body) {
+        const req = Readable.from([]);
+        req.method = method;
+        req.url = url;
+        req.headers = { 'content-type': 'application/json' };
+        req.body = body;
+        const headers = {};
+        const chunks = [];
+        const res = new Writable({
+          write(c, _e, cb) { chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c)); cb(); }
+        });
+        res.statusCode = 200;
+        res.setHeader = (k, v) => { headers[k.toLowerCase()] = String(v); return res; };
+        await fn(req, res);
+        return {
+          status: res.statusCode,
+          contentType: headers['content-type'],
+          json: JSON.parse(Buffer.concat(chunks).toString('utf8')),
+        };
+      }
+
+      const r1 = await invoke(extractHandler, 'POST', '/api/pdf/extract-worksheet', {
+        pdfBase64: ${JSON.stringify(pdfBase64)},
+        fileName: 'VercelSim.pdf',
+      });
+      assert.equal(r1.status, 200);
+      assert.equal(r1.json.success, true);
+      assert.equal(r1.json.data.orNumber, '1014');
+      assert.equal(r1.json.data.materials[1].total, null);
+
+      const r2 = await invoke(indexHandler, 'POST', '/api/pdf/extract-worksheet', {
+        pdfBase64: ${JSON.stringify(pdfBase64)},
+        fileName: 'VercelSimIndex.pdf',
+      });
+      assert.equal(r2.status, 200);
+      assert.equal(r2.json.success, true);
+
+      const r3 = await invoke(chatHandler, 'POST', '/api/ai/chat', { message: 'shortage', contextData: {} });
+      assert.equal(r3.status, 200);
+      assert.ok(r3.json.reply);
+
+      const r4 = await invoke(seqHandler, 'POST', '/api/ai/sequential-workflow', { contextData: { orSummaries: [] } });
+      assert.equal(r4.status, 200);
+      assert.ok(r4.json.stage1);
+
+      console.log('VERCEL_ESM_SIM_OK');
+    `;
+    const runnerPath = path.join(tmpRoot, 'verify-esm.mjs');
+    fs.writeFileSync(runnerPath, runnerScript, 'utf8');
+
+    const { stdout, stderr } = await execFileAsync(process.execPath, [runnerPath], {
+      cwd: tmpRoot,
+    });
+    assert.equal(stderr.trim(), '');
+    assert.match(stdout, /VERCEL_ESM_SIM_OK/);
+  } finally {
+    fs.rmSync(tmpRoot, { recursive: true, force: true });
+  }
+});
+

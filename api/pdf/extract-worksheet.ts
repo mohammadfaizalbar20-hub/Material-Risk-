@@ -1,9 +1,9 @@
-import { handleExtractWorksheetHttpRequest } from '../../src/server/pdfWorksheetHandler';
+import { handleExtractWorksheetHttpRequest } from '../../src/server/pdfWorksheetHandler.js';
 import {
   sendJson,
   type VercelLikeRequest,
   type VercelLikeResponse,
-} from '../../src/server/vercelHttp';
+} from '../../src/server/vercelHttp.js';
 
 export default async function handler(
   req: VercelLikeRequest,

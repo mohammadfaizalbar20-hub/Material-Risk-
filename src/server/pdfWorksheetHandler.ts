@@ -9,14 +9,14 @@ import {
   type ExtractedPdfWorksheet,
   type ExtractedWorksheetMaterial,
   type PdfCoordinatePage,
-} from '../utils/pdfWorksheetParser';
+} from '../utils/pdfWorksheetParser.js';
 import {
   MAX_PDF_PAYLOAD_BYTES,
   parseMultipartPdfUpload,
   type VercelLikeRequest,
   readParsedRequestBody,
   HttpPayloadError,
-} from './vercelHttp';
+} from './vercelHttp.js';
 
 export interface ExtractWorksheetHttpResult {
   status: number;

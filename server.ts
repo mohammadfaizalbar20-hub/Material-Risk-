@@ -1,13 +1,40 @@
 import express from 'express';
 import dotenv from 'dotenv';
+import fs from 'fs';
+import * as nodeModule from 'node:module';
 import path from 'path';
-import { fileURLToPath } from 'url';
-import { handleExtractWorksheetHttpRequest } from './src/server/pdfWorksheetHandler';
-import {
-  generateSequentialPpicReport,
-  handleAiChatPayload,
-} from './src/server/aiHandlers';
-import { sendJson } from './src/server/vercelHttp';
+import { fileURLToPath, pathToFileURL } from 'url';
+
+// Allow `node server.ts` (Node 22 native strip-types) to resolve `.js` relative ESM imports to `.ts` source files
+const registerHooksFn = (nodeModule as { registerHooks?: Function }).registerHooks;
+if (typeof registerHooksFn === 'function') {
+  registerHooksFn({
+    resolve(specifier: string, context: { parentURL?: string }, nextResolve: Function) {
+      if (
+        specifier.startsWith('.') &&
+        specifier.endsWith('.js') &&
+        context.parentURL?.startsWith('file://')
+      ) {
+        const parentDir = path.dirname(fileURLToPath(context.parentURL));
+        const jsCandidate = path.resolve(parentDir, specifier);
+        if (!fs.existsSync(jsCandidate)) {
+          const tsCandidate = `${jsCandidate.slice(0, -3)}.ts`;
+          if (fs.existsSync(tsCandidate)) {
+            return {
+              shortCircuit: true,
+              url: pathToFileURL(tsCandidate).href,
+            };
+          }
+        }
+      }
+      return nextResolve(specifier, context);
+    },
+  });
+}
+
+const { handleExtractWorksheetHttpRequest } = await import('./src/server/pdfWorksheetHandler.js');
+const { generateSequentialPpicReport, handleAiChatPayload } = await import('./src/server/aiHandlers.js');
+const { sendJson } = await import('./src/server/vercelHttp.js');
 
 dotenv.config();
 
