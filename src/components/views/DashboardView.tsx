@@ -5,6 +5,7 @@ import {
   calculateMaterialComparisonMetrics,
 } from '../../utils/ppicCalculations';
 import { ParetoItem } from '../../types/ppic';
+import { cleanFloatPrecision, formatPpicNumber } from '../../utils/excelMaterialParser';
 import {
   fetchDashboardSummaryFromSupabase,
   DashboardSummaryData,
@@ -386,7 +387,7 @@ export const DashboardView: React.FC = () => {
         return {
           materialCode: item.materialCode,
           materialName: item.materialName,
-          unit: (item.unit || 'Unit') as any,
+          unit: item.unit ?? '',
           shortageQty: item.totalDeficit,
           shortageValue: item.totalDeficit * 25000,
           contributionPercent: Math.round(contrib * 10) / 10,
@@ -664,10 +665,10 @@ export const DashboardView: React.FC = () => {
           </div>
           <div className="mt-2 flex items-baseline gap-2">
             <span className="text-2xl font-extrabold text-slate-900 tabular-nums">
-              {comparison.totalReceived.toLocaleString('id-ID')}
+              {formatPpicNumber(comparison.totalReceived)}
             </span>
             <span className="text-xs text-slate-500">
-              / {comparison.totalRequired.toLocaleString('id-ID')} unit
+              / {formatPpicNumber(comparison.totalRequired)} unit
             </span>
           </div>
           <div className="w-full bg-slate-100 h-2 rounded-full mt-3 overflow-hidden">
@@ -685,7 +686,7 @@ export const DashboardView: React.FC = () => {
           <div className="mt-2 text-[11px] text-slate-500 flex justify-between">
             <span>Defisit Total:</span>
             <strong className="text-red-600 font-mono">
-              -{comparison.shortageTotal.toLocaleString('id-ID')} unit
+              -{formatPpicNumber(comparison.shortageTotal)} unit
             </strong>
           </div>
         </div>
@@ -800,7 +801,7 @@ export const DashboardView: React.FC = () => {
                 const reqPct = Math.round((item.required / maxVal) * 100);
                 const recPct = Math.round((item.received / maxVal) * 100);
                 const isFulfilled = item.received >= item.required;
-                const gap = item.required - item.received;
+                const gap = cleanFloatPrecision(item.required - item.received);
 
                 return (
                   <div key={item.code} className="space-y-1.5">
@@ -812,14 +813,14 @@ export const DashboardView: React.FC = () => {
                       </div>
                       <div className="text-right font-mono">
                         <span className="text-slate-500">
-                          {item.received.toLocaleString('id-ID')} / {item.required.toLocaleString('id-ID')} {item.unit}
+                          {formatPpicNumber(item.received)} / {formatPpicNumber(item.required)}{item.unit ? ` ${item.unit}` : ''}
                         </span>
                         <span
                           className={`ml-2 font-bold ${
                             isFulfilled ? 'text-emerald-700' : 'text-red-600'
                           }`}
                         >
-                          {isFulfilled ? '✓ 100%' : `-${gap.toLocaleString('id-ID')} ${item.unit}`}
+                          {isFulfilled ? '✓ 100%' : `-${formatPpicNumber(gap)}${item.unit ? ` ${item.unit}` : ''}`}
                         </span>
                       </div>
                     </div>
@@ -1008,7 +1009,7 @@ export const DashboardView: React.FC = () => {
 
                       <div className="flex items-center gap-3 text-right">
                         <span className="font-mono font-semibold text-red-600">
-                          {formatIdr(item.shortageValue)} ({item.shortageQty.toLocaleString('id-ID')} {item.unit})
+                          {formatIdr(item.shortageValue)} ({formatPpicNumber(item.shortageQty)}{item.unit ? ` ${item.unit}` : ''})
                         </span>
                         <span className="px-1.5 py-0.5 bg-slate-100 rounded text-[11px] font-mono text-slate-700 font-semibold">
                           Kontribusi: {item.contributionPercent}%
@@ -1078,7 +1079,7 @@ export const DashboardView: React.FC = () => {
                       <td className="py-2.5 px-3 font-mono font-bold text-slate-900">{p.materialCode}</td>
                       <td className="py-2.5 px-3 font-medium text-slate-800">{p.materialName}</td>
                       <td className="py-2.5 px-3 text-right font-mono text-red-600 font-bold">
-                        -{p.shortageQty.toLocaleString('id-ID')} {p.unit}
+                        -{formatPpicNumber(p.shortageQty)}{p.unit ? ` ${p.unit}` : ''}
                       </td>
                       <td className="py-2.5 px-3 text-right font-mono font-bold text-slate-900">
                         {formatIdr(p.shortageValue)}
@@ -1275,16 +1276,16 @@ export const DashboardView: React.FC = () => {
                                     </span>
                                   </td>
                                   <td className="py-2.5 px-3 text-right font-mono text-slate-700 font-semibold">
-                                    {item.totalRequired.toLocaleString('id-ID')} {item.unit}
+                                    {formatPpicNumber(item.totalRequired)}{item.unit ? ` ${item.unit}` : ''}
                                   </td>
                                   <td className="py-2.5 px-3 text-right font-mono text-emerald-700 font-semibold">
-                                    {item.totalReceived.toLocaleString('id-ID')} {item.unit}
+                                    {formatPpicNumber(item.totalReceived)}{item.unit ? ` ${item.unit}` : ''}
                                   </td>
                                   <td className="py-2.5 px-3 text-right font-mono font-bold">
                                     <span className={item.balance < 0 ? 'text-red-600' : 'text-emerald-700'}>
                                       {item.balance < 0
-                                        ? `-${Math.abs(item.balance).toLocaleString('id-ID')} ${item.unit}`
-                                        : `+${item.balance.toLocaleString('id-ID')} ${item.unit}`}
+                                        ? `-${formatPpicNumber(Math.abs(item.balance))}${item.unit ? ` ${item.unit}` : ''}`
+                                        : `+${formatPpicNumber(item.balance)}${item.unit ? ` ${item.unit}` : ''}`}
                                     </span>
                                   </td>
                                   <td className="py-2.5 px-3 text-right">
@@ -1403,7 +1404,7 @@ export const DashboardView: React.FC = () => {
               <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
                 <span className="text-[11px] font-semibold text-slate-600">Grand Total Kuantitas Defisit</span>
                 <p className="text-lg font-extrabold text-slate-900 font-mono mt-0.5">
-                  {(paretoMitigationCache?.data.grandTotalShortageQty ?? 0).toLocaleString('id-ID')}
+                  {formatPpicNumber(paretoMitigationCache?.data.grandTotalShortageQty ?? 0)}
                 </p>
               </div>
               <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
@@ -1527,10 +1528,10 @@ export const DashboardView: React.FC = () => {
                                   {item.materialName}
                                 </td>
                                 <td className="py-2.5 px-3 text-center font-mono text-slate-600">
-                                  {item.unit}
+                                  {item.unit || '-'}
                                 </td>
                                 <td className="py-2.5 px-3 text-right font-mono font-bold text-red-600">
-                                  -{item.shortageQty.toLocaleString('id-ID')}
+                                  -{formatPpicNumber(item.shortageQty)}
                                 </td>
                                 <td className="py-2.5 px-3 text-right font-mono font-bold text-slate-900">
                                   {formatIdr(item.shortageValue)}
@@ -1744,16 +1745,16 @@ export const DashboardView: React.FC = () => {
                                   {item.materialName}
                                 </td>
                                 <td className="py-2.5 px-3 text-center font-mono text-slate-600">
-                                  {item.unit}
+                                  {item.unit || '-'}
                                 </td>
                                 <td className="py-2.5 px-3 text-right font-mono text-slate-700">
-                                  {item.totalRequired.toLocaleString('id-ID')}
+                                  {formatPpicNumber(item.totalRequired)}
                                 </td>
                                 <td className="py-2.5 px-3 text-right font-mono text-emerald-700">
-                                  {item.totalReceived.toLocaleString('id-ID')}
+                                  {formatPpicNumber(item.totalReceived)}
                                 </td>
                                 <td className="py-2.5 px-3 text-right font-mono font-bold text-red-600">
-                                  -{item.shortageQty.toLocaleString('id-ID')}
+                                  -{formatPpicNumber(item.shortageQty)}
                                 </td>
                                 <td className="py-2.5 px-3 text-center">
                                   <span

@@ -23,6 +23,7 @@ import {
   X,
 } from 'lucide-react';
 import { RiskLevel } from '../../types/ppic';
+import { formatPpicNumber } from '../../utils/excelMaterialParser';
 
 export const MaterialRiskAnalysisView: React.FC = () => {
   const {
@@ -455,10 +456,10 @@ export const MaterialRiskAnalysisView: React.FC = () => {
                                   <div className="text-[11px] text-slate-600">{mat.materialName}</div>
                                 </td>
                                 <td className="py-2.5 px-3 text-right font-mono font-semibold text-slate-800">
-                                  {mat.requiredQty.toLocaleString('id-ID')} {mat.unit}
+                                  {formatPpicNumber(mat.requiredQty)}{mat.unit ? ` ${mat.unit}` : ''}
                                 </td>
                                 <td className="py-2.5 px-3 text-right font-mono font-semibold text-slate-800">
-                                  {mat.receivedQty.toLocaleString('id-ID')} {mat.unit}
+                                  {formatPpicNumber(mat.receivedQty)}{mat.unit ? ` ${mat.unit}` : ''}
                                 </td>
                                 <td className="py-2.5 px-3 text-right font-mono font-bold">
                                   {mat.shortageRatio === 0 ? (
@@ -564,11 +565,11 @@ export const MaterialRiskAnalysisView: React.FC = () => {
                       </td>
 
                       <td className="py-3 px-3 text-right font-mono font-semibold text-slate-800">
-                        {item.requiredQty.toLocaleString('id-ID')} {item.unit}
+                        {formatPpicNumber(item.requiredQty)}{item.unit ? ` ${item.unit}` : ''}
                       </td>
 
                       <td className="py-3 px-3 text-right font-mono font-semibold text-slate-800">
-                        {item.receivedQty.toLocaleString('id-ID')} {item.unit}
+                        {formatPpicNumber(item.receivedQty)}{item.unit ? ` ${item.unit}` : ''}
                       </td>
 
                       <td

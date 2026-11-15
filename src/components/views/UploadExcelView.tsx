@@ -23,7 +23,13 @@ import {
   Search,
   X,
 } from 'lucide-react';
-import { parseExcelRowsToMaterials } from '../../utils/excelMaterialParser';
+import {
+  parseExcelRowsToMaterials,
+  EXCEL_SHEET_TO_JSON_OPTIONS,
+  filterNonEmptyExcelRows,
+  cleanFloatPrecision,
+  formatPpicNumber,
+} from '../../utils/excelMaterialParser';
 import {
   UploadResumeCheckpoint,
   getCheckpointMeta,
@@ -116,7 +122,7 @@ export const UploadExcelView: React.FC = () => {
           setFileName(meta.fileName);
 
           const rowsWithStatus = cachedRows.map((r, idx) => {
-            const shortage = (r.receivedQty ?? 0) - (r.requiredQty ?? 0);
+            const shortage = cleanFloatPrecision((r.receivedQty ?? 0) - (r.requiredQty ?? 0));
             const isReady = shortage >= 0;
             return {
               ...r,
@@ -127,8 +133,8 @@ export const UploadExcelView: React.FC = () => {
             };
           });
 
-          const totalRequired = rowsWithStatus.reduce((acc, r) => acc + (r.requiredQty || 0), 0);
-          const totalReceived = rowsWithStatus.reduce((acc, r) => acc + (r.receivedQty || 0), 0);
+          const totalRequired = cleanFloatPrecision(rowsWithStatus.reduce((acc, r) => acc + (r.requiredQty || 0), 0));
+          const totalReceived = cleanFloatPrecision(rowsWithStatus.reduce((acc, r) => acc + (r.receivedQty || 0), 0));
 
           setPreviewData({
             fileName: meta.fileName,
@@ -297,10 +303,13 @@ export const UploadExcelView: React.FC = () => {
     reader.onload = (e) => {
       try {
         const buffer = e.target?.result;
-        const workbook = XLSX.read(buffer, { type: 'binary' });
+        const workbook = XLSX.read(buffer, { type: 'array' });
 
         const sheetName = workbook.SheetNames[0];
-        const rawJson: any[] = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName]);
+        const sheet = workbook.Sheets[sheetName];
+        const rawJson: any[] = sheet
+          ? filterNonEmptyExcelRows(XLSX.utils.sheet_to_json(sheet, EXCEL_SHEET_TO_JSON_OPTIONS))
+          : [];
 
         if (!rawJson || rawJson.length === 0) {
           setErrorMessage('Berkas Excel kosong atau tidak memiliki baris data.');
@@ -333,7 +342,7 @@ export const UploadExcelView: React.FC = () => {
         const targetUploadId = resumeCheckpoint?.uploadId || `upload-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
         const rowsWithStatus = result.requirements.map((r, idx) => {
-          const shortage = r.receivedQty - r.requiredQty;
+          const shortage = cleanFloatPrecision(r.receivedQty - r.requiredQty);
           const isReady = shortage >= 0;
           return {
             ...r,
@@ -347,8 +356,8 @@ export const UploadExcelView: React.FC = () => {
           };
         });
 
-        const totalRequired = rowsWithStatus.reduce((acc, r) => acc + (r.requiredQty || 0), 0);
-        const totalReceived = rowsWithStatus.reduce((acc, r) => acc + (r.receivedQty || 0), 0);
+        const totalRequired = cleanFloatPrecision(rowsWithStatus.reduce((acc, r) => acc + (r.requiredQty || 0), 0));
+        const totalReceived = cleanFloatPrecision(rowsWithStatus.reduce((acc, r) => acc + (r.receivedQty || 0), 0));
         const failedRows = Math.max(0, rawJson.length - rowsWithStatus.length);
 
         // Save prepared rows to IndexedDB so they survive page reload
@@ -388,7 +397,7 @@ export const UploadExcelView: React.FC = () => {
         setErrorMessage(`Gagal membaca file Excel: ${err.message || 'Format tidak valid'}`);
       }
     };
-    reader.readAsBinaryString(file);
+    reader.readAsArrayBuffer(file);
   };
 
   // Tahap 4: Pembatalan Preview (Membuang data sementara, database tidak berubah sama sekali)
@@ -563,7 +572,7 @@ export const UploadExcelView: React.FC = () => {
     setTimeout(() => {
       const result = parseExcelRowsToMaterials(sampleRows, materials, targetOr, targetStyle, updateDate);
       const rowsWithStatus = result.requirements.map((r) => {
-        const shortage = r.receivedQty - r.requiredQty;
+        const shortage = cleanFloatPrecision(r.receivedQty - r.requiredQty);
         const isReady = shortage >= 0;
         return {
           ...r,
@@ -575,8 +584,8 @@ export const UploadExcelView: React.FC = () => {
         };
       });
 
-      const totalRequired = rowsWithStatus.reduce((acc, r) => acc + (r.requiredQty || 0), 0);
-      const totalReceived = rowsWithStatus.reduce((acc, r) => acc + (r.receivedQty || 0), 0);
+      const totalRequired = cleanFloatPrecision(rowsWithStatus.reduce((acc, r) => acc + (r.requiredQty || 0), 0));
+      const totalReceived = cleanFloatPrecision(rowsWithStatus.reduce((acc, r) => acc + (r.receivedQty || 0), 0));
 
       setPreviewData({
         fileName: 'PPIC_Order_Lines_Odoo_ERP.xlsx',
@@ -1059,7 +1068,7 @@ export const UploadExcelView: React.FC = () => {
             <div className="p-3 bg-slate-50 rounded-lg border border-slate-200">
               <span className="text-[11px] text-slate-500 block mb-0.5">Total Kebutuhan / Diterima</span>
               <span className="font-mono font-bold text-slate-800 block text-xs">
-                {previewData.summary.totalRequired.toLocaleString('id-ID')} / {previewData.summary.totalReceived.toLocaleString('id-ID')}
+                {formatPpicNumber(previewData.summary.totalRequired)} / {formatPpicNumber(previewData.summary.totalReceived)}
               </span>
             </div>
           </div>
@@ -1111,13 +1120,13 @@ export const UploadExcelView: React.FC = () => {
                         {r.materialName}
                       </td>
                       <td className="py-2 px-3 text-right font-mono font-semibold text-slate-900">
-                        {r.requiredQty.toLocaleString('id-ID')}
+                        {formatPpicNumber(r.requiredQty)}
                       </td>
                       <td className="py-2 px-3 text-right font-mono font-semibold text-slate-900">
-                        {r.receivedQty.toLocaleString('id-ID')}
+                        {formatPpicNumber(r.receivedQty)}
                       </td>
                       <td className="py-2 px-2.5 text-center text-slate-600 font-medium">
-                        {r.unit}
+                        {r.unit || '-'}
                       </td>
                       <td className="py-2 px-3 text-center whitespace-nowrap">
                         <span
@@ -1127,7 +1136,7 @@ export const UploadExcelView: React.FC = () => {
                               : 'bg-red-100 text-red-800 border border-red-300'
                           }`}
                         >
-                          {r.statusLabel} ({r.shortage >= 0 ? `+${r.shortage}` : r.shortage})
+                          {r.statusLabel} ({r.shortage >= 0 ? `+${formatPpicNumber(r.shortage)}` : formatPpicNumber(r.shortage)})
                         </span>
                       </td>
                     </tr>

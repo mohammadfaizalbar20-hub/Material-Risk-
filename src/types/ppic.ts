@@ -1,6 +1,8 @@
 export type MaterialCategory = 'Raw Material' | 'Packaging' | 'Chemical' | 'Auxiliary';
 
-export type MaterialUnit = 'Kg' | 'Pcs' | 'Roll' | 'Drum' | 'Box' | 'Liter' | 'Yard' | 'Meter';
+export type StandardMaterialUnit = 'Kg' | 'Pcs' | 'Roll' | 'Drum' | 'Box' | 'Liter' | 'Yard' | 'Meter';
+
+export type MaterialUnit = string;
 
 export type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL';
 

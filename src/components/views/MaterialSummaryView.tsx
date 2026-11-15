@@ -3,6 +3,7 @@ import { usePpic } from '../../context/PpicContext';
 import { MaterialItemRequirement, MaterialCategory, MaterialUnit } from '../../types/ppic';
 import * as XLSX from 'xlsx';
 import { fetchPaginatedRequirementsFromSupabase } from '../../lib/supabase';
+import { cleanFloatPrecision, formatPpicNumber } from '../../utils/excelMaterialParser';
 import {
   Boxes,
   Plus,
@@ -159,7 +160,7 @@ export const MaterialSummaryView: React.FC = () => {
   // READY jika Kekurangan >= 0, BELUM READY jika Kekurangan < 0
   const processedRequirements = useMemo(() => {
     return materialRequirements.map((req) => {
-      const shortage = req.receivedQty - req.requiredQty; // Kekurangan = Diterima - Kebutuhan
+      const shortage = cleanFloatPrecision(req.receivedQty - req.requiredQty); // Kekurangan = Diterima - Kebutuhan
       const isReady = shortage >= 0;
       return {
         ...req,
@@ -440,13 +441,13 @@ export const MaterialSummaryView: React.FC = () => {
       const shortB = recB - reqB;
       const readyB = shortB >= 0;
 
-      const diffReceived = recB - recA;
-      const diffShortage = shortB - shortA;
+      const diffReceived = cleanFloatPrecision(recB - recA);
+      const diffShortage = cleanFloatPrecision(shortB - shortA);
 
       return {
         materialCode: code,
         materialName: itemB?.materialName || itemA?.materialName || code,
-        unit: itemB?.unit || itemA?.unit || 'Kg',
+        unit: itemB?.unit ?? itemA?.unit ?? '',
         dateA,
         dateB,
         reqA,
@@ -1376,18 +1377,18 @@ export const MaterialSummaryView: React.FC = () => {
 
                           {/* 6. Kebutuhan */}
                           <td className="py-3 px-3.5 text-right font-mono font-semibold text-slate-900 whitespace-nowrap">
-                            {row.requiredQty.toLocaleString('id-ID')}
+                            {formatPpicNumber(row.requiredQty)}
                           </td>
 
                           {/* 7. Diterima */}
                           <td className="py-3 px-3.5 text-right font-mono font-semibold text-slate-900 whitespace-nowrap">
-                            {row.receivedQty.toLocaleString('id-ID')}
+                            {formatPpicNumber(row.receivedQty)}
                           </td>
 
                           {/* 8. Satuan */}
                           <td className="py-3 px-3 text-center font-mono font-medium text-slate-700 whitespace-nowrap">
                             <span className="px-2 py-0.5 bg-slate-100 rounded text-slate-700">
-                              {row.unit}
+                              {row.unit || '-'}
                             </span>
                           </td>
 
@@ -1400,7 +1401,7 @@ export const MaterialSummaryView: React.FC = () => {
                                   READY
                                 </span>
                                 <span className="text-[10px] font-mono text-emerald-700 mt-0.5">
-                                  +{row.shortage.toLocaleString('id-ID')} {row.unit}
+                                  +{formatPpicNumber(row.shortage)}{row.unit ? ` ${row.unit}` : ''}
                                 </span>
                               </div>
                             ) : (
@@ -1410,7 +1411,7 @@ export const MaterialSummaryView: React.FC = () => {
                                   BELUM READY
                                 </span>
                                 <span className="text-[10px] font-mono text-red-700 mt-0.5 font-bold">
-                                  {row.shortage.toLocaleString('id-ID')} {row.unit}
+                                  {formatPpicNumber(row.shortage)}{row.unit ? ` ${row.unit}` : ''}
                                 </span>
                               </div>
                             )}
@@ -1703,32 +1704,32 @@ export const MaterialSummaryView: React.FC = () => {
                   <tr key={row.materialCode} className="hover:bg-slate-50">
                     <td className="py-2.5 px-3 font-mono font-bold text-slate-900">{row.materialCode}</td>
                     <td className="py-2.5 px-3 font-medium text-slate-800">{row.materialName}</td>
-                    <td className="py-2.5 px-3 text-center font-mono text-slate-600">{row.unit}</td>
+                    <td className="py-2.5 px-3 text-center font-mono text-slate-600">{row.unit || '-'}</td>
 
                     <td className="py-2.5 px-3 text-right font-mono text-slate-700 bg-slate-50">
-                      {row.recA.toLocaleString('id-ID')}
+                      {formatPpicNumber(row.recA)}
                     </td>
 
                     <td className="py-2.5 px-3 text-right font-mono font-bold text-blue-700 bg-blue-50/50">
-                      {row.recB.toLocaleString('id-ID')}
+                      {formatPpicNumber(row.recB)}
                     </td>
 
                     <td className="py-2.5 px-3 text-right font-mono font-bold">
                       {row.diffReceived > 0 ? (
                         <span className="text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded">
-                          +{row.diffReceived.toLocaleString('id-ID')} {row.unit}
+                          +{formatPpicNumber(row.diffReceived)}{row.unit ? ` ${row.unit}` : ''}
                         </span>
                       ) : row.diffReceived === 0 ? (
                         <span className="text-slate-400">0</span>
                       ) : (
                         <span className="text-red-600">
-                          {row.diffReceived.toLocaleString('id-ID')} {row.unit}
+                          {formatPpicNumber(row.diffReceived)}{row.unit ? ` ${row.unit}` : ''}
                         </span>
                       )}
                     </td>
 
                     <td className="py-2.5 px-3 text-right font-mono text-slate-800">
-                      {row.reqB.toLocaleString('id-ID')}
+                      {formatPpicNumber(row.reqB)}
                     </td>
 
                     <td className="py-2.5 px-3 text-center">
@@ -1779,10 +1780,10 @@ export const MaterialSummaryView: React.FC = () => {
                   <tr key={mat.id} className="hover:bg-slate-50">
                     <td className="py-2.5 px-3.5 font-mono font-bold text-slate-900">{mat.code}</td>
                     <td className="py-2.5 px-3.5 font-medium text-slate-800">{mat.name}</td>
-                    <td className="py-2.5 px-3 text-center font-mono text-slate-600">{mat.unit}</td>
+                    <td className="py-2.5 px-3 text-center font-mono text-slate-600">{mat.unit || '-'}</td>
                     <td className="py-2.5 px-3.5 text-slate-600">{mat.category}</td>
                     <td className="py-2.5 px-3.5 text-right font-mono font-bold text-slate-900">
-                      {mat.totalStock.toLocaleString('id-ID')}
+                      {formatPpicNumber(mat.totalStock)}
                     </td>
                     <td className="py-2.5 px-3.5 text-slate-500">{mat.supplierName || '-'}</td>
                   </tr>
@@ -1871,20 +1872,28 @@ export const MaterialSummaryView: React.FC = () => {
                   <label className="block text-xs font-semibold text-slate-700 mb-1">
                     Satuan (UoM)
                   </label>
-                  <select
+                  <input
+                    type="text"
+                    list="ppic-unit-suggestions"
                     value={reqFormData.unit}
-                    onChange={(e) => setReqFormData({ ...reqFormData, unit: e.target.value as MaterialUnit })}
-                    className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded focus:ring-1 focus:ring-blue-500 focus:outline-none"
-                  >
-                    <option value="Yard">Yard</option>
-                    <option value="Meter">Meter</option>
-                    <option value="Kg">Kg</option>
-                    <option value="Pcs">Pcs</option>
-                    <option value="Roll">Roll</option>
-                    <option value="Drum">Drum</option>
-                    <option value="Box">Box</option>
-                    <option value="Liter">Liter</option>
-                  </select>
+                    onChange={(e) => setReqFormData({ ...reqFormData, unit: e.target.value })}
+                    placeholder="Contoh: Gros, Pcs, Yard, Kg"
+                    className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded font-mono focus:ring-1 focus:ring-blue-500 focus:outline-none"
+                  />
+                  <datalist id="ppic-unit-suggestions">
+                    <option value="Yard" />
+                    <option value="Meter" />
+                    <option value="Kg" />
+                    <option value="Pcs" />
+                    <option value="Roll" />
+                    <option value="Drum" />
+                    <option value="Box" />
+                    <option value="Liter" />
+                    <option value="Gros" />
+                    <option value="Dozen(s)" />
+                    <option value="CNS" />
+                    <option value="Set" />
+                  </datalist>
                 </div>
               </div>
 
@@ -1910,9 +1919,13 @@ export const MaterialSummaryView: React.FC = () => {
                   <input
                     type="number"
                     min="0"
+                    step="any"
                     required
                     value={reqFormData.requiredQty}
-                    onChange={(e) => setReqFormData({ ...reqFormData, requiredQty: parseFloat(e.target.value) || 0 })}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      setReqFormData({ ...reqFormData, requiredQty: Number.isFinite(v) ? v : 0 });
+                    }}
                     className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded font-mono focus:ring-1 focus:ring-blue-500 focus:outline-none"
                   />
                 </div>
@@ -1924,9 +1937,13 @@ export const MaterialSummaryView: React.FC = () => {
                   <input
                     type="number"
                     min="0"
+                    step="any"
                     required
                     value={reqFormData.receivedQty}
-                    onChange={(e) => setReqFormData({ ...reqFormData, receivedQty: parseFloat(e.target.value) || 0 })}
+                    onChange={(e) => {
+                      const v = parseFloat(e.target.value);
+                      setReqFormData({ ...reqFormData, receivedQty: Number.isFinite(v) ? v : 0 });
+                    }}
                     className="w-full px-3 py-1.5 text-xs border border-slate-300 rounded font-mono focus:ring-1 focus:ring-blue-500 focus:outline-none"
                   />
                 </div>
@@ -1934,10 +1951,15 @@ export const MaterialSummaryView: React.FC = () => {
 
               <div className="p-3 rounded bg-slate-50 border border-slate-200 text-xs flex items-center justify-between">
                 <span className="text-slate-600 font-medium">Perhitungan Kekurangan:</span>
-                <span className={`font-mono font-bold ${reqFormData.receivedQty - reqFormData.requiredQty < 0 ? 'text-red-600' : 'text-emerald-700'}`}>
-                  {reqFormData.receivedQty - reqFormData.requiredQty} {reqFormData.unit} (
-                  {reqFormData.receivedQty - reqFormData.requiredQty >= 0 ? 'READY' : 'BELUM READY'})
-                </span>
+                {(() => {
+                  const modalShortage = cleanFloatPrecision(reqFormData.receivedQty - reqFormData.requiredQty);
+                  return (
+                    <span className={`font-mono font-bold ${modalShortage < 0 ? 'text-red-600' : 'text-emerald-700'}`}>
+                      {formatPpicNumber(modalShortage)}{reqFormData.unit ? ` ${reqFormData.unit}` : ''} (
+                      {modalShortage >= 0 ? 'READY' : 'BELUM READY'})
+                    </span>
+                  );
+                })()}
               </div>
 
               <div className="pt-3 border-t border-slate-200 flex items-center justify-end gap-2">

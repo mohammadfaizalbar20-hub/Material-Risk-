@@ -16,8 +16,15 @@ import {
   buildAtomicSnapshotSyncPayload,
   executeAtomicSnapshotSync,
 } from '../utils/scheduleSnapshotSync';
+import { cleanFloatPrecision } from '../utils/excelMaterialParser';
 
 export { isValidUuid, generateUuid };
+
+function safeNumericField(val: unknown): number {
+  if (val === undefined || val === null || val === '') return 0;
+  const parsed = Number(val);
+  return Number.isFinite(parsed) ? cleanFloatPrecision(parsed) : 0;
+}
 
 // Keys for environment variables or manual configuration in Settings
 const STORAGE_SUPABASE_URL_KEY = 'ppic_supabase_url_custom';
@@ -305,10 +312,10 @@ export function mapDbRequirementToModel(row: any): MaterialItemRequirement {
     materialCode: row.material_code,
     materialName: row.material_name,
     category: row.category,
-    unit: row.unit,
-    requiredQty: Number(row.required_qty) || 0,
-    receivedQty: Number(row.received_qty) || 0,
-    unitPrice: Number(row.unit_price) || 0,
+    unit: row.unit !== undefined && row.unit !== null ? String(row.unit) : '',
+    requiredQty: safeNumericField(row.required_qty),
+    receivedQty: safeNumericField(row.received_qty),
+    unitPrice: safeNumericField(row.unit_price),
     supplierName: row.supplier_name || undefined,
     updateDate: row.update_date,
     importedAt: row.imported_at,
@@ -325,10 +332,10 @@ export function mapModelToDbRequirement(model: MaterialItemRequirement): any {
     material_code: model.materialCode,
     material_name: model.materialName,
     category: model.category,
-    unit: model.unit,
-    required_qty: model.requiredQty,
-    received_qty: model.receivedQty,
-    unit_price: model.unitPrice || 0,
+    unit: model.unit !== undefined && model.unit !== null ? String(model.unit) : '',
+    required_qty: safeNumericField(model.requiredQty),
+    received_qty: safeNumericField(model.receivedQty),
+    unit_price: safeNumericField(model.unitPrice),
     supplier_name: model.supplierName || null,
     update_date: safeDbDate(model.updateDate),
   };
@@ -437,15 +444,15 @@ export function mapDbMaterialToModel(row: any): Material {
     code: row.code,
     name: row.name,
     category: row.category,
-    unit: row.unit,
-    totalStock: Number(row.total_stock) || 0,
-    allocatedStock: Number(row.allocated_stock) || 0,
-    safetyStock: Number(row.safety_stock) || 0,
+    unit: row.unit !== undefined && row.unit !== null ? String(row.unit) : '',
+    totalStock: safeNumericField(row.total_stock),
+    allocatedStock: safeNumericField(row.allocated_stock),
+    safetyStock: safeNumericField(row.safety_stock),
     leadTimeDays: Number(row.lead_time_days) || 7,
     supplierName: row.supplier_name || '',
     defaultWarehouse: row.default_warehouse || 'Gudang Bahan Baku Utama',
-    unitPrice: Number(row.unit_price) || 0,
-    minOrderQty: Number(row.min_order_qty) || 0,
+    unitPrice: safeNumericField(row.unit_price),
+    minOrderQty: safeNumericField(row.min_order_qty),
   };
 }
 
@@ -455,15 +462,15 @@ export function mapModelToDbMaterial(model: Material): any {
     code: model.code,
     name: model.name,
     category: model.category,
-    unit: model.unit,
-    total_stock: model.totalStock,
-    allocated_stock: model.allocatedStock,
-    safety_stock: model.safetyStock,
+    unit: model.unit !== undefined && model.unit !== null ? String(model.unit) : '',
+    total_stock: safeNumericField(model.totalStock),
+    allocated_stock: safeNumericField(model.allocatedStock),
+    safety_stock: safeNumericField(model.safetyStock),
     lead_time_days: model.leadTimeDays,
     supplier_name: model.supplierName || null,
     default_warehouse: model.defaultWarehouse,
-    unit_price: model.unitPrice || 0,
-    min_order_qty: model.minOrderQty || 0,
+    unit_price: safeNumericField(model.unitPrice),
+    min_order_qty: safeNumericField(model.minOrderQty),
   };
 }
 
@@ -1229,31 +1236,31 @@ export async function fetchDashboardSummaryFromSupabase(params?: {
     if (data) {
       const parsed: DashboardSummaryData = {
         totalRows: Number(data.total_rows) || 0,
-        totalRequired: Number(data.total_required) || 0,
-        totalReceived: Number(data.total_received) || 0,
-        totalDeficit: Number(data.total_deficit) || 0,
+        totalRequired: safeNumericField(data.total_required),
+        totalReceived: safeNumericField(data.total_received),
+        totalDeficit: safeNumericField(data.total_deficit),
         readyRows: Number(data.ready_rows) || 0,
         notReadyRows: Number(data.not_ready_rows) || 0,
         fulfillmentRate: Number(data.fulfillment_rate) || 0,
         paretoItems: (data.pareto_items || []).map((p: any) => ({
           materialCode: p.material_code,
           materialName: p.material_name,
-          unit: p.unit,
-          totalRequired: Number(p.total_required) || 0,
-          totalReceived: Number(p.total_received) || 0,
-          totalDeficit: Number(p.total_deficit) || 0,
+          unit: p.unit !== undefined && p.unit !== null ? String(p.unit) : '',
+          totalRequired: safeNumericField(p.total_required),
+          totalReceived: safeNumericField(p.total_received),
+          totalDeficit: safeNumericField(p.total_deficit),
         })),
         topMaterials: (data.top_materials || []).map((t: any) => ({
           materialCode: t.material_code,
           materialName: t.material_name,
-          unit: t.unit,
-          required: Number(t.required) || 0,
-          received: Number(t.received) || 0,
+          unit: t.unit !== undefined && t.unit !== null ? String(t.unit) : '',
+          required: safeNumericField(t.required),
+          received: safeNumericField(t.received),
         })),
         categoryBreakdown: (data.category_breakdown || []).map((c: any) => ({
           category: c.category,
           count: Number(c.count) || 0,
-          totalQty: Number(c.total_qty) || 0,
+          totalQty: safeNumericField(c.total_qty),
         })),
       };
       return {
@@ -1378,10 +1385,10 @@ export async function fetchAllMaterialsComparisonFromSupabase(
               materialCode: String(it.material_code || ''),
               materialName: String(it.material_name || ''),
               category: String(it.category || 'General'),
-              unit: String(it.unit || 'Unit'),
-              totalRequired: Number(it.total_required) || 0,
-              totalReceived: Number(it.total_received) || 0,
-              balance: Number(it.balance) || 0,
+              unit: it.unit !== undefined && it.unit !== null ? String(it.unit) : '',
+              totalRequired: safeNumericField(it.total_required),
+              totalReceived: safeNumericField(it.total_received),
+              balance: safeNumericField(it.balance),
               fulfillmentPercent: Number(it.fulfillment_percent) || 0,
               isReady: Boolean(it.is_ready),
             }))
@@ -1448,11 +1455,11 @@ export async function fetchAllParetoMitigationFromSupabase(
               rank: Number(it.rank) || 0,
               materialCode: String(it.material_code || ''),
               materialName: String(it.material_name || ''),
-              unit: String(it.unit || 'Unit'),
-              totalRequired: Number(it.total_required) || 0,
-              totalReceived: Number(it.total_received) || 0,
-              shortageQty: Number(it.shortage_qty) || 0,
-              shortageValue: Number(it.shortage_value) || 0,
+              unit: it.unit !== undefined && it.unit !== null ? String(it.unit) : '',
+              totalRequired: safeNumericField(it.total_required),
+              totalReceived: safeNumericField(it.total_received),
+              shortageQty: safeNumericField(it.shortage_qty),
+              shortageValue: safeNumericField(it.shortage_value),
               contributionPercent: Number(it.contribution_percent) || 0,
               cumulativePercent: Number(it.cumulative_percent) || 0,
               mitigationPriority: String(it.mitigation_priority || 'SECONDARY'),

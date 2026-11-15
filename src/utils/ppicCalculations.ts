@@ -7,6 +7,7 @@ import {
   ParetoItem,
   ScheduleConflict,
 } from '../types/ppic';
+import { cleanFloatPrecision, formatPpicNumber } from './excelMaterialParser';
 
 /**
  * A. Rasio Kekurangan:
@@ -228,11 +229,11 @@ export function assessAllMaterialRisks(
 
       let recommendation = 'Kebutuhan material telah 100% terpenuhi. Siap produksi.';
       if (riskCategory === 'CRITICAL') {
-        recommendation = `CRITICAL (${riskScore}/100): Defisit ${shortage.toLocaleString()} ${req.unit} dengan waktu tersisa ${days} hari. Segera percepat pengiriman vendor atau lakukan rescheduling.`;
+        recommendation = `CRITICAL (${riskScore}/100): Defisit ${formatPpicNumber(shortage)} ${req.unit} dengan waktu tersisa ${days} hari. Segera percepat pengiriman vendor atau lakukan rescheduling.`;
       } else if (riskCategory === 'HIGH') {
-        recommendation = `HIGH RISK (${riskScore}/100): Defisit ${shortage.toLocaleString()} ${req.unit} (${Math.round(ratio)}%). Terbitkan PO Express atau koordinasi pengiriman parsial.`;
+        recommendation = `HIGH RISK (${riskScore}/100): Defisit ${formatPpicNumber(shortage)} ${req.unit} (${Math.round(ratio)}%). Terbitkan PO Express atau koordinasi pengiriman parsial.`;
       } else if (riskCategory === 'MEDIUM') {
-        recommendation = `MEDIUM RISK (${riskScore}/100): Terdapat kekurangan ${shortage.toLocaleString()} ${req.unit}. Jadwal produksi masih memiliki buffer waktu ${days} hari.`;
+        recommendation = `MEDIUM RISK (${riskScore}/100): Terdapat kekurangan ${formatPpicNumber(shortage)} ${req.unit}. Jadwal produksi masih memiliki buffer waktu ${days} hari.`;
       }
 
       materialAssessments.push({
@@ -336,7 +337,7 @@ export function calculateParetoAnalysis(
   >();
 
   for (const req of filtered) {
-    const shortage = Math.max(0, req.requiredQty - req.receivedQty);
+    const shortage = cleanFloatPrecision(Math.max(0, req.requiredQty - req.receivedQty));
     const value = shortage * (req.unitPrice || 1000);
 
     const existing = materialMap.get(req.materialCode) || {
@@ -347,7 +348,7 @@ export function calculateParetoAnalysis(
       shortageValue: 0,
     };
 
-    existing.shortageQty += shortage;
+    existing.shortageQty = cleanFloatPrecision(existing.shortageQty + shortage);
     existing.shortageValue += value;
     materialMap.set(req.materialCode, existing);
   }
@@ -372,7 +373,7 @@ export function calculateParetoAnalysis(
       materialCode: item.materialCode,
       materialName: item.materialName,
       unit: item.unit,
-      shortageQty: Math.round(item.shortageQty * 10) / 10,
+      shortageQty: cleanFloatPrecision(item.shortageQty),
       shortageValue: Math.round(item.shortageValue),
       contributionPercent: Math.round(contributionPercent * 10) / 10,
       cumulativePercent: Math.min(100, Math.round(cumulativePercent * 10) / 10),
@@ -409,10 +410,13 @@ export function calculateMaterialComparisonMetrics(
   const fulfillmentRatio =
     totalRequired > 0 ? Math.min(100, Math.round((totalReceived / totalRequired) * 100)) : 100;
 
+  const cleanTotalRequired = cleanFloatPrecision(totalRequired);
+  const cleanTotalReceived = cleanFloatPrecision(totalReceived);
+
   return {
-    totalRequired: Math.round(totalRequired),
-    totalReceived: Math.round(totalReceived),
-    shortageTotal: Math.max(0, Math.round(totalRequired - totalReceived)),
+    totalRequired: cleanTotalRequired,
+    totalReceived: cleanTotalReceived,
+    shortageTotal: Math.max(0, cleanFloatPrecision(cleanTotalRequired - cleanTotalReceived)),
     fulfillmentRatio,
     readyCount,
     notReadyCount,
