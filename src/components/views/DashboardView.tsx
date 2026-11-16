@@ -12,10 +12,13 @@ import {
   fetchAllMaterialsComparisonFromSupabase,
   fetchAllParetoMitigationFromSupabase,
   AllMaterialsComparisonData,
-  AllMaterialsComparisonItem,
   AllParetoMitigationData,
-  AllParetoMitigationItem,
 } from '../../lib/supabase';
+import {
+  buildAllMaterialsComparisonData,
+  buildAllParetoMitigationData,
+  filterRequirementsForDrilldown,
+} from '../../utils/dashboardDrilldown';
 import {
   CalendarClock,
   ShieldAlert,
@@ -34,6 +37,8 @@ import {
   RefreshCw,
   Layers,
   FileSpreadsheet,
+  ChevronLeft,
+  ChevronRight,
 } from 'lucide-react';
 
 // Helper to normalize any date/timestamp into Asia/Jakarta YYYY-MM-DD
@@ -58,6 +63,8 @@ export const DashboardView: React.FC = () => {
     registeredOrNumbers,
     getOrSummary,
     uploadHistory,
+    lastSyncTimestamp,
+    supabaseConnected,
   } = usePpic();
 
   // Manual Text Input Search for Nomor OR on Dashboard (NO dropdown!)
@@ -143,11 +150,27 @@ export const DashboardView: React.FC = () => {
   type DrilldownModalType = 'comparison' | 'pareto' | 'mitigation' | null;
   const [activeDrilldownModal, setActiveDrilldownModal] = useState<DrilldownModalType>(null);
   const [drilldownSearchTerm, setDrilldownSearchTerm] = useState<string>('');
+  const [drilldownPage, setDrilldownPage] = useState<number>(1);
+  const [drilldownPageSize, setDrilldownPageSize] = useState<number>(500); // 0 = Semua baris
 
-  // Composite cache key for active filters (OR/Style query and upload date)
+  // Map upload_id ke upload_history created_at sebagai sumber tanggal utama (Client-side JOIN)
+  const uploadDateByUploadId = useMemo(() => {
+    const map = new Map<string, string>();
+    for (const h of uploadHistory) {
+      if (h.id && h.createdAt) {
+        map.set(h.id, toJakartaDate(h.createdAt));
+      }
+    }
+    return map;
+  }, [uploadHistory]);
+
+  // Composite cache key for active filters (OR/Style query, upload date, and sync state)
   const activeDrilldownFilterKey = useMemo(() => {
-    return `${orSearchInput.trim().toUpperCase()}||${selectedUploadDate || ''}`;
-  }, [orSearchInput, selectedUploadDate]);
+    const dataVersion = supabaseConnected
+      ? String(lastSyncTimestamp ?? 0)
+      : `local-${materialRequirements.length}-${uploadHistory.length}`;
+    return `${orSearchInput.trim().toUpperCase()}||${selectedUploadDate || ''}||${dataVersion}`;
+  }, [orSearchInput, selectedUploadDate, supabaseConnected, lastSyncTimestamp, materialRequirements.length, uploadHistory.length]);
 
   // Comparison drilldown state & cache
   const [comparisonCache, setComparisonCache] = useState<{
@@ -169,11 +192,16 @@ export const DashboardView: React.FC = () => {
   const comparisonReqIdRef = useRef<number>(0);
   const paretoReqIdRef = useRef<number>(0);
 
-  // Invalidate stale caches immediately whenever filter changes
+  // Invalidate stale caches immediately whenever filter or synced data changes
   useEffect(() => {
     setComparisonCache((prev) => (prev && prev.filterKey === activeDrilldownFilterKey ? prev : null));
     setParetoMitigationCache((prev) => (prev && prev.filterKey === activeDrilldownFilterKey ? prev : null));
   }, [activeDrilldownFilterKey]);
+
+  // Reset modal pagination to Page 1 when modal, filter, search term, or page size changes
+  useEffect(() => {
+    setDrilldownPage(1);
+  }, [activeDrilldownModal, drilldownSearchTerm, activeDrilldownFilterKey, drilldownPageSize]);
 
   // Comparison fetcher with request identity protection
   const fetchComparisonDrilldown = useCallback(async (force: boolean = false) => {
@@ -200,10 +228,28 @@ export const DashboardView: React.FC = () => {
         data: res.data,
       });
       setComparisonError(null);
+    } else if (res.isOffline) {
+      const localFiltered = filterRequirementsForDrilldown(materialRequirements, {
+        orQuery: orSearchInput.trim() || undefined,
+        uploadDate: selectedUploadDate || null,
+        uploadDateByUploadId,
+      });
+      setComparisonCache({
+        filterKey: activeDrilldownFilterKey,
+        data: buildAllMaterialsComparisonData(localFiltered, 1),
+      });
+      setComparisonError(null);
     } else {
       setComparisonError(res.error || 'Gagal memuat seluruh komparasi material dari database.');
     }
-  }, [activeDrilldownFilterKey, comparisonCache, orSearchInput, selectedUploadDate]);
+  }, [
+    activeDrilldownFilterKey,
+    comparisonCache,
+    orSearchInput,
+    selectedUploadDate,
+    materialRequirements,
+    uploadDateByUploadId,
+  ]);
 
   // Pareto & Mitigation shared fetcher with request identity protection
   const fetchParetoMitigationDrilldown = useCallback(async (force: boolean = false) => {
@@ -230,10 +276,28 @@ export const DashboardView: React.FC = () => {
         data: res.data,
       });
       setParetoError(null);
+    } else if (res.isOffline) {
+      const localFiltered = filterRequirementsForDrilldown(materialRequirements, {
+        orQuery: orSearchInput.trim() || undefined,
+        uploadDate: selectedUploadDate || null,
+        uploadDateByUploadId,
+      });
+      setParetoMitigationCache({
+        filterKey: activeDrilldownFilterKey,
+        data: buildAllParetoMitigationData(localFiltered, 1),
+      });
+      setParetoError(null);
     } else {
       setParetoError(res.error || 'Gagal memuat seluruh data Pareto dan Mitigasi dari database.');
     }
-  }, [activeDrilldownFilterKey, paretoMitigationCache, orSearchInput, selectedUploadDate]);
+  }, [
+    activeDrilldownFilterKey,
+    paretoMitigationCache,
+    orSearchInput,
+    selectedUploadDate,
+    materialRequirements,
+    uploadDateByUploadId,
+  ]);
 
   // Trigger lazy loading when a modal opens or when filters change while modal is open
   useEffect(() => {
@@ -279,7 +343,11 @@ export const DashboardView: React.FC = () => {
     const q = drilldownSearchTerm.trim().toLowerCase();
     if (!q) return comparisonCache.data.items;
     return comparisonCache.data.items.filter(
-      (it) => it.materialCode.toLowerCase().includes(q) || it.materialName.toLowerCase().includes(q)
+      (it) =>
+        it.materialCode.toLowerCase().includes(q) ||
+        it.materialName.toLowerCase().includes(q) ||
+        (it.orNumber || '').toLowerCase().includes(q) ||
+        (it.style || '').toLowerCase().includes(q)
     );
   }, [comparisonCache, activeDrilldownFilterKey, drilldownSearchTerm]);
 
@@ -288,7 +356,11 @@ export const DashboardView: React.FC = () => {
     const q = drilldownSearchTerm.trim().toLowerCase();
     if (!q) return paretoMitigationCache.data.items;
     return paretoMitigationCache.data.items.filter(
-      (it) => it.materialCode.toLowerCase().includes(q) || it.materialName.toLowerCase().includes(q)
+      (it) =>
+        it.materialCode.toLowerCase().includes(q) ||
+        it.materialName.toLowerCase().includes(q) ||
+        (it.orNumber || '').toLowerCase().includes(q) ||
+        (it.style || '').toLowerCase().includes(q)
     );
   }, [paretoMitigationCache, activeDrilldownFilterKey, drilldownSearchTerm]);
 
@@ -297,20 +369,44 @@ export const DashboardView: React.FC = () => {
     const q = drilldownSearchTerm.trim().toLowerCase();
     if (!q) return paretoMitigationCache.data.items;
     return paretoMitigationCache.data.items.filter(
-      (it) => it.materialCode.toLowerCase().includes(q) || it.materialName.toLowerCase().includes(q)
+      (it) =>
+        it.materialCode.toLowerCase().includes(q) ||
+        it.materialName.toLowerCase().includes(q) ||
+        (it.orNumber || '').toLowerCase().includes(q) ||
+        (it.style || '').toLowerCase().includes(q)
     );
   }, [paretoMitigationCache, activeDrilldownFilterKey, drilldownSearchTerm]);
 
-  // Map upload_id ke upload_history created_at sebagai sumber tanggal utama (Client-side JOIN)
-  const uploadDateByUploadId = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const h of uploadHistory) {
-      if (h.id && h.createdAt) {
-        map.set(h.id, toJakartaDate(h.createdAt));
-      }
-    }
-    return map;
-  }, [uploadHistory]);
+  // Paginated slices for modal tables (pageSize === 0 renders all items)
+  const activeModalTotalItems = useMemo(() => {
+    if (activeDrilldownModal === 'comparison') return filteredComparisonItems.length;
+    if (activeDrilldownModal === 'pareto') return filteredParetoItems.length;
+    if (activeDrilldownModal === 'mitigation') return filteredMitigationItems.length;
+    return 0;
+  }, [activeDrilldownModal, filteredComparisonItems.length, filteredParetoItems.length, filteredMitigationItems.length]);
+
+  const drilldownTotalPages = useMemo(() => {
+    if (drilldownPageSize <= 0 || activeModalTotalItems === 0) return 1;
+    return Math.max(1, Math.ceil(activeModalTotalItems / drilldownPageSize));
+  }, [drilldownPageSize, activeModalTotalItems]);
+
+  const safeDrilldownPage = Math.min(drilldownPage, drilldownTotalPages);
+  const drilldownStartIndex = drilldownPageSize <= 0 ? 0 : (safeDrilldownPage - 1) * drilldownPageSize;
+
+  const paginatedComparisonItems = useMemo(() => {
+    if (drilldownPageSize <= 0) return filteredComparisonItems;
+    return filteredComparisonItems.slice(drilldownStartIndex, drilldownStartIndex + drilldownPageSize);
+  }, [filteredComparisonItems, drilldownPageSize, drilldownStartIndex]);
+
+  const paginatedParetoItems = useMemo(() => {
+    if (drilldownPageSize <= 0) return filteredParetoItems;
+    return filteredParetoItems.slice(drilldownStartIndex, drilldownStartIndex + drilldownPageSize);
+  }, [filteredParetoItems, drilldownPageSize, drilldownStartIndex]);
+
+  const paginatedMitigationItems = useMemo(() => {
+    if (drilldownPageSize <= 0) return filteredMitigationItems;
+    return filteredMitigationItems.slice(drilldownStartIndex, drilldownStartIndex + drilldownPageSize);
+  }, [filteredMitigationItems, drilldownPageSize, drilldownStartIndex]);
 
   // ORs uploaded on the selected upload date
   const matchingOrsOnDate = useMemo(() => {
@@ -1125,17 +1221,17 @@ export const DashboardView: React.FC = () => {
             {/* Header Modal */}
             <div className="p-4 sm:p-5 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-50/70">
               <div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <BarChart3 className="w-5 h-5 text-blue-600" />
                   <h2 className="text-base sm:text-lg font-bold text-slate-900">
                     Seluruh Perbandingan Material
                   </h2>
                   <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-blue-100 text-blue-800">
-                    {comparisonCache?.data.totalUniqueMaterials ?? 0} Material Unik
+                    {comparisonCache?.data.totalRows ?? comparisonCache?.data.items.length ?? 0} Baris Material
                   </span>
                 </div>
                 <p className="text-xs text-slate-500 mt-1">
-                  Menampilkan komparasi lengkap Kebutuhan vs Diterima untuk seluruh material unik berdasarkan filter aktif
+                  Menampilkan seluruh baris material Kebutuhan vs Diterima tanpa penggabungan atau pembatasan jumlah baris
                 </p>
               </div>
 
@@ -1177,7 +1273,7 @@ export const DashboardView: React.FC = () => {
                   type="text"
                   value={drilldownSearchTerm}
                   onChange={(e) => setDrilldownSearchTerm(e.target.value)}
-                  placeholder="Cari kode atau nama material..."
+                  placeholder="Cari kode, nama material, atau No. OR..."
                   className="w-full pl-9 pr-8 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
                 />
                 {drilldownSearchTerm && (
@@ -1197,10 +1293,10 @@ export const DashboardView: React.FC = () => {
                 <div className="py-24 text-center">
                   <RefreshCw className="w-8 h-8 text-blue-600 animate-spin mx-auto mb-3" />
                   <p className="text-sm font-semibold text-slate-700">
-                    Memuat seluruh komparasi material dari server Supabase...
+                    Memuat seluruh baris komparasi material...
                   </p>
                   <p className="text-xs text-slate-400 mt-1">
-                    Sedang mengagregasi data langsung di database PostgreSQL
+                    Mengambil seluruh halaman data secara bertahap tanpa pembatasan baris
                   </p>
                 </div>
               )}
@@ -1221,16 +1317,36 @@ export const DashboardView: React.FC = () => {
 
               {!isComparisonLoading && !comparisonError && comparisonCache && (
                 <>
-                  <div className="mb-2 flex items-center justify-between text-xs text-slate-500">
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
                     <span>
-                      Menampilkan <strong className="text-slate-800 font-mono">{filteredComparisonItems.length}</strong> dari{' '}
-                      <strong className="text-slate-800 font-mono">{comparisonCache.data.items.length}</strong> material
+                      Menampilkan <strong className="text-slate-800 font-mono">{paginatedComparisonItems.length}</strong> dari{' '}
+                      <strong className="text-slate-800 font-mono">{filteredComparisonItems.length}</strong> baris material
+                      {drilldownSearchTerm.trim() && (
+                        <> (total {comparisonCache.data.items.length} baris)</>
+                      )}
                     </span>
-                    {drilldownSearchTerm && (
-                      <span className="text-blue-600">
-                        Disaring dengan kata kunci: &quot;{drilldownSearchTerm}&quot;
-                      </span>
-                    )}
+                    <div className="flex items-center gap-2">
+                      {drilldownSearchTerm && (
+                        <span className="text-blue-600">
+                          Disaring dengan kata kunci: &quot;{drilldownSearchTerm}&quot;
+                        </span>
+                      )}
+                      {filteredComparisonItems.length > 100 && (
+                        <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-600">
+                          <span>Tampil/halaman:</span>
+                          <select
+                            value={drilldownPageSize}
+                            onChange={(e) => setDrilldownPageSize(Number(e.target.value))}
+                            className="px-1.5 py-0.5 border border-slate-300 rounded bg-white text-slate-800 font-mono"
+                          >
+                            <option value={100}>100</option>
+                            <option value={250}>250</option>
+                            <option value={500}>500</option>
+                            <option value={0}>Semua</option>
+                          </select>
+                        </label>
+                      )}
+                    </div>
                   </div>
 
                   {filteredComparisonItems.length === 0 ? (
@@ -1246,6 +1362,7 @@ export const DashboardView: React.FC = () => {
                           <thead className="sticky top-0 bg-slate-100 z-10 border-b border-slate-200 shadow-2xs">
                             <tr className="text-slate-700 font-semibold">
                               <th className="py-2.5 px-3 text-center w-12">No.</th>
+                              <th className="py-2.5 px-3">No. OR / Style</th>
                               <th className="py-2.5 px-3">Kode Material</th>
                               <th className="py-2.5 px-3">Nama Material</th>
                               <th className="py-2.5 px-3">Kategori</th>
@@ -1257,12 +1374,24 @@ export const DashboardView: React.FC = () => {
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-slate-100">
-                            {filteredComparisonItems.map((item, idx) => {
+                            {paginatedComparisonItems.map((item, idx) => {
                               const isFulfilled = item.isReady;
+                              const rowNumber = drilldownStartIndex + idx + 1;
                               return (
-                                <tr key={item.materialCode} className="hover:bg-slate-50/80 transition-colors">
+                                <tr
+                                  key={item.id || `${item.materialCode}-${rowNumber}`}
+                                  className="hover:bg-slate-50/80 transition-colors"
+                                >
                                   <td className="py-2.5 px-3 text-center font-mono text-slate-400">
-                                    {idx + 1}
+                                    {rowNumber}
+                                  </td>
+                                  <td className="py-2.5 px-3">
+                                    <div className="font-mono font-semibold text-slate-800">{item.orNumber || '-'}</div>
+                                    {item.style && (
+                                      <div className="text-[10px] text-slate-500 truncate max-w-[140px]" title={item.style}>
+                                        {item.style}
+                                      </div>
+                                    )}
                                   </td>
                                   <td className="py-2.5 px-3 font-mono font-bold text-slate-900">
                                     {item.materialCode}
@@ -1326,13 +1455,38 @@ export const DashboardView: React.FC = () => {
                       </div>
                     </div>
                   )}
+
+                  {drilldownPageSize > 0 && drilldownTotalPages > 1 && (
+                    <div className="mt-3 flex items-center justify-between text-xs text-slate-600">
+                      <span>
+                        Halaman <strong className="font-mono">{safeDrilldownPage}</strong> dari{' '}
+                        <strong className="font-mono">{drilldownTotalPages}</strong>
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => setDrilldownPage((p) => Math.max(1, p - 1))}
+                          disabled={safeDrilldownPage <= 1}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 border border-slate-300 rounded bg-white hover:bg-slate-50 disabled:opacity-40 cursor-pointer"
+                        >
+                          <ChevronLeft className="w-3.5 h-3.5" /> Sebelumnya
+                        </button>
+                        <button
+                          onClick={() => setDrilldownPage((p) => Math.min(drilldownTotalPages, p + 1))}
+                          disabled={safeDrilldownPage >= drilldownTotalPages}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 border border-slate-300 rounded bg-white hover:bg-slate-50 disabled:opacity-40 cursor-pointer"
+                        >
+                          Berikutnya <ChevronRight className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </>
               )}
             </div>
 
             {/* Footer Modal */}
             <div className="p-3 border-t border-slate-200 bg-white flex items-center justify-between text-xs text-slate-500">
-              <span>Menampilkan seluruh material tanpa pembatasan Top 6.</span>
+              <span>Menampilkan seluruh baris material yang memenuhi filter tanpa pembatasan Top 6 atau penggabungan.</span>
               <button
                 onClick={() => setActiveDrilldownModal(null)}
                 className="px-4 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-md transition-colors cursor-pointer"
@@ -1359,17 +1513,17 @@ export const DashboardView: React.FC = () => {
             {/* Header Modal */}
             <div className="p-4 sm:p-5 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-50/70">
               <div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <BarChart3 className="w-5 h-5 text-blue-600" />
                   <h2 className="text-base sm:text-lg font-bold text-slate-900">
                     Seluruh Analisis Pareto Material
                   </h2>
                   <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-red-100 text-red-800">
-                    {paretoMitigationCache?.data.totalDeficitMaterials ?? 0} Material Defisit
+                    {paretoMitigationCache?.data.totalDeficitRows ?? paretoMitigationCache?.data.totalDeficitMaterials ?? 0} Baris Defisit
                   </span>
                 </div>
                 <p className="text-xs text-slate-500 mt-1">
-                  Seluruh material dengan kuantitas defisit positif diurutkan dari defisit terbesar (80/20 Rule)
+                  Seluruh baris material dengan kuantitas defisit positif diurutkan dari defisit terbesar (80/20 Rule)
                 </p>
               </div>
 
@@ -1395,10 +1549,10 @@ export const DashboardView: React.FC = () => {
             {/* Summary Cards */}
             <div className="p-4 border-b border-slate-200 bg-white grid grid-cols-1 sm:grid-cols-3 gap-3">
               <div className="p-3 bg-red-50/70 border border-red-100 rounded-lg">
-                <span className="text-[11px] font-semibold text-red-700">Total Material Defisit</span>
+                <span className="text-[11px] font-semibold text-red-700">Total Baris Material Defisit</span>
                 <p className="text-lg font-extrabold text-red-900 font-mono mt-0.5">
-                  {paretoMitigationCache?.data.totalDeficitMaterials ?? 0}{' '}
-                  <span className="text-xs font-normal text-red-600">Item</span>
+                  {paretoMitigationCache?.data.totalDeficitRows ?? paretoMitigationCache?.data.totalDeficitMaterials ?? 0}{' '}
+                  <span className="text-xs font-normal text-red-600">Baris</span>
                 </p>
               </div>
               <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg">
@@ -1437,7 +1591,7 @@ export const DashboardView: React.FC = () => {
                   type="text"
                   value={drilldownSearchTerm}
                   onChange={(e) => setDrilldownSearchTerm(e.target.value)}
-                  placeholder="Cari kode atau nama material defisit..."
+                  placeholder="Cari kode, nama material, atau No. OR..."
                   className="w-full pl-9 pr-8 py-1.5 text-xs bg-white border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
                 />
                 {drilldownSearchTerm && (
@@ -1457,10 +1611,10 @@ export const DashboardView: React.FC = () => {
                 <div className="py-24 text-center">
                   <RefreshCw className="w-8 h-8 text-blue-600 animate-spin mx-auto mb-3" />
                   <p className="text-sm font-semibold text-slate-700">
-                    Memuat seluruh analisis Pareto material dari server Supabase...
+                    Memuat seluruh analisis Pareto material...
                   </p>
                   <p className="text-xs text-slate-400 mt-1">
-                    Sedang menghitung ranking defisit dan kurva kumulatif di PostgreSQL
+                    Mengambil seluruh halaman data dan menghitung ranking defisit tanpa pembatasan baris
                   </p>
                 </div>
               )}
@@ -1481,16 +1635,36 @@ export const DashboardView: React.FC = () => {
 
               {!isParetoLoading && !paretoError && paretoMitigationCache && (
                 <>
-                  <div className="mb-2 flex items-center justify-between text-xs text-slate-500">
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
                     <span>
-                      Menampilkan <strong className="text-slate-800 font-mono">{filteredParetoItems.length}</strong> dari{' '}
-                      <strong className="text-slate-800 font-mono">{paretoMitigationCache.data.items.length}</strong> material defisit
+                      Menampilkan <strong className="text-slate-800 font-mono">{paginatedParetoItems.length}</strong> dari{' '}
+                      <strong className="text-slate-800 font-mono">{filteredParetoItems.length}</strong> baris defisit
+                      {drilldownSearchTerm.trim() && (
+                        <> (total {paretoMitigationCache.data.items.length} baris)</>
+                      )}
                     </span>
-                    {drilldownSearchTerm && (
-                      <span className="text-blue-600">
-                        Disaring dengan kata kunci: &quot;{drilldownSearchTerm}&quot;
-                      </span>
-                    )}
+                    <div className="flex items-center gap-2">
+                      {drilldownSearchTerm && (
+                        <span className="text-blue-600">
+                          Disaring dengan kata kunci: &quot;{drilldownSearchTerm}&quot;
+                        </span>
+                      )}
+                      {filteredParetoItems.length > 100 && (
+                        <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-600">
+                          <span>Tampil/halaman:</span>
+                          <select
+                            value={drilldownPageSize}
+                            onChange={(e) => setDrilldownPageSize(Number(e.target.value))}
+                            className="px-1.5 py-0.5 border border-slate-300 rounded bg-white text-slate-800 font-mono"
+                          >
+                            <option value={100}>100</option>
+                            <option value={250}>250</option>
+                            <option value={500}>500</option>
+                            <option value={0}>Semua</option>
+                          </select>
+                        </label>
+                      )}
+                    </div>
                   </div>
 
                   {filteredParetoItems.length === 0 ? (
@@ -1506,6 +1680,7 @@ export const DashboardView: React.FC = () => {
                           <thead className="sticky top-0 bg-slate-100 z-10 border-b border-slate-200 shadow-2xs">
                             <tr className="text-slate-700 font-semibold">
                               <th className="py-2.5 px-3 text-center w-16">Peringkat</th>
+                              <th className="py-2.5 px-3">No. OR / Style</th>
                               <th className="py-2.5 px-3">Kode Material</th>
                               <th className="py-2.5 px-3">Nama Material</th>
                               <th className="py-2.5 px-3 text-center">Satuan</th>
@@ -1516,10 +1691,21 @@ export const DashboardView: React.FC = () => {
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-slate-100">
-                            {filteredParetoItems.map((item) => (
-                              <tr key={item.materialCode} className="hover:bg-slate-50/80 transition-colors">
+                            {paginatedParetoItems.map((item, idx) => (
+                              <tr
+                                key={item.id || `${item.materialCode}-${item.rank}-${idx}`}
+                                className="hover:bg-slate-50/80 transition-colors"
+                              >
                                 <td className="py-2.5 px-3 text-center font-mono font-bold text-slate-400">
                                   #{item.rank}
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  <div className="font-mono font-semibold text-slate-800">{item.orNumber || '-'}</div>
+                                  {item.style && (
+                                    <div className="text-[10px] text-slate-500 truncate max-w-[140px]" title={item.style}>
+                                      {item.style}
+                                    </div>
+                                  )}
                                 </td>
                                 <td className="py-2.5 px-3 font-mono font-bold text-slate-900">
                                   {item.materialCode}
@@ -1569,13 +1755,38 @@ export const DashboardView: React.FC = () => {
                       </div>
                     </div>
                   )}
+
+                  {drilldownPageSize > 0 && drilldownTotalPages > 1 && (
+                    <div className="mt-3 flex items-center justify-between text-xs text-slate-600">
+                      <span>
+                        Halaman <strong className="font-mono">{safeDrilldownPage}</strong> dari{' '}
+                        <strong className="font-mono">{drilldownTotalPages}</strong>
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => setDrilldownPage((p) => Math.max(1, p - 1))}
+                          disabled={safeDrilldownPage <= 1}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 border border-slate-300 rounded bg-white hover:bg-slate-50 disabled:opacity-40 cursor-pointer"
+                        >
+                          <ChevronLeft className="w-3.5 h-3.5" /> Sebelumnya
+                        </button>
+                        <button
+                          onClick={() => setDrilldownPage((p) => Math.min(drilldownTotalPages, p + 1))}
+                          disabled={safeDrilldownPage >= drilldownTotalPages}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 border border-slate-300 rounded bg-white hover:bg-slate-50 disabled:opacity-40 cursor-pointer"
+                        >
+                          Berikutnya <ChevronRight className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </>
               )}
             </div>
 
             {/* Footer Modal */}
             <div className="p-3 border-t border-slate-200 bg-white flex items-center justify-between text-xs text-slate-500">
-              <span>Menampilkan seluruh material defisit positif tanpa batasan Top 10.</span>
+              <span>Menampilkan seluruh baris material defisit positif tanpa batasan Top 10 atau penggabungan.</span>
               <button
                 onClick={() => setActiveDrilldownModal(null)}
                 className="px-4 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-md transition-colors cursor-pointer"
@@ -1602,17 +1813,17 @@ export const DashboardView: React.FC = () => {
             {/* Header Modal */}
             <div className="p-4 sm:p-5 border-b border-slate-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-slate-50/70">
               <div>
-                <div className="flex items-center gap-2">
+                <div className="flex flex-wrap items-center gap-2">
                   <ShieldAlert className="w-5 h-5 text-red-600" />
                   <h2 className="text-base sm:text-lg font-bold text-slate-900">
                     Seluruh Daftar Mitigation Priority
                   </h2>
                   <span className="px-2 py-0.5 rounded-full text-xs font-bold bg-amber-100 text-amber-800">
-                    {paretoMitigationCache?.data.totalDeficitMaterials ?? 0} Item Memerlukan Mitigasi
+                    {paretoMitigationCache?.data.totalDeficitRows ?? paretoMitigationCache?.data.totalDeficitMaterials ?? 0} Baris Memerlukan Mitigasi
                   </span>
                 </div>
                 <p className="text-xs text-slate-500 mt-1">
-                  Seluruh material prioritas mitigasi dikelompokkan berdasarkan aturan 80/20 (Vital Few vs Secondary)
+                  Seluruh baris material prioritas mitigasi dikelompokkan berdasarkan aturan 80/20 (Vital Few vs Secondary)
                 </p>
               </div>
 
@@ -1654,7 +1865,7 @@ export const DashboardView: React.FC = () => {
                   type="text"
                   value={drilldownSearchTerm}
                   onChange={(e) => setDrilldownSearchTerm(e.target.value)}
-                  placeholder="Cari kode atau nama material mitigasi..."
+                  placeholder="Cari kode, nama material, atau No. OR..."
                   className="w-full pl-9 pr-8 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded-lg focus:outline-hidden focus:ring-2 focus:ring-blue-500/20 focus:border-blue-500"
                 />
                 {drilldownSearchTerm && (
@@ -1674,10 +1885,10 @@ export const DashboardView: React.FC = () => {
                 <div className="py-24 text-center">
                   <RefreshCw className="w-8 h-8 text-blue-600 animate-spin mx-auto mb-3" />
                   <p className="text-sm font-semibold text-slate-700">
-                    Memuat seluruh data prioritas mitigasi dari server Supabase...
+                    Memuat seluruh data prioritas mitigasi...
                   </p>
                   <p className="text-xs text-slate-400 mt-1">
-                    Sedang mengagregasi prioritas penanganan mitigasi di database PostgreSQL
+                    Mengambil seluruh halaman data dan mengurutkan prioritas penanganan mitigasi
                   </p>
                 </div>
               )}
@@ -1698,16 +1909,36 @@ export const DashboardView: React.FC = () => {
 
               {!isParetoLoading && !paretoError && paretoMitigationCache && (
                 <>
-                  <div className="mb-2 flex items-center justify-between text-xs text-slate-500">
+                  <div className="mb-2 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
                     <span>
-                      Menampilkan <strong className="text-slate-800 font-mono">{filteredMitigationItems.length}</strong> dari{' '}
-                      <strong className="text-slate-800 font-mono">{paretoMitigationCache.data.items.length}</strong> material prioritas mitigasi
+                      Menampilkan <strong className="text-slate-800 font-mono">{paginatedMitigationItems.length}</strong> dari{' '}
+                      <strong className="text-slate-800 font-mono">{filteredMitigationItems.length}</strong> baris prioritas mitigasi
+                      {drilldownSearchTerm.trim() && (
+                        <> (total {paretoMitigationCache.data.items.length} baris)</>
+                      )}
                     </span>
-                    {drilldownSearchTerm && (
-                      <span className="text-blue-600">
-                        Disaring dengan kata kunci: &quot;{drilldownSearchTerm}&quot;
-                      </span>
-                    )}
+                    <div className="flex items-center gap-2">
+                      {drilldownSearchTerm && (
+                        <span className="text-blue-600">
+                          Disaring dengan kata kunci: &quot;{drilldownSearchTerm}&quot;
+                        </span>
+                      )}
+                      {filteredMitigationItems.length > 100 && (
+                        <label className="inline-flex items-center gap-1.5 text-[11px] text-slate-600">
+                          <span>Tampil/halaman:</span>
+                          <select
+                            value={drilldownPageSize}
+                            onChange={(e) => setDrilldownPageSize(Number(e.target.value))}
+                            className="px-1.5 py-0.5 border border-slate-300 rounded bg-white text-slate-800 font-mono"
+                          >
+                            <option value={100}>100</option>
+                            <option value={250}>250</option>
+                            <option value={500}>500</option>
+                            <option value={0}>Semua</option>
+                          </select>
+                        </label>
+                      )}
+                    </div>
                   </div>
 
                   {filteredMitigationItems.length === 0 ? (
@@ -1723,6 +1954,7 @@ export const DashboardView: React.FC = () => {
                           <thead className="sticky top-0 bg-slate-100 z-10 border-b border-slate-200 shadow-2xs">
                             <tr className="text-slate-700 font-semibold">
                               <th className="py-2.5 px-3 text-center w-16">Peringkat</th>
+                              <th className="py-2.5 px-3">No. OR / Style</th>
                               <th className="py-2.5 px-3">Kode Material</th>
                               <th className="py-2.5 px-3">Nama Material</th>
                               <th className="py-2.5 px-3 text-center">Satuan</th>
@@ -1733,10 +1965,21 @@ export const DashboardView: React.FC = () => {
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-slate-100">
-                            {filteredMitigationItems.map((item) => (
-                              <tr key={item.materialCode} className="hover:bg-slate-50/80 transition-colors">
+                            {paginatedMitigationItems.map((item, idx) => (
+                              <tr
+                                key={item.id || `${item.materialCode}-${item.rank}-${idx}`}
+                                className="hover:bg-slate-50/80 transition-colors"
+                              >
                                 <td className="py-2.5 px-3 text-center font-mono font-bold text-slate-400">
                                   #{item.rank}
+                                </td>
+                                <td className="py-2.5 px-3">
+                                  <div className="font-mono font-semibold text-slate-800">{item.orNumber || '-'}</div>
+                                  {item.style && (
+                                    <div className="text-[10px] text-slate-500 truncate max-w-[140px]" title={item.style}>
+                                      {item.style}
+                                    </div>
+                                  )}
                                 </td>
                                 <td className="py-2.5 px-3 font-mono font-bold text-slate-900">
                                   {item.materialCode}
@@ -1774,13 +2017,38 @@ export const DashboardView: React.FC = () => {
                       </div>
                     </div>
                   )}
+
+                  {drilldownPageSize > 0 && drilldownTotalPages > 1 && (
+                    <div className="mt-3 flex items-center justify-between text-xs text-slate-600">
+                      <span>
+                        Halaman <strong className="font-mono">{safeDrilldownPage}</strong> dari{' '}
+                        <strong className="font-mono">{drilldownTotalPages}</strong>
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={() => setDrilldownPage((p) => Math.max(1, p - 1))}
+                          disabled={safeDrilldownPage <= 1}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 border border-slate-300 rounded bg-white hover:bg-slate-50 disabled:opacity-40 cursor-pointer"
+                        >
+                          <ChevronLeft className="w-3.5 h-3.5" /> Sebelumnya
+                        </button>
+                        <button
+                          onClick={() => setDrilldownPage((p) => Math.min(drilldownTotalPages, p + 1))}
+                          disabled={safeDrilldownPage >= drilldownTotalPages}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 border border-slate-300 rounded bg-white hover:bg-slate-50 disabled:opacity-40 cursor-pointer"
+                        >
+                          Berikutnya <ChevronRight className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </>
               )}
             </div>
 
             {/* Footer Modal */}
             <div className="p-3 border-t border-slate-200 bg-white flex items-center justify-between text-xs text-slate-500">
-              <span>Menampilkan seluruh material prioritas mitigasi tanpa batasan Top 10.</span>
+              <span>Menampilkan seluruh baris material prioritas mitigasi tanpa batasan Top 10 atau penggabungan.</span>
               <button
                 onClick={() => setActiveDrilldownModal(null)}
                 className="px-4 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 font-semibold rounded-md transition-colors cursor-pointer"
