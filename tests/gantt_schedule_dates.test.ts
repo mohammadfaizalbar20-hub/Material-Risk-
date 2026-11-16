@@ -6,7 +6,9 @@ import {
   doDateRangesOverlap,
   doesScheduleOverlapMonth,
   getDaysInCalendarMonth,
+  getGanttRowHeightPx,
   isFinishBeforeStart,
+  layoutGanttLineSchedules,
   parseCalendarDateParts,
 } from '../src/utils/ganttScheduleUtils';
 import { getIndonesianHolidayInfo } from '../src/utils/indonesianHolidays';
@@ -263,3 +265,197 @@ test('February leap/non-leap months and Indonesian holiday markers remain intact
   assert.equal(dec24.isHoliday, true);
   assert.equal(dec24.type, 'CUTI_BERSAMA');
 });
+
+function makeSchedule(
+  id: string,
+  orNumber: string,
+  productionDate: string,
+  finishDate: string
+): ProductionSchedule {
+  return {
+    id,
+    orNumber,
+    style: `Style ${orNumber}`,
+    productionLine: 'Line 1',
+    productionDate,
+    finishDate,
+    target: 1000,
+    status: 'Terjadwal',
+  };
+}
+
+test('Lane Case 1: Three sequential non-overlapping schedules share a single lane (1 lane)', () => {
+  const schedules = [
+    makeSchedule('3', 'OR-C', '2026-12-21', '2026-12-30'),
+    makeSchedule('1', 'OR-A', '2026-12-01', '2026-12-10'),
+    makeSchedule('2', 'OR-B', '2026-12-11', '2026-12-20'),
+  ];
+
+  const layout = layoutGanttLineSchedules(schedules, { year: 2026, month0: 11, daysInMonth: 31 });
+  assert.equal(layout.laneCount, 1);
+  assert.equal(layout.rowHeightPx, getGanttRowHeightPx(1));
+  assert.deepEqual(
+    layout.items.map((item) => ({
+      or: item.schedule.orNumber,
+      laneIndex: item.laneIndex,
+      startDay: item.barSpan.startDay,
+      endDay: item.barSpan.endDay,
+    })),
+    [
+      { or: 'OR-A', laneIndex: 0, startDay: 1, endDay: 10 },
+      { or: 'OR-B', laneIndex: 0, startDay: 11, endDay: 20 },
+      { or: 'OR-C', laneIndex: 0, startDay: 21, endDay: 30 },
+    ]
+  );
+});
+
+test('Lane Case 2: Two overlapping schedules (including same-day inclusive boundary) use 2 lanes', () => {
+  // Multi-day overlap: Dec 1-15 & Dec 10-20
+  const overlapLayout = layoutGanttLineSchedules(
+    [
+      makeSchedule('1', 'OR-A', '2026-12-01', '2026-12-15'),
+      makeSchedule('2', 'OR-B', '2026-12-10', '2026-12-20'),
+    ],
+    { year: 2026, month0: 11, daysInMonth: 31 }
+  );
+  assert.equal(overlapLayout.laneCount, 2);
+  assert.equal(overlapLayout.items[0].laneIndex, 0);
+  assert.equal(overlapLayout.items[1].laneIndex, 1);
+  assert.equal(overlapLayout.rowHeightPx, getGanttRowHeightPx(2));
+
+  // Inclusive same-day boundary: ends on Dec 10, next starts on Dec 10 -> must NOT share lane
+  const sameDayLayout = layoutGanttLineSchedules(
+    [
+      makeSchedule('1', 'OR-A', '2026-12-01', '2026-12-10'),
+      makeSchedule('2', 'OR-B', '2026-12-10', '2026-12-20'),
+    ],
+    { year: 2026, month0: 11, daysInMonth: 31 }
+  );
+  assert.equal(sameDayLayout.laneCount, 2);
+  assert.equal(sameDayLayout.items[0].laneIndex, 0);
+  assert.equal(sameDayLayout.items[1].laneIndex, 1);
+});
+
+test('Lane Case 3: Three schedules with two overlapping use minimum 2 lanes', () => {
+  const layout = layoutGanttLineSchedules(
+    [
+      makeSchedule('1', 'OR-A', '2026-12-01', '2026-12-15'),
+      makeSchedule('2', 'OR-B', '2026-12-10', '2026-12-20'),
+      makeSchedule('3', 'OR-C', '2026-12-21', '2026-12-30'),
+    ],
+    { year: 2026, month0: 11, daysInMonth: 31 }
+  );
+
+  assert.equal(layout.laneCount, 2);
+  assert.deepEqual(
+    layout.items.map((i) => ({ or: i.schedule.orNumber, lane: i.laneIndex })),
+    [
+      { or: 'OR-A', lane: 0 },
+      { or: 'OR-B', lane: 1 },
+      { or: 'OR-C', lane: 0 },
+    ]
+  );
+});
+
+test('Lane Case 4: Freed lane is reused by subsequent non-overlapping schedules', () => {
+  // OR-A (1-10) -> Lane 0
+  // OR-B (5-22) -> Lane 1
+  // OR-C (11-15) -> Lane 0 becomes free after day 10 -> reuses Lane 0
+  // OR-D (16-25) -> Lane 0 becomes free after day 15 -> reuses Lane 0
+  // OR-E (18-28) -> Overlaps both Lane 0 (16-25) and Lane 1 (5-22) -> Lane 2
+  const layout = layoutGanttLineSchedules(
+    [
+      makeSchedule('1', 'OR-A', '2026-12-01', '2026-12-10'),
+      makeSchedule('2', 'OR-B', '2026-12-05', '2026-12-22'),
+      makeSchedule('3', 'OR-C', '2026-12-11', '2026-12-15'),
+      makeSchedule('4', 'OR-D', '2026-12-16', '2026-12-25'),
+      makeSchedule('5', 'OR-E', '2026-12-18', '2026-12-28'),
+    ],
+    { year: 2026, month0: 11, daysInMonth: 31 }
+  );
+
+  assert.equal(layout.laneCount, 3);
+  assert.deepEqual(
+    layout.items.map((i) => ({ or: i.schedule.orNumber, lane: i.laneIndex })),
+    [
+      { or: 'OR-A', lane: 0 },
+      { or: 'OR-B', lane: 1 },
+      { or: 'OR-C', lane: 0 },
+      { or: 'OR-D', lane: 0 },
+      { or: 'OR-E', lane: 2 },
+    ]
+  );
+});
+
+test('Lane Case 5: Cross-month schedules preserve clipped horizontal spans and optimal lanes', () => {
+  const schedules = [
+    makeSchedule('1', 'OR-CROSS', '2026-11-20', '2026-12-10'),
+    makeSchedule('2', 'OR-DEC-SEQ', '2026-12-11', '2026-12-20'),
+    makeSchedule('3', 'OR-DEC-OVL', '2026-12-08', '2026-12-18'),
+  ];
+
+  const novLayout = layoutGanttLineSchedules(schedules, { year: 2026, month0: 10, daysInMonth: 30 });
+  assert.equal(novLayout.laneCount, 1);
+  assert.equal(novLayout.items.length, 1);
+  assert.equal(novLayout.items[0].schedule.orNumber, 'OR-CROSS');
+  assert.equal(novLayout.items[0].barSpan.startDay, 20);
+  assert.equal(novLayout.items[0].barSpan.endDay, 30);
+  approxEqual(novLayout.items[0].barSpan.leftPct, (19 / 31) * 100);
+  approxEqual(novLayout.items[0].barSpan.widthPct, (11 / 31) * 100);
+
+  const decLayout = layoutGanttLineSchedules(schedules, { year: 2026, month0: 11, daysInMonth: 31 });
+  assert.equal(decLayout.laneCount, 2);
+  assert.deepEqual(
+    decLayout.items.map((i) => ({
+      or: i.schedule.orNumber,
+      lane: i.laneIndex,
+      startDay: i.barSpan.startDay,
+      endDay: i.barSpan.endDay,
+    })),
+    [
+      { or: 'OR-CROSS', lane: 0, startDay: 1, endDay: 10 },
+      { or: 'OR-DEC-OVL', lane: 1, startDay: 8, endDay: 18 },
+      { or: 'OR-DEC-SEQ', lane: 0, startDay: 11, endDay: 20 },
+    ]
+  );
+  approxEqual(decLayout.items[0].barSpan.leftPct, 0);
+  approxEqual(decLayout.items[0].barSpan.widthPct, (10 / 31) * 100);
+});
+
+test('Lane Case 6: Production line row height scales strictly with actual laneCount', () => {
+  const empty = layoutGanttLineSchedules([], { year: 2026, month0: 11, daysInMonth: 31 });
+  const oneLane = layoutGanttLineSchedules(
+    [
+      makeSchedule('1', 'OR-1', '2026-12-01', '2026-12-10'),
+      makeSchedule('2', 'OR-2', '2026-12-11', '2026-12-20'),
+    ],
+    { year: 2026, month0: 11, daysInMonth: 31 }
+  );
+  const twoLanes = layoutGanttLineSchedules(
+    [
+      makeSchedule('1', 'OR-1', '2026-12-01', '2026-12-15'),
+      makeSchedule('2', 'OR-2', '2026-12-10', '2026-12-20'),
+    ],
+    { year: 2026, month0: 11, daysInMonth: 31 }
+  );
+  const threeLanes = layoutGanttLineSchedules(
+    [
+      makeSchedule('1', 'OR-1', '2026-12-01', '2026-12-15'),
+      makeSchedule('2', 'OR-2', '2026-12-05', '2026-12-18'),
+      makeSchedule('3', 'OR-3', '2026-12-10', '2026-12-20'),
+    ],
+    { year: 2026, month0: 11, daysInMonth: 31 }
+  );
+
+  assert.equal(empty.laneCount, 0);
+  assert.equal(empty.rowHeightPx, 64);
+  assert.equal(oneLane.laneCount, 1);
+  assert.equal(oneLane.rowHeightPx, 64);
+  assert.equal(twoLanes.laneCount, 2);
+  assert.equal(twoLanes.rowHeightPx, 106);
+  assert.equal(threeLanes.laneCount, 3);
+  assert.equal(threeLanes.rowHeightPx, 148);
+  assert.ok(oneLane.rowHeightPx < twoLanes.rowHeightPx);
+  assert.ok(twoLanes.rowHeightPx < threeLanes.rowHeightPx);
+});
+

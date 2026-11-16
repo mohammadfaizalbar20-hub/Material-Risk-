@@ -185,3 +185,116 @@ export function calculateGanttBarSpan(params: {
     widthPct,
   };
 }
+
+export const GANTT_LANE_HEIGHT_PX = 36;
+export const GANTT_LANE_GAP_PX = 6;
+export const GANTT_ROW_PADDING_Y_PX = 14;
+
+export interface GanttLaneItem<T extends Pick<ProductionSchedule, 'id' | 'productionDate' | 'finishDate'> = ProductionSchedule> {
+  schedule: T;
+  barSpan: GanttBarSpan;
+  laneIndex: number;
+}
+
+export interface GanttLineLayout<T extends Pick<ProductionSchedule, 'id' | 'productionDate' | 'finishDate'> = ProductionSchedule> {
+  items: Array<GanttLaneItem<T>>;
+  laneCount: number;
+  rowHeightPx: number;
+}
+
+export function getGanttRowHeightPx(laneCount: number): number {
+  const effectiveLanes = Math.max(1, laneCount);
+  const contentHeight =
+    effectiveLanes * GANTT_LANE_HEIGHT_PX + (effectiveLanes - 1) * GANTT_LANE_GAP_PX;
+  return GANTT_ROW_PADDING_Y_PX * 2 + contentHeight;
+}
+
+/**
+ * Assign schedules on a single Production Line to horizontal lanes using
+ * greedy interval partitioning with INCLUSIVE date overlap.
+ *
+ * Rules:
+ * - Non-overlapping schedules share/reuse the lowest free lane index (0, 1, ...).
+ * - Inclusive overlap: if schedule A finishes on day D and schedule B starts on day D,
+ *   they collide (D < D is false) and are placed on different lanes.
+ * - Cross-month schedules are clipped to the active month via calculateGanttBarSpan
+ *   before lane assignment, preserving horizontal position and width.
+ */
+export function layoutGanttLineSchedules<
+  T extends Pick<ProductionSchedule, 'id' | 'productionDate' | 'finishDate'>
+>(
+  schedules: T[],
+  params: {
+    year: number;
+    month0: number;
+    daysInMonth?: number;
+  }
+): GanttLineLayout<T> {
+  const { year, month0 } = params;
+  const daysInMonth = params.daysInMonth ?? getDaysInCalendarMonth(year, month0);
+
+  const spanned: Array<{ schedule: T; barSpan: GanttBarSpan }> = [];
+  for (const schedule of schedules) {
+    const barSpan = calculateGanttBarSpan({
+      productionDate: schedule.productionDate,
+      finishDate: schedule.finishDate,
+      year,
+      month0,
+      daysInMonth,
+    });
+    if (barSpan) {
+      spanned.push({ schedule, barSpan });
+    }
+  }
+
+  // Sort by clipped startDay asc, then clipped endDay asc, then actual start/finish dates, then id
+  spanned.sort((a, b) => {
+    if (a.barSpan.startDay !== b.barSpan.startDay) {
+      return a.barSpan.startDay - b.barSpan.startDay;
+    }
+    if (a.barSpan.endDay !== b.barSpan.endDay) {
+      return a.barSpan.endDay - b.barSpan.endDay;
+    }
+    const startCmp = compareCalendarDates(a.schedule.productionDate, b.schedule.productionDate);
+    if (startCmp !== 0) return startCmp;
+    const endCmp = compareCalendarDates(a.schedule.finishDate, b.schedule.finishDate);
+    if (endCmp !== 0) return endCmp;
+    return a.schedule.id.localeCompare(b.schedule.id);
+  });
+
+  // Track the inclusive last occupied endDay of each lane
+  const laneLastEndDays: number[] = [];
+  const items: Array<GanttLaneItem<T>> = [];
+
+  for (const entry of spanned) {
+    let assignedLane = -1;
+    for (let i = 0; i < laneLastEndDays.length; i++) {
+      // Strictly '<' enforces inclusive date boundaries:
+      // finishing on day 10 and starting on day 10 is treated as overlap (10 < 10 === false).
+      if (laneLastEndDays[i] < entry.barSpan.startDay) {
+        assignedLane = i;
+        laneLastEndDays[i] = entry.barSpan.endDay;
+        break;
+      }
+    }
+
+    if (assignedLane === -1) {
+      assignedLane = laneLastEndDays.length;
+      laneLastEndDays.push(entry.barSpan.endDay);
+    }
+
+    items.push({
+      schedule: entry.schedule,
+      barSpan: entry.barSpan,
+      laneIndex: assignedLane,
+    });
+  }
+
+  const laneCount = laneLastEndDays.length;
+  return {
+    items,
+    laneCount,
+    rowHeightPx: getGanttRowHeightPx(laneCount),
+  };
+}
+

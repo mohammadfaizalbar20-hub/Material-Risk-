@@ -47,10 +47,13 @@ import {
 } from '../../lib/supabase';
 import { generateUuid } from '../../utils/uuid';
 import {
-  calculateGanttBarSpan,
   doesScheduleOverlapMonth,
   doDateRangesOverlap,
+  GANTT_LANE_GAP_PX,
+  GANTT_LANE_HEIGHT_PX,
+  GANTT_ROW_PADDING_Y_PX,
   isFinishBeforeStart,
+  layoutGanttLineSchedules,
 } from '../../utils/ganttScheduleUtils';
 
 export const ProductionScheduleView: React.FC = () => {
@@ -1375,10 +1378,18 @@ export const ProductionScheduleView: React.FC = () => {
                   return doesScheduleOverlapMonth(s, currentYear, currentMonth, daysInMonth);
                 });
 
+                const lineLayout = layoutGanttLineSchedules(visibleSchedules, {
+                  year: currentYear,
+                  month0: currentMonth,
+                  daysInMonth,
+                });
+
                 return (
                   <div
                     key={lineName}
-                    style={{ minHeight: `${Math.max(96, visibleSchedules.length * 42 + 12)}px` }}
+                    data-line-name={lineName}
+                    data-lane-count={lineLayout.laneCount}
+                    style={{ minHeight: `${lineLayout.rowHeightPx}px` }}
                     className="grid grid-cols-[170px_repeat(31,minmax(34px,1fr))] relative hover:bg-slate-50/40 transition-colors"
                   >
                     {/* Fixed Sticky Line Column (Left side remains visible while horizontal scrolling) */}
@@ -1443,22 +1454,16 @@ export const ProductionScheduleView: React.FC = () => {
                         <div key={`blank-${i}`} className="bg-slate-100/40 border-r border-slate-100" />
                       ))}
 
-                      {/* Render Horizontal Gantt Schedule Blocks */}
-                      <div className="absolute inset-0 px-0 py-1.5 flex flex-col gap-1.5 justify-center pointer-events-none">
-                        {visibleSchedules.map((sch) => {
+                      {/* Render Horizontal Gantt Schedule Blocks packed into non-overlapping lanes */}
+                      <div className="absolute inset-0 pointer-events-none">
+                        {lineLayout.items.map(({ schedule: sch, barSpan, laneIndex }) => {
                           const conflict = getConflictForSchedule(sch.id);
                           const hasConflict = Boolean(conflict);
 
-                          const barSpan = calculateGanttBarSpan({
-                            productionDate: sch.productionDate,
-                            finishDate: sch.finishDate,
-                            year: currentYear,
-                            month0: currentMonth,
-                            daysInMonth,
-                          });
-                          if (!barSpan) return null;
-
                           const { startDay, endDay, leftPct, widthPct } = barSpan;
+                          const topPx =
+                            GANTT_ROW_PADDING_Y_PX +
+                            laneIndex * (GANTT_LANE_HEIGHT_PX + GANTT_LANE_GAP_PX);
                           const colors = getBlockColor(sch, hasConflict);
 
                           return (
@@ -1468,6 +1473,7 @@ export const ProductionScheduleView: React.FC = () => {
                               data-or-number={sch.orNumber}
                               data-start-day={startDay}
                               data-end-day={endDay}
+                              data-lane-index={laneIndex}
                               data-production-date={sch.productionDate}
                               data-finish-date={sch.finishDate}
                               aria-label={`Detail jadwal ${sch.orNumber} ${sch.style}`}
@@ -1480,10 +1486,12 @@ export const ProductionScheduleView: React.FC = () => {
                                 setActiveDetailSchedule(sch);
                               }}
                               style={{
+                                top: `${topPx}px`,
                                 left: `${leftPct}%`,
                                 width: `${widthPct}%`,
+                                height: `${GANTT_LANE_HEIGHT_PX}px`,
                               }}
-                              className={`relative pointer-events-auto h-9 rounded-md shadow-xs p-1.5 cursor-pointer transition-colors duration-150 flex items-center justify-between text-left text-xs font-semibold overflow-hidden group ${colors.bg} ${colors.border} ${colors.text}`}
+                              className={`absolute pointer-events-auto rounded-md shadow-xs p-1.5 cursor-pointer transition-colors duration-150 flex items-center justify-between text-left text-xs font-semibold overflow-hidden group ${colors.bg} ${colors.border} ${colors.text}`}
                               title={`${sch.orNumber} - ${sch.style} | Target: ${sch.target} | ${sch.productionDate} s/d ${sch.finishDate}${hasConflict ? ' [BENTROK DENGAN ' + conflict?.conflictingWith.map(cw => cw.orNumber).join(', ') + ']' : ''}`}
                             >
                               <div className="flex items-center gap-1.5 truncate">
