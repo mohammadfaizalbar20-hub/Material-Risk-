@@ -46,6 +46,12 @@ import {
   getSupabaseCredentials,
 } from '../../lib/supabase';
 import { generateUuid } from '../../utils/uuid';
+import {
+  calculateGanttBarSpan,
+  doesScheduleOverlapMonth,
+  doDateRangesOverlap,
+  isFinishBeforeStart,
+} from '../../utils/ganttScheduleUtils';
 
 export const ProductionScheduleView: React.FC = () => {
   const {
@@ -280,16 +286,17 @@ export const ProductionScheduleView: React.FC = () => {
   // Check form conflict in real-time
   const formConflictPreview = useMemo(() => {
     if (!formData.productionLine || !formData.productionDate || !formData.finishDate) return null;
-    const prodDate = new Date(formData.productionDate);
-    const finDate = new Date(formData.finishDate);
-    if (finDate < prodDate) return null;
+    if (isFinishBeforeStart(formData.productionDate, formData.finishDate)) return null;
 
     const clashes = productionSchedules.filter((s) => {
       if (editingScheduleId && s.id === editingScheduleId) return false;
       if (s.productionLine !== formData.productionLine) return false;
-      const sStart = new Date(s.productionDate);
-      const sEnd = new Date(s.finishDate);
-      return prodDate <= sEnd && finDate >= sStart;
+      return doDateRangesOverlap(
+        formData.productionDate,
+        formData.finishDate,
+        s.productionDate,
+        s.finishDate
+      );
     });
 
     if (clashes.length > 0) {
@@ -831,7 +838,7 @@ export const ProductionScheduleView: React.FC = () => {
       setFormValidationError('Line Produksi wajib dipilih.');
       return;
     }
-    if (new Date(formData.finishDate) < new Date(formData.productionDate)) {
+    if (isFinishBeforeStart(formData.productionDate, formData.finishDate)) {
       setFormValidationError('Tanggal selesai tidak boleh lebih awal daripada tanggal produksi.');
       return;
     }
@@ -1294,7 +1301,7 @@ export const ProductionScheduleView: React.FC = () => {
       {/* Production Planning Board (Horizontal Gantt Calendar with Fixed Sticky Line Column & Holiday Markings) */}
       <div className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
         <div className="overflow-x-auto relative">
-          <div className="min-w-[1200px]">
+          <div className="min-w-[1224px]">
             {/* Header: Dates Row */}
             <div className="grid grid-cols-[170px_repeat(31,minmax(34px,1fr))] bg-slate-900 text-white text-xs border-b border-slate-700 font-semibold sticky top-0 z-30">
               {/* Sticky Line Header Column */}
@@ -1326,6 +1333,7 @@ export const ProductionScheduleView: React.FC = () => {
                 return (
                   <div
                     key={d.day}
+                    data-gantt-day={d.day}
                     className={`p-1 text-center border-r border-slate-800/80 flex flex-col justify-center items-center transition-colors relative group select-none ${headerBg}`}
                     title={d.holidayInfo.isHoliday ? `${d.dateStr}: ${d.holidayInfo.name}` : `${d.dayName}, ${d.dateStr}`}
                   >
@@ -1364,17 +1372,14 @@ export const ProductionScheduleView: React.FC = () => {
                     const matchStyle = (s.style || '').toUpperCase().includes(q);
                     if (!matchOr && !matchStyle) return false;
                   }
-                  const sStart = new Date(s.productionDate);
-                  const sEnd = new Date(s.finishDate);
-                  const mStart = new Date(currentYear, currentMonth, 1);
-                  const mEnd = new Date(currentYear, currentMonth, daysInMonth, 23, 59, 59);
-                  return sStart <= mEnd && sEnd >= mStart;
+                  return doesScheduleOverlapMonth(s, currentYear, currentMonth, daysInMonth);
                 });
 
                 return (
                   <div
                     key={lineName}
-                    className="grid grid-cols-[170px_repeat(31,minmax(34px,1fr))] min-h-24 relative hover:bg-slate-50/40 transition-colors"
+                    style={{ minHeight: `${Math.max(96, visibleSchedules.length * 42 + 12)}px` }}
+                    className="grid grid-cols-[170px_repeat(31,minmax(34px,1fr))] relative hover:bg-slate-50/40 transition-colors"
                   >
                     {/* Fixed Sticky Line Column (Left side remains visible while horizontal scrolling) */}
                     <div className="sticky left-0 z-20 p-3 border-r border-slate-200 bg-white/95 backdrop-blur-xs flex flex-col justify-center shadow-[3px_0_6px_-1px_rgba(0,0,0,0.06)]">
@@ -1439,35 +1444,32 @@ export const ProductionScheduleView: React.FC = () => {
                       ))}
 
                       {/* Render Horizontal Gantt Schedule Blocks */}
-                      <div className="absolute inset-0 p-1.5 flex flex-col gap-1.5 justify-center pointer-events-none">
+                      <div className="absolute inset-0 px-0 py-1.5 flex flex-col gap-1.5 justify-center pointer-events-none">
                         {visibleSchedules.map((sch) => {
                           const conflict = getConflictForSchedule(sch.id);
                           const hasConflict = Boolean(conflict);
 
-                          // Calculate start day and end day clipped to current month
-                          const sStart = new Date(sch.productionDate);
-                          const sEnd = new Date(sch.finishDate);
+                          const barSpan = calculateGanttBarSpan({
+                            productionDate: sch.productionDate,
+                            finishDate: sch.finishDate,
+                            year: currentYear,
+                            month0: currentMonth,
+                            daysInMonth,
+                          });
+                          if (!barSpan) return null;
 
-                          const startDay =
-                            sStart.getFullYear() === currentYear && sStart.getMonth() === currentMonth
-                               ? sStart.getDate()
-                               : 1;
-
-                          const endDay =
-                            sEnd.getFullYear() === currentYear && sEnd.getMonth() === currentMonth
-                              ? sEnd.getDate()
-                              : daysInMonth;
-
-                          // Left % and Width %
-                          const leftPct = ((startDay - 1) / 31) * 100;
-                          const widthPct = Math.max(1, (endDay - startDay + 1) / 31) * 100;
-
+                          const { startDay, endDay, leftPct, widthPct } = barSpan;
                           const colors = getBlockColor(sch, hasConflict);
 
                           return (
                             <button
                               type="button"
                               key={sch.id}
+                              data-or-number={sch.orNumber}
+                              data-start-day={startDay}
+                              data-end-day={endDay}
+                              data-production-date={sch.productionDate}
+                              data-finish-date={sch.finishDate}
                               aria-label={`Detail jadwal ${sch.orNumber} ${sch.style}`}
                               onClick={(e) => {
                                 e.stopPropagation();
@@ -1481,7 +1483,7 @@ export const ProductionScheduleView: React.FC = () => {
                                 left: `${leftPct}%`,
                                 width: `${widthPct}%`,
                               }}
-                              className={`relative pointer-events-auto h-9 rounded-md shadow-xs p-1.5 cursor-pointer transition-all duration-150 flex items-center justify-between text-left text-xs font-semibold overflow-hidden group ${colors.bg} ${colors.border} ${colors.text}`}
+                              className={`relative pointer-events-auto h-9 rounded-md shadow-xs p-1.5 cursor-pointer transition-colors duration-150 flex items-center justify-between text-left text-xs font-semibold overflow-hidden group ${colors.bg} ${colors.border} ${colors.text}`}
                               title={`${sch.orNumber} - ${sch.style} | Target: ${sch.target} | ${sch.productionDate} s/d ${sch.finishDate}${hasConflict ? ' [BENTROK DENGAN ' + conflict?.conflictingWith.map(cw => cw.orNumber).join(', ') + ']' : ''}`}
                             >
                               <div className="flex items-center gap-1.5 truncate">
