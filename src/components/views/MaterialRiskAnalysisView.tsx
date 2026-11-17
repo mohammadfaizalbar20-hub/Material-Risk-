@@ -24,6 +24,7 @@ import {
 } from 'lucide-react';
 import { RiskLevel } from '../../types/ppic';
 import { formatPpicNumber } from '../../utils/excelMaterialParser';
+import { normalizeAssignedProductionLine } from '../../utils/ganttScheduleUtils';
 
 export const MaterialRiskAnalysisView: React.FC = () => {
   const {
@@ -335,9 +336,11 @@ export const MaterialRiskAnalysisView: React.FC = () => {
               const isExpanded = expandedOrNumber === summary.orNumber;
               const isIncomplete = summary.materials.some((m) => !m.isCompleteData);
 
+              const assignedLine = normalizeAssignedProductionLine(summary.productionLine);
+
               return (
                 <div
-                  key={`${summary.orNumber}-${summary.productionDate}-${summary.productionLine}`}
+                  key={`${summary.orNumber}-${summary.productionDate}-${assignedLine || 'unassigned'}`}
                   className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden transition-all"
                 >
                   {/* Summary Card Header */}
@@ -357,9 +360,9 @@ export const MaterialRiskAnalysisView: React.FC = () => {
                             {summary.style}
                           </span>
 
-                          {summary.productionLine && (
+                          {assignedLine && (
                             <span className="text-[10px] font-semibold px-2 py-0.5 rounded bg-slate-100 text-slate-700">
-                              {summary.productionLine}
+                              {assignedLine}
                             </span>
                           )}
                         </div>

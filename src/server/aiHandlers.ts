@@ -56,15 +56,19 @@ export function generateSequentialPpicReport(context: any) {
     (s: any) => s.overallRiskLevel === 'CRITICAL' || s.overallRiskLevel === 'HIGH'
   );
 
-  const stage1Summary = deterministicScores.map((s: any) => ({
-    orNumber: s.orNumber,
-    style: s.style,
-    line: s.productionLine,
-    prodDate: s.productionDate,
-    riskScore: s.overallRiskScore,
-    riskLevel: s.overallRiskLevel,
-    readyRatio: `${s.readyMaterialsCount}/${s.totalMaterialsCount} Material Ready`,
-  }));
+  const stage1Summary = deterministicScores.map((s: any) => {
+    const rawLine = String(s.productionLine || '').trim();
+    const cleanLine = rawLine.toLowerCase() === 'produksi' ? '' : rawLine;
+    return {
+      orNumber: s.orNumber,
+      style: s.style,
+      line: cleanLine || '-',
+      prodDate: s.productionDate,
+      riskScore: s.overallRiskScore,
+      riskLevel: s.overallRiskLevel,
+      readyRatio: `${s.readyMaterialsCount}/${s.totalMaterialsCount} Material Ready`,
+    };
+  });
 
   const stage2ClaudeAnalysis = `### Tahap 2: Analisis Risiko Awal (Claude Analysis Engine)
 *Berdasarkan hasil kalkulasi deterministik Tahap 1:*

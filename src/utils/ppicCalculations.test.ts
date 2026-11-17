@@ -161,3 +161,81 @@ test('Pareto Analysis: Urutkan kekurangan terbesar dan kalkulasi persentase kumu
   assert.equal(pareto[1].contributionPercent, 20);
   assert.equal(pareto[1].cumulativePercent, 100);
 });
+
+test('Jadwal tanpa Line Produksi (kosong) atau placeholder lama "Produksi" TIDAK boleh memicu konflik bentrok jadwal palsu', () => {
+  const schedules: ProductionSchedule[] = [
+    {
+      id: 'un-a',
+      orNumber: 'OR-101',
+      productionDate: '2026-11-05',
+      finishDate: '2026-11-12',
+      productionLine: '',
+      style: 'Style 101',
+      target: 500,
+    },
+    {
+      id: 'un-b',
+      orNumber: 'OR-102',
+      productionDate: '2026-11-05',
+      finishDate: '2026-11-12',
+      productionLine: 'Produksi',
+      style: 'Style 102',
+      target: 600,
+    },
+    {
+      id: 'un-c',
+      orNumber: 'OR-103',
+      productionDate: '2026-11-06',
+      finishDate: '2026-11-10',
+      productionLine: 'Produksi',
+      style: 'Style 103',
+      target: 700,
+    },
+    {
+      id: 'real-a',
+      orNumber: 'OR-201',
+      productionDate: '2026-11-05',
+      finishDate: '2026-11-10',
+      productionLine: 'Line 1',
+      style: 'Style 201',
+      target: 1000,
+    },
+    {
+      id: 'real-b',
+      orNumber: 'OR-202',
+      productionDate: '2026-11-08',
+      finishDate: '2026-11-12',
+      productionLine: 'line 1',
+      style: 'Style 202',
+      target: 1000,
+    },
+  ];
+
+  const conflicts = detectScheduleConflicts(schedules);
+  assert.equal(conflicts.has('un-a'), false);
+  assert.equal(conflicts.has('un-b'), false);
+  assert.equal(conflicts.has('un-c'), false);
+  assert.equal(conflicts.has('real-a'), true);
+  assert.equal(conflicts.has('real-b'), true);
+  assert.equal(conflicts.get('real-a')?.line, 'Line 1');
+
+  const reqs: MaterialItemRequirement[] = [
+    {
+      id: 'req-p1',
+      orNumber: 'OR-102',
+      style: 'Style 102',
+      materialCode: 'MAT-X',
+      materialName: 'Material X',
+      category: 'Raw Material',
+      unit: 'Yard',
+      requiredQty: 100,
+      receivedQty: 40,
+      unitPrice: 1000,
+    },
+  ];
+  const { orSummaries } = assessAllMaterialRisks(reqs, schedules, new Date('2026-11-01'));
+  const summary102 = orSummaries.find((s) => s.orNumber === 'OR-102');
+  assert.ok(summary102);
+  assert.equal(summary102.productionLine, '');
+});
+

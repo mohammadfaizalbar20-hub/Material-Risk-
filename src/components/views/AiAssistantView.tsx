@@ -23,6 +23,7 @@ import {
   X,
   Hash,
 } from 'lucide-react';
+import { normalizeAssignedProductionLine } from '../../utils/ganttScheduleUtils';
 
 interface ChatMessage {
   id: string;
@@ -528,9 +529,11 @@ Silakan sampaikan pertanyaan atau pilih rekomendasi cepat!`,
 
             <div className="p-4">
               <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-                {orRiskSummaries.map((summary, idx) => (
+                {orRiskSummaries.map((summary, idx) => {
+                  const assignedLine = normalizeAssignedProductionLine(summary.productionLine);
+                  return (
                   <div
-                    key={`${summary.orNumber}-${summary.productionDate}-${summary.productionLine}-${idx}`}
+                    key={`${summary.orNumber}-${summary.productionDate}-${assignedLine || 'unassigned'}-${idx}`}
                     className="p-3 rounded-lg border border-slate-200 bg-slate-50/70 space-y-1.5"
                   >
                     <div className="flex items-center justify-between">
@@ -543,11 +546,12 @@ Silakan sampaikan pertanyaan atau pilih rekomendasi cepat!`,
                       {summary.style}
                     </div>
                     <div className="text-[10px] text-slate-500 flex items-center justify-between pt-1 border-t border-slate-200">
-                      <span>Line: {summary.productionLine || '-'}</span>
+                      <span>Line: {assignedLine || '-'}</span>
                       <span>{summary.readyMaterialsCount}/{summary.totalMaterials} Ready</span>
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           </div>

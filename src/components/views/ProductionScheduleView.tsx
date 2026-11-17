@@ -44,12 +44,13 @@ import {
 } from '../../lib/supabase';
 import { generateUuid } from '../../utils/uuid';
 import {
-  doesScheduleOverlapMonth,
   GANTT_LANE_GAP_PX,
   GANTT_LANE_HEIGHT_PX,
   GANTT_ROW_PADDING_Y_PX,
+  getDisplayProductionLineLabel,
+  groupSchedulesForGanttBoard,
   isFinishBeforeStart,
-  layoutGanttLineSchedules,
+  normalizeAssignedProductionLine,
 } from '../../utils/ganttScheduleUtils';
 
 interface FormExcelMaterial {
@@ -81,6 +82,7 @@ interface FormExcelScheduleItem {
   style?: string;
   target?: number | null;
   rawTarget?: string;
+  productionLine?: string; // Opsional input manual (kosong -> 'Belum Ditentukan')
   productionDate: string; // Input manual per jadwal
   finishDate: string; // Input manual per jadwal
   needsReview?: boolean;
@@ -97,6 +99,7 @@ interface FormExcelScheduleItem {
 export const ProductionScheduleView: React.FC = () => {
   const {
     productionSchedules,
+    scheduleConflicts,
     addProductionSchedule,
     updateProductionSchedule,
     deleteProductionSchedule,
@@ -131,13 +134,14 @@ export const ProductionScheduleView: React.FC = () => {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalMode, setModalMode] = useState<'create' | 'edit'>('create');
   const [editingScheduleId, setEditingScheduleId] = useState<string | null>(null);
-  const [editingOriginalLine, setEditingOriginalLine] = useState<string>('Produksi');
+  const [editingOriginalLine, setEditingOriginalLine] = useState<string>('');
   const [activeDetailSchedule, setActiveDetailSchedule] = useState<ProductionSchedule | null>(null);
 
   // Manual Form State (used when creating/editing manually without uploaded Excel files)
   const [formData, setFormData] = useState<{
     orNumber: string;
     productionNumber: string;
+    productionLine: string;
     productionDate: string;
     finishDate: string;
     style: string;
@@ -146,6 +150,7 @@ export const ProductionScheduleView: React.FC = () => {
   }>({
     orNumber: '',
     productionNumber: '',
+    productionLine: '',
     productionDate: '2026-11-05',
     finishDate: '2026-11-09',
     style: '',
@@ -165,6 +170,20 @@ export const ProductionScheduleView: React.FC = () => {
   } | null>(null);
 
   const availableOrList = registeredOrNumbers;
+
+  // Dynamic suggestions ONLY from previously saved schedules (never fabricate fake line names)
+  const existingProductionLines = useMemo(() => {
+    const unique = new Map<string, string>();
+    for (const s of productionSchedules) {
+      const assigned = normalizeAssignedProductionLine(s.productionLine);
+      if (assigned && !unique.has(assigned.toLowerCase())) {
+        unique.set(assigned.toLowerCase(), assigned);
+      }
+    }
+    return Array.from(unique.values()).sort((a, b) =>
+      a.localeCompare(b, 'id', { numeric: true, sensitivity: 'base' })
+    );
+  }, [productionSchedules]);
 
   const getDefaultDateRange = () => {
     const padM = String(currentMonth + 1).padStart(2, '0');
@@ -269,7 +288,7 @@ export const ProductionScheduleView: React.FC = () => {
     const defaults = getDefaultDateRange();
     setModalMode('create');
     setEditingScheduleId(null);
-    setEditingOriginalLine('Produksi');
+    setEditingOriginalLine('');
     setCreateDraftId(generateUuid());
     setIsSubmittingForm(false);
     setUploadedExcels([]);
@@ -277,6 +296,7 @@ export const ProductionScheduleView: React.FC = () => {
     setFormData({
       orNumber: availableOrList[0] || '',
       productionNumber: '',
+      productionLine: '',
       productionDate: defaults.start,
       finishDate: defaults.end,
       style: availableOrList[0] ? getStyleForOr(availableOrList[0]) || '' : '',
@@ -290,9 +310,10 @@ export const ProductionScheduleView: React.FC = () => {
 
   // Open Edit Modal (mempertahankan snapshot tersimpan tanpa auto-rematch)
   const openEditModal = (sch: ProductionSchedule) => {
+    const assignedLine = normalizeAssignedProductionLine(sch.productionLine);
     setModalMode('edit');
     setEditingScheduleId(sch.id);
-    setEditingOriginalLine(sch.productionLine || 'Produksi');
+    setEditingOriginalLine(assignedLine);
     setIsSubmittingForm(false);
     if (sch.worksheets && sch.worksheets.length > 0) {
       const existing: FormExcelScheduleItem[] = sch.worksheets.map((ws) => ({
@@ -304,6 +325,7 @@ export const ProductionScheduleView: React.FC = () => {
         productionNumber: ws.worksheetNo || '',
         style: ws.style,
         target: ws.target,
+        productionLine: assignedLine,
         productionDate: sch.productionDate,
         finishDate: sch.finishDate,
         materials: (ws.materials || []).map((m, idx) => ({
@@ -336,6 +358,7 @@ export const ProductionScheduleView: React.FC = () => {
     setFormData({
       orNumber: sch.orNumber,
       productionNumber: sch.worksheets?.[0]?.worksheetNo || '',
+      productionLine: assignedLine,
       productionDate: sch.productionDate,
       finishDate: sch.finishDate,
       style: sch.style,
@@ -404,7 +427,14 @@ export const ProductionScheduleView: React.FC = () => {
     patch: Partial<
       Pick<
         FormExcelScheduleItem,
-        'orNumber' | 'productionNumber' | 'style' | 'target' | 'productionDate' | 'finishDate' | 'reviewConfirmed'
+        | 'orNumber'
+        | 'productionNumber'
+        | 'style'
+        | 'target'
+        | 'productionLine'
+        | 'productionDate'
+        | 'finishDate'
+        | 'reviewConfirmed'
       >
     >
   ) => {
@@ -548,6 +578,7 @@ export const ProductionScheduleView: React.FC = () => {
       file: f,
       fileName: f.name,
       status: 'parsing',
+      productionLine: modalMode === 'edit' ? editingOriginalLine : '',
       productionDate: defaults.start,
       finishDate: defaults.end,
     }));
@@ -965,7 +996,7 @@ export const ProductionScheduleView: React.FC = () => {
               orNumber: cleanOr,
               productionDate: p.productionDate,
               finishDate: p.finishDate,
-              productionLine: 'Produksi',
+              productionLine: normalizeAssignedProductionLine(p.productionLine),
               style: cleanStyle,
               target: Number(p.target || 0),
               status: 'Terjadwal',
@@ -1022,7 +1053,9 @@ export const ProductionScheduleView: React.FC = () => {
           orNumber: cleanOr,
           productionDate: primary.productionDate,
           finishDate: primary.finishDate,
-          productionLine: editingOriginalLine || 'Produksi',
+          productionLine: normalizeAssignedProductionLine(
+            primary.productionLine !== undefined ? primary.productionLine : editingOriginalLine
+          ),
           style: cleanStyle,
           target: totalTarget,
           status: formData.status,
@@ -1055,7 +1088,7 @@ export const ProductionScheduleView: React.FC = () => {
         orNumber: cleanOr,
         productionDate: formData.productionDate,
         finishDate: formData.finishDate,
-        productionLine: modalMode === 'edit' ? editingOriginalLine || 'Produksi' : 'Produksi',
+        productionLine: normalizeAssignedProductionLine(formData.productionLine),
         style: cleanStyle,
         target: Number(formData.target),
         status: formData.status,
@@ -1142,20 +1175,14 @@ export const ProductionScheduleView: React.FC = () => {
     });
   }, [productionSchedules, orSearchInput]);
 
-  // Schedules overlapping currently displayed month, packed onto horizontal non-overlapping lanes
-  const visibleMonthSchedules = useMemo(() => {
-    return filteredSchedules.filter((s) =>
-      doesScheduleOverlapMonth(s, currentYear, currentMonth, daysInMonth)
-    );
-  }, [filteredSchedules, currentYear, currentMonth, daysInMonth]);
-
-  const boardLayout = useMemo(() => {
-    return layoutGanttLineSchedules(visibleMonthSchedules, {
+  // Group schedules by Line Produksi and pack bars horizontally onto non-overlapping lanes per Line
+  const ganttLineGroups = useMemo(() => {
+    return groupSchedulesForGanttBoard(filteredSchedules, {
       year: currentYear,
       month0: currentMonth,
       daysInMonth,
     });
-  }, [visibleMonthSchedules, currentYear, currentMonth, daysInMonth]);
+  }, [filteredSchedules, currentYear, currentMonth, daysInMonth]);
 
   const getBlockColor = (sch: ProductionSchedule) => {
     const colors = [
@@ -1346,9 +1373,9 @@ export const ProductionScheduleView: React.FC = () => {
           <div className="min-w-[1224px]">
             {/* Header: Dates Row */}
             <div className="grid grid-cols-[180px_repeat(31,minmax(34px,1fr))] bg-slate-900 text-white text-xs border-b border-slate-700 font-semibold sticky top-0 z-30">
-              {/* Sticky Schedule Header Column */}
+              {/* Sticky Line Produksi Header Column */}
               <div className="sticky left-0 z-40 bg-slate-900 p-3 border-r border-slate-700 flex items-center justify-between shadow-[3px_0_6px_-1px_rgba(0,0,0,0.5)]">
-                <span className="font-bold text-white tracking-wide">Jadwal Produksi</span>
+                <span className="font-bold text-white tracking-wide">Line Produksi</span>
                 <span className="text-[10px] text-slate-400 font-mono">Tgl</span>
               </div>
               {daysArray.map((d) => {
@@ -1399,153 +1426,181 @@ export const ProductionScheduleView: React.FC = () => {
               ))}
             </div>
 
-            {/* Unified Schedule Gantt Board Row with Date-Overlap Lane Packing */}
-            <div
-              data-board-row="all-schedules"
-              data-lane-count={boardLayout.laneCount}
-              style={{ minHeight: `${Math.max(boardLayout.rowHeightPx, 96)}px` }}
-              className="grid grid-cols-[180px_repeat(31,minmax(34px,1fr))] relative hover:bg-slate-50/30 transition-colors"
-            >
-              {/* Fixed Sticky Summary Column */}
-              <div className="sticky left-0 z-20 p-3 border-r border-slate-200 bg-white/95 backdrop-blur-xs flex flex-col justify-center shadow-[3px_0_6px_-1px_rgba(0,0,0,0.06)]">
-                <div className="font-bold text-xs text-slate-900 flex items-center gap-1.5">
-                  <Layers className="w-3.5 h-3.5 text-blue-600 shrink-0" />
-                  <span className="truncate">Rencana Produksi</span>
+            {/* Per-Line Produksi Gantt Board Rows with Sticky Line Name & Date-Overlap Lane Packing */}
+            <div className="divide-y divide-slate-200">
+              {ganttLineGroups.length === 0 ? (
+                <div className="p-10 text-center text-xs text-slate-400">
+                  Belum ada jadwal produksi tersimpan untuk bulan {monthNames[currentMonth]} {currentYear}.
                 </div>
-                <div className="text-[11px] text-slate-600 mt-1 truncate">
-                  {visibleMonthSchedules.length} Jadwal di {monthNames[currentMonth].slice(0, 3)} {currentYear}
-                </div>
-                <div className="text-[10px] text-slate-400 mt-0.5">
-                  {boardLayout.laneCount} Baris Jadwal
-                </div>
-              </div>
-
-              {/* Day Grid Cells */}
-              <div className="col-span-31 grid grid-cols-31 relative">
-                {daysArray.map((d) => {
-                  const isNational = d.holidayInfo.type === 'NATIONAL_HOLIDAY';
-                  const isCuti = d.holidayInfo.type === 'CUTI_BERSAMA';
-                  const isSunday = d.holidayInfo.type === 'SUNDAY';
-
-                  let cellBg = 'border-slate-100 hover:bg-slate-50/50';
-                  let holidayTag = null;
-
-                  if (isNational) {
-                    cellBg = 'bg-rose-100/75 border-rose-200/90';
-                    holidayTag = (
-                      <span className="text-[8px] font-bold text-rose-700/80 uppercase font-mono tracking-tighter select-none leading-none">
-                        LIBUR
-                      </span>
-                    );
-                  } else if (isCuti) {
-                    cellBg = 'bg-amber-100/70 border-amber-200/90';
-                    holidayTag = (
-                      <span className="text-[8px] font-bold text-amber-800/80 uppercase font-mono tracking-tighter select-none leading-none">
-                        CUTI
-                      </span>
-                    );
-                  } else if (isSunday) {
-                    cellBg = 'bg-rose-50/70 border-rose-100/80';
-                    holidayTag = (
-                      <span className="text-[8px] font-bold text-rose-500/70 uppercase font-mono tracking-tighter select-none leading-none">
-                        MIN
-                      </span>
-                    );
-                  } else if (d.isSaturday) {
-                    cellBg = 'bg-slate-50/40 border-slate-100';
-                  }
+              ) : (
+                ganttLineGroups.map((group) => {
+                  const hasRealLineConflict =
+                    !group.isUnassigned &&
+                    group.layout.items.some(({ schedule }) => scheduleConflicts.has(schedule.id));
 
                   return (
                     <div
-                      key={d.day}
-                      className={`border-r h-full relative flex flex-col justify-between items-center py-1 transition-colors ${cellBg}`}
-                      title={d.holidayInfo.isHoliday ? `${d.dateStr} - ${d.holidayInfo.name} (Hari Libur Produksi)` : undefined}
+                      key={group.lineKey}
+                      data-board-row={group.lineLabel}
+                      data-line-key={group.lineKey}
+                      data-lane-count={group.layout.laneCount}
+                      style={{ minHeight: `${Math.max(group.layout.rowHeightPx, 64)}px` }}
+                      className="grid grid-cols-[180px_repeat(31,minmax(34px,1fr))] relative hover:bg-slate-50/30 transition-colors"
                     >
-                      {holidayTag}
-                      <span />
+                      {/* Fixed Sticky Left Line Produksi Column */}
+                      <div className="sticky left-0 z-20 p-3 border-r border-slate-200 bg-white/95 backdrop-blur-xs flex flex-col justify-center shadow-[3px_0_6px_-1px_rgba(0,0,0,0.06)]">
+                        <div className="font-bold text-xs text-slate-900 flex items-center gap-1.5">
+                          <Layers
+                            className={`w-3.5 h-3.5 shrink-0 ${
+                              group.isUnassigned ? 'text-slate-400' : 'text-blue-600'
+                            }`}
+                          />
+                          <span className={`truncate ${group.isUnassigned ? 'text-slate-600 italic' : 'text-slate-900'}`}>
+                            {group.lineLabel}
+                          </span>
+                        </div>
+                        <div className="text-[11px] text-slate-500 mt-1 truncate">
+                          {group.layout.items.length > 0
+                            ? `${group.layout.items.length} Jadwal · ${group.layout.laneCount} Baris`
+                            : `0 Jadwal di ${monthNames[currentMonth].slice(0, 3)} ${currentYear}`}
+                        </div>
+                        {hasRealLineConflict && (
+                          <div className="mt-1 inline-flex items-center gap-1 text-[10px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded w-fit">
+                            <AlertTriangle className="w-3 h-3 shrink-0 text-amber-600" />
+                            <span>Bentrok Jadwal</span>
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Day Grid Cells for this Line */}
+                      <div className="col-span-31 grid grid-cols-31 relative">
+                        {daysArray.map((d) => {
+                          const isNational = d.holidayInfo.type === 'NATIONAL_HOLIDAY';
+                          const isCuti = d.holidayInfo.type === 'CUTI_BERSAMA';
+                          const isSunday = d.holidayInfo.type === 'SUNDAY';
+
+                          let cellBg = 'border-slate-100 hover:bg-slate-50/50';
+                          let holidayTag = null;
+
+                          if (isNational) {
+                            cellBg = 'bg-rose-100/75 border-rose-200/90';
+                            holidayTag = (
+                              <span className="text-[8px] font-bold text-rose-700/80 uppercase font-mono tracking-tighter select-none leading-none">
+                                LIBUR
+                              </span>
+                            );
+                          } else if (isCuti) {
+                            cellBg = 'bg-amber-100/70 border-amber-200/90';
+                            holidayTag = (
+                              <span className="text-[8px] font-bold text-amber-800/80 uppercase font-mono tracking-tighter select-none leading-none">
+                                CUTI
+                              </span>
+                            );
+                          } else if (isSunday) {
+                            cellBg = 'bg-rose-50/70 border-rose-100/80';
+                            holidayTag = (
+                              <span className="text-[8px] font-bold text-rose-500/70 uppercase font-mono tracking-tighter select-none leading-none">
+                                MIN
+                              </span>
+                            );
+                          } else if (d.isSaturday) {
+                            cellBg = 'bg-slate-50/40 border-slate-100';
+                          }
+
+                          return (
+                            <div
+                              key={d.day}
+                              className={`border-r h-full relative flex flex-col justify-between items-center py-1 transition-colors ${cellBg}`}
+                              title={d.holidayInfo.isHoliday ? `${d.dateStr} - ${d.holidayInfo.name} (Hari Libur Produksi)` : undefined}
+                            >
+                              {holidayTag}
+                              <span />
+                            </div>
+                          );
+                        })}
+                        {Array.from({ length: 31 - daysInMonth }).map((_, i) => (
+                          <div key={`blank-${i}`} className="bg-slate-100/40 border-r border-slate-100" />
+                        ))}
+
+                        {/* Horizontal Gantt Schedule Blocks packed into non-overlapping lanes within this Line */}
+                        <div className="absolute inset-0 pointer-events-none">
+                          {group.layout.items.map(({ schedule: sch, barSpan, laneIndex }) => {
+                            const { startDay, endDay, leftPct, widthPct } = barSpan;
+                            const topPx =
+                              GANTT_ROW_PADDING_Y_PX +
+                              laneIndex * (GANTT_LANE_HEIGHT_PX + GANTT_LANE_GAP_PX);
+                            const colors = getBlockColor(sch);
+                            const prodNo = sch.worksheets?.[0]?.worksheetNo;
+                            const conflictInfo = scheduleConflicts.get(sch.id);
+
+                            return (
+                              <button
+                                type="button"
+                                key={sch.id}
+                                data-or-number={sch.orNumber}
+                                data-line-label={group.lineLabel}
+                                data-start-day={startDay}
+                                data-end-day={endDay}
+                                data-lane-index={laneIndex}
+                                data-production-date={sch.productionDate}
+                                data-finish-date={sch.finishDate}
+                                aria-label={`Detail jadwal ${sch.orNumber} ${sch.style}`}
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setDetailSelectedWsId(null);
+                                  setRefreshFeedback(null);
+                                  setDetailActionError(null);
+                                  setConfirmDeleteId(null);
+                                  setActiveDetailSchedule(sch);
+                                }}
+                                style={{
+                                  top: `${topPx}px`,
+                                  left: `${leftPct}%`,
+                                  width: `${widthPct}%`,
+                                  height: `${GANTT_LANE_HEIGHT_PX}px`,
+                                }}
+                                className={`absolute pointer-events-auto rounded-md shadow-xs p-1.5 cursor-pointer transition-colors duration-150 flex items-center justify-between text-left text-xs font-semibold overflow-hidden group ${colors.bg} ${colors.border} ${colors.text} ${
+                                  conflictInfo ? 'ring-2 ring-amber-400/90' : ''
+                                }`}
+                                title={`[${group.lineLabel}] OR ${sch.orNumber}${prodNo ? ` (${prodNo})` : ''} - ${sch.style} | Target: ${formatPpicNumber(sch.target)} | ${sch.productionDate} s/d ${sch.finishDate}${conflictInfo ? ' (Bentrok jadwal pada Line yang sama)' : ''}`}
+                              >
+                                <div className="flex items-center gap-1.5 truncate">
+                                  <span className="font-mono font-bold truncate">
+                                    OR {sch.orNumber}
+                                  </span>
+                                  {prodNo && (
+                                    <span className="opacity-85 text-[10px] font-mono truncate hidden lg:inline">
+                                      [{prodNo}]
+                                    </span>
+                                  )}
+                                  <span className="opacity-80 text-[11px] truncate hidden md:inline">
+                                    · {sch.style}
+                                  </span>
+                                </div>
+
+                                <div className="flex items-center gap-1 shrink-0 ml-1">
+                                  {sch.worksheets && sch.worksheets.length > 0 && (
+                                    <span
+                                      className="text-[10px] bg-white/25 px-1 py-0.2 rounded flex items-center gap-0.5 font-bold"
+                                      title={`${sch.worksheets.length} file Excel terlampir`}
+                                    >
+                                      <Paperclip className="w-2.5 h-2.5" />
+                                      <span>{sch.worksheets.length}</span>
+                                    </span>
+                                  )}
+                                  <span className={`text-[10px] font-mono px-1 py-0.2 rounded font-bold ${colors.badge}`}>
+                                    {formatPpicNumber(sch.target)}
+                                  </span>
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
                     </div>
                   );
-                })}
-                {Array.from({ length: 31 - daysInMonth }).map((_, i) => (
-                  <div key={`blank-${i}`} className="bg-slate-100/40 border-r border-slate-100" />
-                ))}
-
-                {/* Horizontal Gantt Schedule Blocks packed into non-overlapping lanes */}
-                <div className="absolute inset-0 pointer-events-none">
-                  {boardLayout.items.length === 0 && (
-                    <div className="h-full flex items-center justify-center text-xs text-slate-400">
-                      Belum ada jadwal produksi pada bulan {monthNames[currentMonth]} {currentYear}.
-                    </div>
-                  )}
-                  {boardLayout.items.map(({ schedule: sch, barSpan, laneIndex }) => {
-                    const { startDay, endDay, leftPct, widthPct } = barSpan;
-                    const topPx =
-                      GANTT_ROW_PADDING_Y_PX +
-                      laneIndex * (GANTT_LANE_HEIGHT_PX + GANTT_LANE_GAP_PX);
-                    const colors = getBlockColor(sch);
-                    const prodNo = sch.worksheets?.[0]?.worksheetNo;
-
-                    return (
-                      <button
-                        type="button"
-                        key={sch.id}
-                        data-or-number={sch.orNumber}
-                        data-start-day={startDay}
-                        data-end-day={endDay}
-                        data-lane-index={laneIndex}
-                        data-production-date={sch.productionDate}
-                        data-finish-date={sch.finishDate}
-                        aria-label={`Detail jadwal ${sch.orNumber} ${sch.style}`}
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setDetailSelectedWsId(null);
-                          setRefreshFeedback(null);
-                          setDetailActionError(null);
-                          setConfirmDeleteId(null);
-                          setActiveDetailSchedule(sch);
-                        }}
-                        style={{
-                          top: `${topPx}px`,
-                          left: `${leftPct}%`,
-                          width: `${widthPct}%`,
-                          height: `${GANTT_LANE_HEIGHT_PX}px`,
-                        }}
-                        className={`absolute pointer-events-auto rounded-md shadow-xs p-1.5 cursor-pointer transition-colors duration-150 flex items-center justify-between text-left text-xs font-semibold overflow-hidden group ${colors.bg} ${colors.border} ${colors.text}`}
-                        title={`OR ${sch.orNumber}${prodNo ? ` (${prodNo})` : ''} - ${sch.style} | Target: ${formatPpicNumber(sch.target)} | ${sch.productionDate} s/d ${sch.finishDate}`}
-                      >
-                        <div className="flex items-center gap-1.5 truncate">
-                          <span className="font-mono font-bold truncate">
-                            OR {sch.orNumber}
-                          </span>
-                          {prodNo && (
-                            <span className="opacity-85 text-[10px] font-mono truncate hidden lg:inline">
-                              [{prodNo}]
-                            </span>
-                          )}
-                          <span className="opacity-80 text-[11px] truncate hidden md:inline">
-                            · {sch.style}
-                          </span>
-                        </div>
-
-                        <div className="flex items-center gap-1 shrink-0 ml-1">
-                          {sch.worksheets && sch.worksheets.length > 0 && (
-                            <span
-                              className="text-[10px] bg-white/25 px-1 py-0.2 rounded flex items-center gap-0.5 font-bold"
-                              title={`${sch.worksheets.length} file Excel terlampir`}
-                            >
-                              <Paperclip className="w-2.5 h-2.5" />
-                              <span>{sch.worksheets.length}</span>
-                            </span>
-                          )}
-                          <span className={`text-[10px] font-mono px-1 py-0.2 rounded font-bold ${colors.badge}`}>
-                            {formatPpicNumber(sch.target)}
-                          </span>
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
-              </div>
+                })
+              )}
             </div>
           </div>
         </div>
@@ -1608,8 +1663,8 @@ export const ProductionScheduleView: React.FC = () => {
 
             {/* Modal Body */}
             <div className="p-5 space-y-4">
-              {/* Primary Schedule Info Grid (NO Line Produksi, NO Delivery Date) */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
+              {/* Primary Schedule Info Grid */}
+              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3 text-xs">
                 <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
                   <span className="text-slate-500 block mb-0.5">Nomor OR</span>
                   <span className="text-sm font-bold font-mono text-slate-900">
@@ -1622,7 +1677,30 @@ export const ProductionScheduleView: React.FC = () => {
                     {activeDetailSchedule.worksheets?.[0]?.worksheetNo || '-'}
                   </span>
                 </div>
+                <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
+                  <span className="text-slate-500 block mb-0.5">Line Produksi</span>
+                  <span className="text-sm font-bold text-slate-900">
+                    {getDisplayProductionLineLabel(activeDetailSchedule.productionLine)}
+                  </span>
+                </div>
               </div>
+
+              {(() => {
+                const detailConflict = scheduleConflicts.get(activeDetailSchedule.id);
+                if (!detailConflict) return null;
+                return (
+                  <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-xs text-amber-900 flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                    <div>
+                      <span className="font-bold">Bentrok Jadwal pada {detailConflict.line}:</span>{' '}
+                      Tanggal pelaksanaan bertabrakan dengan{' '}
+                      {detailConflict.conflictingWith
+                        .map((c) => `OR ${c.orNumber} (${c.productionDate} s/d ${c.finishDate})`)
+                        .join(', ')}.
+                    </div>
+                  </div>
+                );
+              })()}
 
               <div className="p-3 bg-slate-50 rounded-lg border border-slate-100 text-xs">
                 <span className="text-slate-500 block mb-0.5">Style</span>
@@ -2243,7 +2321,7 @@ export const ProductionScheduleView: React.FC = () => {
                             </div>
                           )}
 
-                          {/* Extracted Info + Manual Production Start/Finish Dates */}
+                          {/* Extracted Info + Optional Line Produksi & Manual Production Start/Finish Dates */}
                           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5 p-3 bg-slate-50 border border-slate-200 rounded-lg text-[11px]">
                             <div>
                               <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
@@ -2350,6 +2428,21 @@ export const ProductionScheduleView: React.FC = () => {
                                   handleUpdateExcelField(activeExcel.id, { finishDate: e.target.value })
                                 }
                                 className="w-full px-2 py-1 text-xs font-mono rounded border border-slate-300 bg-white"
+                              />
+                            </div>
+                            <div className="sm:col-span-2 lg:col-span-3">
+                              <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
+                                Line Produksi (Opsional)
+                              </label>
+                              <input
+                                type="text"
+                                list="ppic-existing-lines"
+                                value={activeExcel.productionLine || ''}
+                                onChange={(e) =>
+                                  handleUpdateExcelField(activeExcel.id, { productionLine: e.target.value })
+                                }
+                                placeholder="Kosongkan jika belum ditentukan, atau pilih/ketik nama Line (misal: Line 1)"
+                                className="w-full px-2 py-1 text-xs rounded border border-slate-300 bg-white"
                               />
                             </div>
                           </div>
@@ -2564,7 +2657,21 @@ export const ProductionScheduleView: React.FC = () => {
                   </div>
 
                   <div>
-                    <label className="block text-xs font-semibold text-slate-700 mb-1">5. Target Produksi *</label>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      5. Line Produksi (Opsional)
+                    </label>
+                    <input
+                      type="text"
+                      list="ppic-existing-lines"
+                      value={formData.productionLine}
+                      onChange={(e) => setFormData({ ...formData, productionLine: e.target.value })}
+                      placeholder="Kosongkan jika belum ditentukan, atau pilih/ketik nama Line"
+                      className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">6. Target Produksi *</label>
                     <input
                       type="number"
                       min="1"
@@ -2580,6 +2687,12 @@ export const ProductionScheduleView: React.FC = () => {
                   </div>
                 </div>
               )}
+
+              <datalist id="ppic-existing-lines">
+                {existingProductionLines.map((line) => (
+                  <option key={line} value={line} />
+                ))}
+              </datalist>
 
               {/* Action Buttons */}
               <div className="pt-3 border-t border-slate-200 flex items-center justify-end gap-2">

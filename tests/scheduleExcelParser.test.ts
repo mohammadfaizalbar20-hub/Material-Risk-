@@ -488,3 +488,153 @@ test('12. Supabase DB mapper & Atomic Snapshot Sync RPC payload preserve workshe
     assert.equal(rpcPayload.payload.p_worksheets_snapshot[0].materials[0].unit, 'CNS');
   }
 });
+
+test('13. Recognizes Odoo UoM column aliases, hidden zero-width chars, leading title rows, ignores Routing, and never defaults missing UoM column', () => {
+  // Case A: Odoo exports Raw Materials/Unit of Measure directly on stock.move (plus Routing column which must be ignored)
+  const aoaWithTitleAndAlias = [
+    ['MRP PRODUCTION EXPORT', null, null],
+    [],
+    [
+      'Source\u200B',
+      'Reference',
+      'Style List/Display Name',
+      'Quantity To Produce',
+      'Routing',
+      'Raw Materials/Product/Internal Reference',
+      'Raw Materials/Product/Display Name',
+      'Raw Materials/Unit of Measure',
+      'Raw Materials/Initial Demand',
+    ],
+    [
+      'OR/2026/08/1090',
+      'WH/MO/22810',
+      'OUTDOOR PARKA',
+      900,
+      'Routing Line A',
+      'ZIP-88',
+      'Resleting YKK',
+      'Gros',
+      12.5,
+    ],
+  ];
+  const wsA = XLSX.utils.aoa_to_sheet(aoaWithTitleAndAlias);
+  const wbA = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wbA, wsA, 'Sheet1');
+  const bufA = XLSX.write(wbA, { type: 'array', bookType: 'biff8' }) as Uint8Array;
+
+  const parsedA = parseScheduleExcelBuffer(bufA, 'odoo_uom_alias.xls');
+  assert.equal(parsedA.orNumber, '1090');
+  assert.equal(parsedA.productionNumber, 'WH/MO/22810');
+  assert.equal(parsedA.style, 'OUTDOOR PARKA');
+  assert.equal(parsedA.target, 900);
+  assert.equal(parsedA.materials[0].unit, 'Gros');
+  assert.equal(parsedA.materials[0].total, 12.5);
+
+  // Case B: Raw Materials/Product/Unit of Measure/Display Name
+  const bufB = createExcelBufferFromRows([
+    {
+      Source: 'OR/2026/08/1091',
+      Reference: 'WH/MO/22811',
+      'Style List/Display Name': 'CARGO PANT',
+      'Quantity To Produce': 500,
+      'Raw Materials/Product/Internal Reference': 'BTN-10',
+      'Raw Materials/Product/Display Name': 'Kancing Logam',
+      'Raw Materials/Product/Unit of Measure/Display Name': 'Pcs',
+      'Raw Materials/Initial Demand': 1500,
+    },
+  ]);
+  const parsedB = parseScheduleExcelBuffer(bufB, 'odoo_uom_display_name.xlsx');
+  assert.equal(parsedB.materials[0].unit, 'Pcs');
+
+  // Case C: Missing UoM column must still fail validation loudly (never default to Kg)
+  const bufMissing = createExcelBufferFromRows([
+    {
+      Source: 'OR/2026/08/1092',
+      Reference: 'WH/MO/22812',
+      'Style List/Display Name': 'INVALID FILE',
+      'Quantity To Produce': 100,
+      'Raw Materials/Product/Internal Reference': 'MAT-1',
+      'Raw Materials/Product/Display Name': 'Sample Material',
+      'Raw Materials/Initial Demand': 50,
+    },
+  ]);
+  assert.throws(
+    () => parseScheduleExcelBuffer(bufMissing, 'missing_uom.xlsx'),
+    /Kolom wajib tidak ditemukan: Raw Materials\/Product\/Unit of Measure/
+  );
+});
+
+test('14. matchMaterialsWithMasterData does NOT merge/sum duplicate Master Data material codes with differing readiness', () => {
+  const uploadHistory: UploadHistoryItem[] = [
+    {
+      id: 'upl-dup-latest',
+      orNumber: '1044',
+      style: 'JACKET MULTI-TRIM',
+      fileName: 'master_1044.xlsx',
+      updateDate: '2026-07-10',
+      uploadTime: '10:00:00 WIB',
+      rowCount: 2,
+      status: 'Sukses',
+      createdAt: '2026-07-10T03:00:00.000Z',
+    },
+  ];
+
+  // Two Master Data rows with identical code TRM-01 but DIFFERENT Kebutuhan/Diterima/Status:
+  // Row 1: Kebutuhan 500, Diterima 500 -> READY
+  // Row 2: Kebutuhan 300, Diterima 100 -> BELUM READY
+  // Previous bug summed them (800 req vs 600 rec) and marked BOTH BELUM READY with receivedQty=600!
+  const masterReqs: MaterialItemRequirement[] = [
+    {
+      id: 'req-dup-1',
+      uploadId: 'upl-dup-latest',
+      orNumber: '1044',
+      style: 'JACKET MULTI-TRIM',
+      materialCode: 'TRM-01',
+      materialName: 'Trim Ribbon Hitam',
+      category: 'Auxiliary',
+      unit: 'Yard',
+      requiredQty: 500,
+      receivedQty: 500,
+      unitPrice: 0,
+      updateDate: '2026-07-10',
+      createdAt: '2026-07-10T03:00:00.000Z',
+    },
+    {
+      id: 'req-dup-2',
+      uploadId: 'upl-dup-latest',
+      orNumber: '1044',
+      style: 'JACKET MULTI-TRIM',
+      materialCode: 'TRM-01',
+      materialName: 'Trim Ribbon Hitam',
+      category: 'Auxiliary',
+      unit: 'Yard',
+      requiredQty: 300,
+      receivedQty: 100,
+      unitPrice: 0,
+      updateDate: '2026-07-10',
+      createdAt: '2026-07-10T03:00:00.000Z',
+    },
+  ];
+
+  const matched = matchMaterialsWithMasterData(
+    [
+      { materialCode: 'TRM-01', materialName: 'Trim Ribbon Hitam', unit: 'Yard', total: 500 },
+      { materialCode: 'TRM-01', materialName: 'Trim Ribbon Hitam', unit: 'Yard', total: 300 },
+      { materialCode: 'TRM-01', materialName: 'Trim Ribbon Hitam (Extra)', unit: 'Yard', total: 50 },
+    ],
+    '1044',
+    masterReqs,
+    uploadHistory
+  );
+
+  assert.equal(matched.length, 3);
+  assert.equal(matched[0].receivedQty, 500);
+  assert.equal(matched[0].status, 'READY');
+  assert.equal(matched[1].receivedQty, 100);
+  assert.equal(matched[1].status, 'BELUM READY');
+  // 3rd duplicate Schedule row has no remaining Master Data candidate -> must stay null ('-') rather than double-counting!
+  assert.equal(matched[2].receivedQty, null);
+  assert.equal(matched[2].status, null);
+  assert.equal(matched[2].isFoundInMasterData, false);
+});
+

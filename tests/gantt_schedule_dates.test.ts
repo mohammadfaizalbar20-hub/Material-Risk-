@@ -7,9 +7,11 @@ import {
   doesScheduleOverlapMonth,
   getDaysInCalendarMonth,
   getGanttRowHeightPx,
+  groupSchedulesForGanttBoard,
   isFinishBeforeStart,
   layoutGanttLineSchedules,
   parseCalendarDateParts,
+  UNASSIGNED_PRODUCTION_LINE_LABEL,
 } from '../src/utils/ganttScheduleUtils';
 import { getIndonesianHolidayInfo } from '../src/utils/indonesianHolidays';
 import { mapDbScheduleToModel, mapModelToDbSchedule } from '../src/lib/supabase';
@@ -459,3 +461,109 @@ test('Lane Case 6: Production line row height scales strictly with actual laneCo
   assert.ok(twoLanes.rowHeightPx < threeLanes.rowHeightPx);
 });
 
+test('Line Grouping: groupSchedulesForGanttBoard groups per Line Produksi, sorts naturally, packs lanes per Line, and isolates unassigned into Belum Ditentukan', () => {
+  const schedules: ProductionSchedule[] = [
+    {
+      id: 'l10-1',
+      orNumber: 'OR-L10',
+      style: 'Style L10',
+      productionLine: 'Line 10',
+      productionDate: '2026-11-02',
+      finishDate: '2026-11-08',
+      target: 500,
+    },
+    {
+      id: 'l1-1',
+      orNumber: 'OR-L1A',
+      style: 'Style L1A',
+      productionLine: 'Line 1',
+      productionDate: '2026-11-01',
+      finishDate: '2026-11-05',
+      target: 1000,
+    },
+    {
+      id: 'l1-2',
+      orNumber: 'OR-L1B',
+      style: 'Style L1B',
+      productionLine: 'Line 1',
+      productionDate: '2026-11-04', // Overlaps OR-L1A on Line 1 -> lane 1
+      finishDate: '2026-11-09',
+      target: 1000,
+    },
+    {
+      id: 'l1-3',
+      orNumber: 'OR-L1C',
+      style: 'Style L1C',
+      productionLine: 'Line 1',
+      productionDate: '2026-11-10', // Non-overlapping after 01-05 -> reuses lane 0
+      finishDate: '2026-11-15',
+      target: 1000,
+    },
+    {
+      id: 'l3-1',
+      orNumber: 'OR-L3',
+      style: 'Style L3',
+      productionLine: 'Line 3',
+      productionDate: '2026-11-03',
+      finishDate: '2026-11-12',
+      target: 700,
+    },
+    {
+      id: 'un-1',
+      orNumber: 'OR-EXCEL-1',
+      style: 'Style Excel 1',
+      productionLine: '',
+      productionDate: '2026-11-01',
+      finishDate: '2026-11-10',
+      target: 800,
+    },
+    {
+      id: 'un-2',
+      orNumber: 'OR-LEGACY',
+      style: 'Style Legacy',
+      productionLine: 'Produksi', // Legacy placeholder normalized into unassigned bucket
+      productionDate: '2026-11-11',
+      finishDate: '2026-11-20',
+      target: 600,
+    },
+  ];
+
+  const groups = groupSchedulesForGanttBoard(schedules, {
+    year: 2026,
+    month0: 10,
+    daysInMonth: 30,
+  });
+
+  // Natural sort: Line 1, Line 3, Line 10, then Belum Ditentukan
+  assert.deepEqual(
+    groups.map((g) => g.lineLabel),
+    ['Line 1', 'Line 3', 'Line 10', UNASSIGNED_PRODUCTION_LINE_LABEL]
+  );
+
+  // Line 1 has 2 lanes (L1A+L1C share lane 0, L1B on lane 1)
+  assert.equal(groups[0].layout.laneCount, 2);
+  assert.deepEqual(
+    groups[0].layout.items.map((i) => ({ or: i.schedule.orNumber, lane: i.laneIndex })),
+    [
+      { or: 'OR-L1A', lane: 0 },
+      { or: 'OR-L1B', lane: 1 },
+      { or: 'OR-L1C', lane: 0 },
+    ]
+  );
+
+  // Line 3 & Line 10 each have 1 lane
+  assert.equal(groups[1].layout.laneCount, 1);
+  assert.equal(groups[2].layout.laneCount, 1);
+
+  // Unassigned schedules share lane 0 because Nov 1-10 and Nov 11-20 do not overlap
+  assert.equal(groups[3].isUnassigned, true);
+  assert.equal(groups[3].layout.laneCount, 1);
+  assert.equal(groups[3].layout.items.length, 2);
+
+  // When all schedules have real lines, Belum Ditentukan row is omitted
+  const onlyAssigned = groupSchedulesForGanttBoard(
+    schedules.filter((s) => s.id.startsWith('l')),
+    { year: 2026, month0: 10, daysInMonth: 30 }
+  );
+  assert.equal(onlyAssigned.some((g) => g.isUnassigned), false);
+});

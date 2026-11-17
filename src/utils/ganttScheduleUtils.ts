@@ -298,3 +298,94 @@ export function layoutGanttLineSchedules<
   };
 }
 
+export const UNASSIGNED_PRODUCTION_LINE_LABEL = 'Belum Ditentukan';
+const LEGACY_PLACEHOLDER_LINES = new Set(['produksi', '-', 'belum ditentukan']);
+
+/**
+ * Returns true if the productionLine is blank or a legacy placeholder ('Produksi', '-').
+ */
+export function isUnassignedProductionLine(line: string | null | undefined): boolean {
+  const trimmed = String(line || '').trim();
+  if (!trimmed) return true;
+  return LEGACY_PLACEHOLDER_LINES.has(trimmed.toLowerCase());
+}
+
+/**
+ * Returns the trimmed real Production Line (e.g. 'Line 1'), or '' if unassigned / legacy 'Produksi'.
+ */
+export function normalizeAssignedProductionLine(line: string | null | undefined): string {
+  const trimmed = String(line || '').trim();
+  if (!trimmed) return '';
+  if (LEGACY_PLACEHOLDER_LINES.has(trimmed.toLowerCase())) return '';
+  return trimmed;
+}
+
+export function getDisplayProductionLineLabel(line: string | null | undefined): string {
+  return normalizeAssignedProductionLine(line) || UNASSIGNED_PRODUCTION_LINE_LABEL;
+}
+
+export interface GanttLineGroup<
+  T extends Pick<ProductionSchedule, 'id' | 'productionDate' | 'finishDate' | 'productionLine'> = ProductionSchedule
+> {
+  lineKey: string;
+  lineLabel: string;
+  isUnassigned: boolean;
+  schedules: T[];
+  layout: GanttLineLayout<T>;
+}
+
+/**
+ * Groups schedules by their assigned Production Line and computes non-overlapping lane layouts
+ * independently per Line row for the viewed calendar month.
+ * Unassigned schedules (blank or legacy 'Produksi') are placed in a final 'Belum Ditentukan' row.
+ */
+export function groupSchedulesForGanttBoard<
+  T extends Pick<ProductionSchedule, 'id' | 'productionDate' | 'finishDate' | 'productionLine'>
+>(
+  schedules: T[],
+  params: {
+    year: number;
+    month0: number;
+    daysInMonth?: number;
+  }
+): Array<GanttLineGroup<T>> {
+  const buckets = new Map<
+    string,
+    { lineLabel: string; isUnassigned: boolean; schedules: T[] }
+  >();
+
+  for (const sch of schedules) {
+    const assigned = normalizeAssignedProductionLine(sch.productionLine);
+    const isUnassigned = assigned.length === 0;
+    const key = isUnassigned ? '__UNASSIGNED__' : assigned.toLowerCase();
+    const label = isUnassigned ? UNASSIGNED_PRODUCTION_LINE_LABEL : assigned;
+
+    const existing = buckets.get(key);
+    if (existing) {
+      existing.schedules.push(sch);
+    } else {
+      buckets.set(key, {
+        lineLabel: label,
+        isUnassigned,
+        schedules: [sch],
+      });
+    }
+  }
+
+  const groups: Array<GanttLineGroup<T>> = Array.from(buckets.entries()).map(([lineKey, bucket]) => ({
+    lineKey,
+    lineLabel: bucket.lineLabel,
+    isUnassigned: bucket.isUnassigned,
+    schedules: bucket.schedules,
+    layout: layoutGanttLineSchedules(bucket.schedules, params),
+  }));
+
+  groups.sort((a, b) => {
+    if (a.isUnassigned !== b.isUnassigned) {
+      return a.isUnassigned ? 1 : -1;
+    }
+    return a.lineLabel.localeCompare(b.lineLabel, 'id', { numeric: true, sensitivity: 'base' });
+  });
+
+  return groups;
+}

@@ -1977,15 +1977,44 @@ export function findLatestUploadForOr(
   };
 }
 
+function normalizeMatchAttribute(value: unknown): string {
+  return String(value ?? '')
+    .replace(/\u00A0/g, ' ')
+    .trim()
+    .toLowerCase()
+    .replace(/\s+/g, ' ');
+}
+
+function roundFloatPrecision(num: number): number {
+  if (!Number.isFinite(num)) return 0;
+  const rounded = Math.round(num * 1e9) / 1e9;
+  return Object.is(rounded, -0) ? 0 : rounded;
+}
+
+function getMasterCandidateReadiness(mr: MaterialItemRequirement): {
+  receivedQty: number;
+  status: 'READY' | 'BELUM READY';
+} {
+  const receivedQty = roundFloatPrecision(Number(mr.receivedQty ?? 0));
+  const requiredQty = roundFloatPrecision(Number(mr.requiredQty ?? 0));
+  const diff = roundFloatPrecision(receivedQty - requiredQty);
+  return {
+    receivedQty,
+    status: diff >= 0 ? 'READY' : 'BELUM READY',
+  };
+}
+
 /**
- * Matches extracted PDF materials against ONLY the latest Excel upload for the PDF's No. OR.
+ * Matches extracted Schedule materials against ONLY the latest Excel upload for the schedule's No. OR.
  * Rules:
- * - Match strictly on same No. OR + Kode Material from the single latest Excel upload for that OR
+ * - Match strictly on same No. OR + Kode Material from the single latest Master Data Excel upload for that OR
  * - Do NOT fall back to older uploads for the same OR
  * - Do NOT take data from other ORs
- * - If found: receivedQty = received from latest upload, status = 'READY' | 'BELUM READY'
- * - If not found: receivedQty = null (display '-'), status = null (display '-')
- * - Preserves order and duplicate materials in PDF
+ * - NEVER arbitrarily sum/merge multiple Master Data rows sharing the same material code
+ * - Preserves order and keeps duplicate Schedule material rows separate
+ * - When Master Data contains multiple rows for the same material code, pairs Schedule rows 1-to-1
+ *   against distinct Master Data rows (scoring exact Kebutuhan, Nama Material, Unit) without double-counting
+ *   a consumed row; leaves excess unmatched Schedule rows as null ('-')
  */
 export function matchMaterialsWithMasterData(
   materials: ExtractedWorksheetMaterial[],
@@ -2006,31 +2035,105 @@ export function matchMaterialsWithMasterData(
   const matchedUploadTime = latestUpload?.uploadTime || null;
   const matchedUploadCreatedAt = latestUpload?.createdAt || null;
 
-  // Map ONLY rows from the latest upload by material code (case-insensitive)
-  const masterByCode = new Map<string, { totalReceived: number; totalRequired: number; isReady: boolean }>();
+  // Group rows from ONLY the latest upload for this OR by material code without summing/merging
+  const candidatesByCode = new Map<string, MaterialItemRequirement[]>();
   for (const mr of latestOrRecords) {
     const key = mr.materialCode.trim().toUpperCase();
-    const existing = masterByCode.get(key) || { totalReceived: 0, totalRequired: 0, isReady: false };
-    existing.totalReceived += mr.receivedQty || 0;
-    existing.totalRequired += mr.requiredQty || 0;
-    existing.isReady = existing.totalReceived >= existing.totalRequired;
-    masterByCode.set(key, existing);
+    if (!key) continue;
+    const list = candidatesByCode.get(key) || [];
+    list.push(mr);
+    candidatesByCode.set(key, list);
+  }
+
+  // Group schedule row indices by material code so multi-candidate codes can be paired 1-to-1
+  const schedIndicesByCode = new Map<string, number[]>();
+  materials.forEach((item, idx) => {
+    const key = item.materialCode.trim().toUpperCase();
+    if (!key) return;
+    const list = schedIndicesByCode.get(key) || [];
+    list.push(idx);
+    schedIndicesByCode.set(key, list);
+  });
+
+  const assignedMasterBySchedIdx = new Map<number, MaterialItemRequirement>();
+
+  for (const [key, schedIndices] of schedIndicesByCode.entries()) {
+    const candidates = candidatesByCode.get(key);
+    if (!candidates || candidates.length === 0) continue;
+
+    if (candidates.length === 1) {
+      // Single Master Data row for this code (no duplicate ambiguity to sum/merge)
+      for (const sIdx of schedIndices) {
+        assignedMasterBySchedIdx.set(sIdx, candidates[0]);
+      }
+      continue;
+    }
+
+    // Multiple Master Data rows exist with the exact same material code.
+    // Pair Schedule rows 1-to-1 with distinct Master Data candidates without merging/summing.
+    const scoredPairs: Array<{
+      sIdx: number;
+      cIdx: number;
+      score: number;
+    }> = [];
+
+    for (const sIdx of schedIndices) {
+      const item = materials[sIdx];
+      const itemName = normalizeMatchAttribute(item.materialName);
+      const itemUnit = normalizeMatchAttribute(item.unit);
+
+      candidates.forEach((cand, cIdx) => {
+        let score = 0;
+        if (
+          item.total !== null &&
+          item.total !== undefined &&
+          Number.isFinite(item.total) &&
+          Math.abs(item.total - Number(cand.requiredQty ?? 0)) <= 1e-6
+        ) {
+          score += 8;
+        }
+        const candName = normalizeMatchAttribute(cand.materialName);
+        if (itemName && candName && itemName === candName) {
+          score += 4;
+        }
+        const candUnit = normalizeMatchAttribute(cand.unit);
+        if (itemUnit && candUnit && itemUnit === candUnit) {
+          score += 2;
+        }
+        scoredPairs.push({ sIdx, cIdx, score });
+      });
+    }
+
+    scoredPairs.sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      if (a.sIdx !== b.sIdx) return a.sIdx - b.sIdx;
+      return a.cIdx - b.cIdx;
+    });
+
+    const usedSched = new Set<number>();
+    const usedCand = new Set<number>();
+    for (const pair of scoredPairs) {
+      if (usedSched.has(pair.sIdx) || usedCand.has(pair.cIdx)) continue;
+      usedSched.add(pair.sIdx);
+      usedCand.add(pair.cIdx);
+      assignedMasterBySchedIdx.set(pair.sIdx, candidates[pair.cIdx]);
+    }
   }
 
   return materials.map((item, idx) => {
-    const key = item.materialCode.trim().toUpperCase();
-    const matchedMaster = masterByCode.get(key);
+    const matchedCandidate = assignedMasterBySchedIdx.get(idx);
     const existingId = (item as WorksheetMaterialItem).id || `wsm-${idx + 1}`;
 
-    if (matchedMaster) {
+    if (matchedCandidate) {
+      const { receivedQty, status } = getMasterCandidateReadiness(matchedCandidate);
       return {
         materialCode: item.materialCode,
         materialName: item.materialName,
         unit: item.unit,
         total: item.total,
         id: existingId,
-        receivedQty: matchedMaster.totalReceived,
-        status: matchedMaster.isReady ? 'READY' : 'BELUM READY',
+        receivedQty,
+        status,
         isFoundInMasterData: true,
         matchedUploadId,
         matchedUploadDate,
@@ -2040,9 +2143,8 @@ export function matchMaterialsWithMasterData(
       };
     }
 
-    // Material NOT found in the latest upload for this OR:
+    // Material NOT found in the latest upload for this OR (or excess duplicate row beyond Master Data rows):
     // Diterima: null (display '-'), Status: null (display '-')
-    // Do NOT fall back to older uploads and do NOT automatically mark as Belum Ready!
     return {
       materialCode: item.materialCode,
       materialName: item.materialName,

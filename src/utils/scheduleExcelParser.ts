@@ -36,21 +36,128 @@ export interface ExtractedScheduleExcel {
 const SCHEDULE_HEADER_TARGETS = {
   source: ['source'],
   reference: ['reference'],
-  style: ['style list/display name'],
+  style: ['style list/display name', 'style list/name', 'style list'],
   target: ['quantity to produce'],
-  materialCode: ['raw materials/product/internal reference'],
-  materialName: ['raw materials/product/display name'],
-  unit: ['raw materials/product/unit of measure'],
+  materialCode: [
+    'raw materials/product/internal reference',
+    'raw materials/product/default code',
+  ],
+  materialName: [
+    'raw materials/product/display name',
+    'raw materials/product/name',
+    'raw materials/product',
+  ],
+  unit: [
+    'raw materials/product/unit of measure',
+    'raw materials/product/unit of measure/display name',
+    'raw materials/product/unit of measure/name',
+    'raw materials/product/product unit of measure',
+    'raw materials/product/product unit of measure/display name',
+    'raw materials/product/uom',
+    'raw materials/product/uom/display name',
+    'raw materials/product/purchase uom',
+    'raw materials/product/purchase uom/display name',
+    'raw materials/unit of measure',
+    'raw materials/unit of measure/display name',
+    'raw materials/unit of measure/name',
+    'raw materials/product unit of measure',
+    'raw materials/product unit of measure/display name',
+    'raw materials/uom',
+    'raw materials/uom/display name',
+  ],
   initialDemand: ['raw materials/initial demand'],
 } as const;
 
+const ALL_RECOGNIZED_SCHEDULE_HEADERS = new Set<string>(
+  Object.values(SCHEDULE_HEADER_TARGETS).flatMap((aliases) => aliases)
+);
+
 function normalizeScheduleHeader(header: string): string {
   return String(header || '')
+    .replace(/[\u200B-\u200D\uFEFF\u00AD]/g, '')
     .replace(/\u00A0/g, ' ')
     .trim()
     .toLowerCase()
     .replace(/\s*\/\s*/g, '/')
     .replace(/\s+/g, ' ');
+}
+
+function countMatchedScheduleHeaders(headers: string[]): number {
+  const matchedFields = new Set<string>();
+  for (const h of headers) {
+    const norm = normalizeScheduleHeader(h);
+    if (!norm || !ALL_RECOGNIZED_SCHEDULE_HEADERS.has(norm)) continue;
+    for (const [field, targets] of Object.entries(SCHEDULE_HEADER_TARGETS)) {
+      if ((targets as readonly string[]).includes(norm)) {
+        matchedFields.add(field);
+      }
+    }
+  }
+  return matchedFields.size;
+}
+
+/**
+ * Extracts row objects from a worksheet.
+ * Uses standard row-0 headers when at least 3 expected Production Schedule headers are present;
+ * otherwise scans the top 25 rows for an Odoo/exported header row preceded by title/blank rows.
+ */
+function extractSheetRowsWithHeaderScan(sheet: XLSX.WorkSheet): Record<string, unknown>[] {
+  const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(
+    sheet,
+    EXCEL_SHEET_TO_JSON_OPTIONS
+  );
+  const nonEmptyDefault = filterNonEmptyExcelRows(rawRows);
+  const defaultHeaders = Array.from(
+    new Set(nonEmptyDefault.flatMap((row) => Object.keys(row || {})))
+  );
+  if (countMatchedScheduleHeaders(defaultHeaders) >= 3) {
+    return nonEmptyDefault;
+  }
+
+  const matrix = XLSX.utils.sheet_to_json<unknown[]>(sheet, {
+    header: 1,
+    raw: true,
+    defval: null,
+    blankrows: false,
+  });
+
+  let bestHeaderIdx = -1;
+  let bestScore = 0;
+  const maxScan = Math.min(25, matrix.length);
+  for (let r = 0; r < maxScan; r++) {
+    const rowCells = Array.isArray(matrix[r]) ? matrix[r] : [];
+    const candidateHeaders = rowCells.map((c) => (isExcelCellEmpty(c) ? '' : String(c).trim()));
+    const score = countMatchedScheduleHeaders(candidateHeaders);
+    if (score > bestScore) {
+      bestScore = score;
+      bestHeaderIdx = r;
+    }
+  }
+
+  if (bestHeaderIdx === -1 || bestScore < 3) {
+    return nonEmptyDefault;
+  }
+
+  const headerCells = Array.isArray(matrix[bestHeaderIdx]) ? matrix[bestHeaderIdx] : [];
+  const usedCounts = new Map<string, number>();
+  const resolvedHeaders = headerCells.map((cell, idx) => {
+    const base = isExcelCellEmpty(cell) ? `__EMPTY_${idx}` : String(cell).trim();
+    const seen = usedCounts.get(base) || 0;
+    usedCounts.set(base, seen + 1);
+    return seen === 0 ? base : `${base}_${seen}`;
+  });
+
+  const reconstructed: Record<string, unknown>[] = [];
+  for (let r = bestHeaderIdx + 1; r < matrix.length; r++) {
+    const rowCells = Array.isArray(matrix[r]) ? matrix[r] : [];
+    const obj: Record<string, unknown> = {};
+    for (let c = 0; c < resolvedHeaders.length; c++) {
+      obj[resolvedHeaders[c]] = c < rowCells.length ? rowCells[c] : null;
+    }
+    reconstructed.push(obj);
+  }
+
+  return filterNonEmptyExcelRows(reconstructed);
 }
 
 /**
@@ -137,7 +244,7 @@ function normalizeTextCell(val: unknown): string {
  * - Production header fields (Source, Reference, Style List/Display Name, Quantity To Produce)
  *   and the first material row may coexist on row 0; subsequent material rows inherit the same
  *   production even when header columns are blank.
- * - Ignores Deadline Start, Deadline End, Delivery Date, Line Produksi, Quantity Done / Done.
+ * - Ignores Deadline Start, Deadline End, Delivery Date, Line Produksi / Routing, Quantity Done / Done.
  * - Preserves duplicate material codes as separate rows, exact verbatim Unit of Measure,
  *   and exact unrounded decimals for Target Produksi and Initial Demand (Kebutuhan).
  */
@@ -179,8 +286,11 @@ export function parseScheduleExcelRows(
   if (!colMap.initialDemand) missingColumns.push('Raw Materials/Initial Demand');
 
   if (missingColumns.length > 0) {
+    const readableHeaders = allHeaders.filter((h) => !/^__EMPTY/.test(h));
     throw new Error(
-      `Format kolom Excel "${fileName}" tidak sesuai Production Schedule. Kolom wajib tidak ditemukan: ${missingColumns.join(', ')}.`
+      `Format kolom Excel "${fileName}" tidak sesuai Production Schedule. Kolom wajib tidak ditemukan: ${missingColumns.join(', ')}.${
+        readableHeaders.length > 0 ? ` Header terbaca: [${readableHeaders.join(', ')}].` : ''
+      }`
     );
   }
 
@@ -338,11 +448,7 @@ export function parseScheduleExcelBuffer(
   for (const sheetName of workbook.SheetNames) {
     const sheet = workbook.Sheets[sheetName];
     if (!sheet) continue;
-    const rawRows = XLSX.utils.sheet_to_json<Record<string, unknown>>(
-      sheet,
-      EXCEL_SHEET_TO_JSON_OPTIONS
-    );
-    const nonEmpty = filterNonEmptyExcelRows(rawRows);
+    const nonEmpty = extractSheetRowsWithHeaderScan(sheet);
     if (nonEmpty.length > 0) {
       return parseScheduleExcelRows(nonEmpty, fileName);
     }

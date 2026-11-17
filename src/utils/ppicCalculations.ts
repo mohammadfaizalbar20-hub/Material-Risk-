@@ -8,6 +8,7 @@ import {
   ScheduleConflict,
 } from '../types/ppic';
 import { cleanFloatPrecision, formatPpicNumber } from './excelMaterialParser';
+import { doDateRangesOverlap, normalizeAssignedProductionLine } from './ganttScheduleUtils';
 
 /**
  * A. Rasio Kekurangan:
@@ -100,29 +101,28 @@ export function detectScheduleConflicts(schedules: ProductionSchedule[]): Map<st
 
   for (let i = 0; i < schedules.length; i++) {
     const s1 = schedules[i];
+    const line1 = normalizeAssignedProductionLine(s1.productionLine);
+    if (!line1) {
+      // Unassigned schedules or legacy placeholder ('Produksi') must never generate false line collisions
+      continue;
+    }
+
     const conflictingWith: ScheduleConflict['conflictingWith'] = [];
 
     for (let j = 0; j < schedules.length; j++) {
       if (i === j) continue;
       const s2 = schedules[j];
+      const line2 = normalizeAssignedProductionLine(s2.productionLine);
+      if (!line2 || line1.toLowerCase() !== line2.toLowerCase()) continue;
 
-      if (s1.productionLine === s2.productionLine) {
-        // Check date overlap
-        const start1 = new Date(s1.productionDate).getTime();
-        const end1 = new Date(s1.finishDate).getTime();
-        const start2 = new Date(s2.productionDate).getTime();
-        const end2 = new Date(s2.finishDate).getTime();
-
-        const isOverlapping = start1 <= end2 && end1 >= start2;
-        if (isOverlapping) {
-          conflictingWith.push({
-            id: s2.id,
-            orNumber: s2.orNumber,
-            style: s2.style,
-            productionDate: s2.productionDate,
-            finishDate: s2.finishDate,
-          });
-        }
+      if (doDateRangesOverlap(s1.productionDate, s1.finishDate, s2.productionDate, s2.finishDate)) {
+        conflictingWith.push({
+          id: s2.id,
+          orNumber: s2.orNumber,
+          style: s2.style,
+          productionDate: s2.productionDate,
+          finishDate: s2.finishDate,
+        });
       }
     }
 
@@ -130,7 +130,7 @@ export function detectScheduleConflicts(schedules: ProductionSchedule[]): Map<st
       conflictMap.set(s1.id, {
         scheduleId: s1.id,
         orNumber: s1.orNumber,
-        line: s1.productionLine,
+        line: line1,
         productionDate: s1.productionDate,
         finishDate: s1.finishDate,
         conflictingWith,
@@ -251,7 +251,7 @@ export function assessAllMaterialRisks(
         shortageScore,
         productionDate: sch.productionDate,
         finishDate: sch.finishDate,
-        productionLine: sch.productionLine,
+        productionLine: normalizeAssignedProductionLine(sch.productionLine),
         daysToProduction: days,
         urgencyScore,
         riskScore,
