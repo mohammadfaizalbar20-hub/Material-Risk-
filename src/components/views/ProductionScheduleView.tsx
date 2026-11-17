@@ -1,6 +1,6 @@
-import React, { useState, useMemo } from 'react';
+import React, { useState, useMemo, useRef } from 'react';
 import { usePpic } from '../../context/PpicContext';
-import { ProductionSchedule, ScheduleConflict, WorksheetPdfItem, WorksheetMaterialItem } from '../../types/ppic';
+import { ProductionSchedule, WorksheetPdfItem, WorksheetMaterialItem } from '../../types/ppic';
 import {
   Calendar,
   ChevronLeft,
@@ -8,48 +8,36 @@ import {
   Plus,
   AlertTriangle,
   Info,
-  Clock,
   Layers,
   Edit2,
   Trash2,
   X,
-  Filter,
   CheckCircle,
   Eye,
-  ArrowRight,
   ShieldAlert,
   Search,
   Hash,
   Upload,
-  FileText,
+  FileSpreadsheet,
   Paperclip,
   Loader2,
   CheckCircle2,
-  FileCheck,
   FileWarning,
   RefreshCw,
-  Sparkles,
 } from 'lucide-react';
 import { getIndonesianHolidayInfo, DayHolidayInfo } from '../../utils/indonesianHolidays';
 import {
   buildWorksheetSnapshot,
-  ExtractedPdfWorksheet,
   findLatestUploadForOr,
   matchMaterialsWithMasterData,
-  parseExtractWorksheetHttpResponse,
   refreshScheduleWorksheetsSnapshot,
-  validateExtractedWorksheet,
-  WorksheetFieldWarning,
   WorksheetMaterialMatched,
 } from '../../utils/pdfWorksheetParser';
 import {
-  buildWorksheetFromFirstPageOcr,
-  isRetryableOcrError,
-  PageOcrExtraction,
-  PdfOcrProgressState,
-  validateUsableOcrWorksheet,
-} from '../../utils/pdfOcrWorkflow';
-import { openBrowserPdfSession } from '../../utils/pdfClientRenderer';
+  ExtractedScheduleExcel,
+  parseScheduleExcelFile,
+} from '../../utils/scheduleExcelParser';
+import { formatPpicNumber } from '../../utils/excelMaterialParser';
 import {
   fetchLatestUploadMaterialsForOrs,
   getSupabaseCredentials,
@@ -57,7 +45,6 @@ import {
 import { generateUuid } from '../../utils/uuid';
 import {
   doesScheduleOverlapMonth,
-  doDateRangesOverlap,
   GANTT_LANE_GAP_PX,
   GANTT_LANE_HEIGHT_PX,
   GANTT_ROW_PADDING_Y_PX,
@@ -65,107 +52,102 @@ import {
   layoutGanttLineSchedules,
 } from '../../utils/ganttScheduleUtils';
 
+interface FormExcelMaterial {
+  id: string;
+  materialCode: string;
+  materialName: string;
+  unit: string;
+  total: number | null;
+  rawTotal?: string;
+  receivedQty?: number | null;
+  status?: 'READY' | 'BELUM READY' | null;
+  isFoundInMasterData?: boolean;
+  matchedUploadId?: string | null;
+  matchedUploadDate?: string | null;
+  matchedUploadTime?: string | null;
+  matchedUploadCreatedAt?: string | null;
+  matchedAt?: string | null;
+}
+
+interface FormExcelScheduleItem {
+  id: string;
+  file?: File;
+  fileName: string;
+  status: 'parsing' | 'success' | 'error';
+  error?: string;
+  orNumber?: string;
+  rawSource?: string;
+  productionNumber?: string; // Nomor Produksi dari kolom Reference
+  style?: string;
+  target?: number | null;
+  rawTarget?: string;
+  productionDate: string; // Input manual per jadwal
+  finishDate: string; // Input manual per jadwal
+  needsReview?: boolean;
+  reviewConfirmed?: boolean;
+  reviewReasons?: string[];
+  materials?: FormExcelMaterial[];
+  matchedUploadId?: string | null;
+  matchedUploadDate?: string | null;
+  matchedUploadTime?: string | null;
+  matchedUploadCreatedAt?: string | null;
+  lastSyncedAt?: string | null;
+}
+
 export const ProductionScheduleView: React.FC = () => {
   const {
     productionSchedules,
     addProductionSchedule,
     updateProductionSchedule,
     deleteProductionSchedule,
-    scheduleConflicts,
-    orStyleRelations,
     getStyleForOr,
     saveOrStyleRelation,
     setActiveMenu,
-    selectedScheduleId,
-    setSelectedScheduleId,
     registeredOrNumbers,
-    getOrSummary,
     materialRequirements,
     uploadHistory,
   } = usePpic();
 
-  // Multi-PDF Worksheet state for Schedule Form
-  interface FormWorksheetMaterial {
-    id?: string;
-    materialCode: string;
-    materialName: string;
-    unit: string;
-    total: number | null;
-    rawTotal?: string;
-    isTotalAmbiguous?: boolean;
-    needsReview?: boolean;
-    reviewNote?: string;
-    receivedQty?: number | null;
-    status?: 'READY' | 'BELUM READY' | null;
-    isFoundInMasterData?: boolean;
-    matchedUploadId?: string | null;
-    matchedUploadDate?: string | null;
-    matchedUploadTime?: string | null;
-    matchedUploadCreatedAt?: string | null;
-    matchedAt?: string | null;
-  }
+  const [uploadedExcels, setUploadedExcels] = useState<FormExcelScheduleItem[]>([]);
+  const [selectedPreviewId, setSelectedPreviewId] = useState<string | null>(null);
+  const [isProcessingExcels, setIsProcessingExcels] = useState<boolean>(false);
+  const [replacingItemId, setReplacingItemId] = useState<string | null>(null);
+  const replaceFileInputRef = useRef<HTMLInputElement | null>(null);
 
-  interface FormPdfItem {
-    id: string;
-    file?: File;
-    fileName: string;
-    status: 'parsing' | 'success' | 'error';
-    error?: string;
-    orNumber?: string;
-    rawOrNumber?: string;
-    worksheetNo?: string;
-    style?: string;
-    target?: number | null;
-    rawTarget?: string;
-    isTargetAmbiguous?: boolean;
-    extractionMethod?: 'coordinates' | 'text' | 'gemini' | 'hybrid';
-    needsReview?: boolean;
-    reviewConfirmed?: boolean;
-    reviewReasons?: string[];
-    fieldWarnings?: WorksheetFieldWarning[];
-    materials?: FormWorksheetMaterial[];
-    matchedUploadId?: string | null;
-    matchedUploadDate?: string | null;
-    matchedUploadTime?: string | null;
-    matchedUploadCreatedAt?: string | null;
-    lastSyncedAt?: string | null;
-    ocrState?: PdfOcrProgressState;
-  }
-
-  const [uploadedPdfs, setUploadedPdfs] = useState<FormPdfItem[]>([]);
-  const [selectedPreviewPdfId, setSelectedPreviewPdfId] = useState<string | null>(null);
-  const [isProcessingPdfs, setIsProcessingPdfs] = useState<boolean>(false);
   const [detailSelectedWsId, setDetailSelectedWsId] = useState<string | null>(null);
   const [isRefreshingSnapshot, setIsRefreshingSnapshot] = useState<boolean>(false);
-  const [refreshFeedback, setRefreshFeedback] = useState<{ type: 'success' | 'info' | 'error'; message: string } | null>(null);
+  const [refreshFeedback, setRefreshFeedback] = useState<{
+    type: 'success' | 'info' | 'error';
+    message: string;
+  } | null>(null);
   const [isRefreshingFormPreview, setIsRefreshingFormPreview] = useState<boolean>(false);
 
-  // Calendar Month Navigation: Default to November 2026 (matching demo dataset) or current date
+  // Calendar Month Navigation: Default to November 2026
   const [currentYear, setCurrentYear] = useState<number>(2026);
   const [currentMonth, setCurrentMonth] = useState<number>(10); // 0-indexed: 10 = November
-  const [selectedLineFilter, setSelectedLineFilter] = useState<string>('ALL');
   const [orSearchInput, setOrSearchInput] = useState<string>('');
 
   // Modal states
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [modalMode, setModalMode] = useState<'create' | 'edit'>('create');
   const [editingScheduleId, setEditingScheduleId] = useState<string | null>(null);
+  const [editingOriginalLine, setEditingOriginalLine] = useState<string>('Produksi');
   const [activeDetailSchedule, setActiveDetailSchedule] = useState<ProductionSchedule | null>(null);
 
-  // Form State (6 mandatory fields)
+  // Manual Form State (used when creating/editing manually without uploaded Excel files)
   const [formData, setFormData] = useState<{
     orNumber: string;
+    productionNumber: string;
     productionDate: string;
     finishDate: string;
-    productionLine: string;
     style: string;
     target: number;
     status: ProductionSchedule['status'];
   }>({
     orNumber: '',
+    productionNumber: '',
     productionDate: '2026-11-05',
     finishDate: '2026-11-09',
-    productionLine: 'Line 1',
     style: '',
     target: 2500,
     status: 'Terjadwal',
@@ -177,24 +159,22 @@ export const ProductionScheduleView: React.FC = () => {
   const [isDeletingSchedule, setIsDeletingSchedule] = useState<boolean>(false);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [detailActionError, setDetailActionError] = useState<string | null>(null);
-  const [crudFeedback, setCrudFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const [crudFeedback, setCrudFeedback] = useState<{
+    type: 'success' | 'error';
+    message: string;
+  } | null>(null);
 
-  // Predefined Lines per user request: Line 1, 3, 4, 5, 6, 7
-  const defaultLines = useMemo(() => {
-    const predefined = ['Line 1', 'Line 3', 'Line 4', 'Line 5', 'Line 6', 'Line 7'];
-    const linesFromSchedules = productionSchedules.map((s) => s.productionLine).filter(Boolean);
-    const combined = Array.from(new Set([...predefined, ...linesFromSchedules])).filter((ln) => ln !== 'Line 2');
-    return combined.sort((a, b) => {
-      const numA = parseInt(a.replace(/\D/g, ''), 10) || 0;
-      const numB = parseInt(b.replace(/\D/g, ''), 10) || 0;
-      return numA - numB;
-    });
-  }, [productionSchedules]);
-
-  // Single source of truth for OR list from Upload Excel
   const availableOrList = registeredOrNumbers;
 
-  // Handle month switching
+  const getDefaultDateRange = () => {
+    const padM = String(currentMonth + 1).padStart(2, '0');
+    return {
+      start: `${currentYear}-${padM}-05`,
+      end: `${currentYear}-${padM}-09`,
+    };
+  };
+
+  // Month switching
   const handlePrevMonth = () => {
     if (currentMonth === 0) {
       setCurrentMonth(11);
@@ -215,13 +195,11 @@ export const ProductionScheduleView: React.FC = () => {
 
   const monthNames = [
     'Januari', 'Februari', 'Maret', 'April', 'Mei', 'Juni',
-    'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember'
+    'Juli', 'Agustus', 'September', 'Oktober', 'November', 'Desember',
   ];
 
-  // Days in selected month
   const daysInMonth = useMemo(() => {
-    const date = new Date(currentYear, currentMonth + 1, 0);
-    return date.getDate();
+    return new Date(currentYear, currentMonth + 1, 0).getDate();
   }, [currentYear, currentMonth]);
 
   const daysArray = useMemo(() => {
@@ -255,7 +233,6 @@ export const ProductionScheduleView: React.FC = () => {
     return days;
   }, [currentYear, currentMonth, daysInMonth]);
 
-  // Statistics of holidays in the currently viewed month
   const holidayStats = useMemo(() => {
     let sundays = 0;
     let nationalHolidays = 0;
@@ -276,16 +253,7 @@ export const ProductionScheduleView: React.FC = () => {
     };
   }, [daysArray, daysInMonth]);
 
-  // Check if a schedule has conflict
-  const getConflictForSchedule = (scheduleId: string): ScheduleConflict | undefined => {
-    return scheduleConflicts.get(scheduleId);
-  };
-
-  const conflictsList = useMemo(() => {
-    return Array.from(scheduleConflicts.values());
-  }, [scheduleConflicts]);
-
-  // Form: Auto-fill Style when OR changes
+  // Form: Auto-fill Style when manual OR changes
   const handleOrChange = (orNum: string) => {
     const clean = orNum.trim().toUpperCase();
     const matchedStyle = getStyleForOr(clean);
@@ -296,47 +264,23 @@ export const ProductionScheduleView: React.FC = () => {
     }));
   };
 
-  // Check form conflict in real-time
-  const formConflictPreview = useMemo(() => {
-    if (!formData.productionLine || !formData.productionDate || !formData.finishDate) return null;
-    if (isFinishBeforeStart(formData.productionDate, formData.finishDate)) return null;
-
-    const clashes = productionSchedules.filter((s) => {
-      if (editingScheduleId && s.id === editingScheduleId) return false;
-      if (s.productionLine !== formData.productionLine) return false;
-      return doDateRangesOverlap(
-        formData.productionDate,
-        formData.finishDate,
-        s.productionDate,
-        s.finishDate
-      );
-    });
-
-    if (clashes.length > 0) {
-      return clashes.map((c) => ({
-        orNumber: c.orNumber,
-        style: c.style,
-        dates: `${c.productionDate} s/d ${c.finishDate}`,
-      }));
-    }
-    return null;
-  }, [formData, productionSchedules, editingScheduleId]);
-
   // Open Create Modal
   const openCreateModal = () => {
+    const defaults = getDefaultDateRange();
     setModalMode('create');
     setEditingScheduleId(null);
+    setEditingOriginalLine('Produksi');
     setCreateDraftId(generateUuid());
     setIsSubmittingForm(false);
-    setUploadedPdfs([]);
-    setSelectedPreviewPdfId(null);
+    setUploadedExcels([]);
+    setSelectedPreviewId(null);
     setFormData({
-      orNumber: availableOrList[0] || 'OR-2026-001',
-      productionDate: `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-05`,
-      finishDate: `${currentYear}-${String(currentMonth + 1).padStart(2, '0')}-09`,
-      productionLine: selectedLineFilter !== 'ALL' ? selectedLineFilter : 'Line 1',
-      style: getStyleForOr(availableOrList[0] || 'OR-2026-001') || 'Casual Cotton Shirt Men Navy',
-      target: 2500,
+      orNumber: availableOrList[0] || '',
+      productionNumber: '',
+      productionDate: defaults.start,
+      finishDate: defaults.end,
+      style: availableOrList[0] ? getStyleForOr(availableOrList[0]) || '' : '',
+      target: 0,
       status: 'Terjadwal',
     });
     setFormValidationError(null);
@@ -348,33 +292,52 @@ export const ProductionScheduleView: React.FC = () => {
   const openEditModal = (sch: ProductionSchedule) => {
     setModalMode('edit');
     setEditingScheduleId(sch.id);
+    setEditingOriginalLine(sch.productionLine || 'Produksi');
     setIsSubmittingForm(false);
     if (sch.worksheets && sch.worksheets.length > 0) {
-      const existing: FormPdfItem[] = sch.worksheets.map((ws) => ({
+      const existing: FormExcelScheduleItem[] = sch.worksheets.map((ws) => ({
         id: ws.id,
         fileName: ws.fileName,
         status: 'success' as const,
         orNumber: ws.orNumber,
+        rawSource: ws.rawOrNumber,
+        productionNumber: ws.worksheetNo || '',
         style: ws.style,
         target: ws.target,
-        materials: ws.materials,
+        productionDate: sch.productionDate,
+        finishDate: sch.finishDate,
+        materials: (ws.materials || []).map((m, idx) => ({
+          id: m.id || `wsm-${idx + 1}`,
+          materialCode: m.materialCode,
+          materialName: m.materialName,
+          unit: m.unit,
+          total: m.total,
+          receivedQty: m.receivedQty ?? null,
+          status: m.status ?? null,
+          isFoundInMasterData: m.isFoundInMasterData,
+          matchedUploadId: m.matchedUploadId ?? ws.matchedUploadId ?? null,
+          matchedUploadDate: m.matchedUploadDate ?? ws.matchedUploadDate ?? null,
+          matchedUploadTime: m.matchedUploadTime ?? ws.matchedUploadTime ?? null,
+          matchedUploadCreatedAt: m.matchedUploadCreatedAt ?? ws.matchedUploadCreatedAt ?? null,
+          matchedAt: m.matchedAt ?? ws.lastSyncedAt ?? null,
+        })),
         matchedUploadId: ws.matchedUploadId ?? null,
         matchedUploadDate: ws.matchedUploadDate ?? null,
         matchedUploadTime: ws.matchedUploadTime ?? null,
         matchedUploadCreatedAt: ws.matchedUploadCreatedAt ?? null,
         lastSyncedAt: ws.lastSyncedAt ?? ws.uploadedAt ?? null,
       }));
-      setUploadedPdfs(existing);
-      setSelectedPreviewPdfId(existing[0]?.id || null);
+      setUploadedExcels(existing);
+      setSelectedPreviewId(existing[0]?.id || null);
     } else {
-      setUploadedPdfs([]);
-      setSelectedPreviewPdfId(null);
+      setUploadedExcels([]);
+      setSelectedPreviewId(null);
     }
     setFormData({
       orNumber: sch.orNumber,
+      productionNumber: sch.worksheets?.[0]?.worksheetNo || '',
       productionDate: sch.productionDate,
       finishDate: sch.finishDate,
-      productionLine: sch.productionLine,
       style: sch.style,
       target: sch.target,
       status: sch.status || 'Terjadwal',
@@ -388,88 +351,89 @@ export const ProductionScheduleView: React.FC = () => {
     setIsModalOpen(true);
   };
 
-  const revalidateFormPdfItem = (pdf: FormPdfItem): FormPdfItem => {
-    if (pdf.status !== 'success') return pdf;
-    const check = validateExtractedWorksheet({
-      id: pdf.id,
-      fileName: pdf.fileName,
-      orNumber: pdf.orNumber || '',
-      rawOrNumber: pdf.rawOrNumber,
-      worksheetNo: pdf.worksheetNo,
-      style: pdf.style || '',
-      target: pdf.target ?? null,
-      rawTarget: pdf.rawTarget,
-      isTargetAmbiguous: pdf.isTargetAmbiguous,
-      materials: (pdf.materials || []).map((m) => ({
-        materialCode: m.materialCode,
-        materialName: m.materialName,
-        unit: m.unit,
-        total: m.total,
-        rawTotal: m.rawTotal,
-        isTotalAmbiguous: m.isTotalAmbiguous,
-        needsReview: m.needsReview,
-        reviewNote: m.reviewNote,
-      })),
-    });
+  const revalidateExcelItem = (item: FormExcelScheduleItem): FormExcelScheduleItem => {
+    if (item.status !== 'success') return item;
+    const reasons: string[] = [];
 
-    const missingTotalWarnings: WorksheetFieldWarning[] = [];
-    const missingTotalReasons: string[] = [];
-    (pdf.materials || []).forEach((m, idx) => {
-      if (m.total === null || m.total === undefined || !Number.isFinite(m.total)) {
-        const msg = `Kolom TOTAL material "${m.materialCode || `Baris ${idx + 1}`}" masih kosong dan perlu diisi/diperiksa.`;
-        missingTotalWarnings.push({ field: `materials[${idx}].total`, severity: 'warning', message: msg });
-        missingTotalReasons.push(msg);
-      }
-    });
+    if (!item.orNumber?.trim()) {
+      reasons.push('Nomor OR (dari kolom Source) masih kosong.');
+    }
+    if (!item.productionNumber?.trim()) {
+      reasons.push('Nomor Produksi (dari kolom Reference) masih kosong.');
+    }
+    if (!item.style?.trim()) {
+      reasons.push('Style (dari kolom Style List/Display Name) masih kosong.');
+    }
+    if (item.target === null || item.target === undefined || !Number.isFinite(item.target) || item.target <= 0) {
+      reasons.push('Target Produksi (Quantity To Produce) harus lebih dari 0.');
+    }
+    if (!item.productionDate || !item.finishDate) {
+      reasons.push('Tanggal Mulai Produksi dan Tanggal Selesai Produksi wajib diisi.');
+    } else if (isFinishBeforeStart(item.productionDate, item.finishDate)) {
+      reasons.push('Tanggal Selesai Produksi tidak boleh lebih awal dari Tanggal Mulai Produksi.');
+    }
+    if (!item.materials || item.materials.length === 0) {
+      reasons.push('Daftar Raw Materials kosong.');
+    } else {
+      item.materials.forEach((m, idx) => {
+        if (!m.materialCode?.trim()) {
+          reasons.push(`Baris material ke-${idx + 1}: Kode Material kosong.`);
+        }
+        if (!m.materialName?.trim()) {
+          reasons.push(`Baris material ke-${idx + 1}: Nama Material kosong.`);
+        }
+        if (!m.unit?.trim()) {
+          reasons.push(`Baris material ke-${idx + 1} (${m.materialCode || '-'}): Satuan kosong.`);
+        }
+        if (m.total === null || m.total === undefined || !Number.isFinite(m.total) || m.total < 0) {
+          reasons.push(`Baris material ke-${idx + 1} (${m.materialCode || '-'}): Kebutuhan tidak valid.`);
+        }
+      });
+    }
 
-    const combinedWarnings = [...check.fieldWarnings, ...missingTotalWarnings];
-    const combinedReasons = Array.from(new Set([...check.reviewReasons, ...missingTotalReasons]));
+    const deduped = Array.from(new Set(reasons));
     return {
-      ...pdf,
-      needsReview: combinedWarnings.length > 0,
-      reviewReasons: combinedReasons,
-      fieldWarnings: combinedWarnings,
+      ...item,
+      needsReview: deduped.length > 0,
+      reviewReasons: deduped,
     };
   };
 
-  const handleUpdatePdfField = (
-    pdfId: string,
-    patch: Partial<Pick<FormPdfItem, 'orNumber' | 'worksheetNo' | 'style' | 'target' | 'reviewConfirmed'>>
+  const handleUpdateExcelField = (
+    itemId: string,
+    patch: Partial<
+      Pick<
+        FormExcelScheduleItem,
+        'orNumber' | 'productionNumber' | 'style' | 'target' | 'productionDate' | 'finishDate' | 'reviewConfirmed'
+      >
+    >
   ) => {
-    setUploadedPdfs((prev) =>
-      prev.map((p) => {
-        if (p.id !== pdfId) return p;
-        const next: FormPdfItem = {
-          ...p,
+    setUploadedExcels((prev) =>
+      prev.map((item) => {
+        if (item.id !== itemId) return item;
+        const next: FormExcelScheduleItem = {
+          ...item,
           ...patch,
-          isTargetAmbiguous: patch.target !== undefined ? false : p.isTargetAmbiguous,
           reviewConfirmed: patch.reviewConfirmed !== undefined ? patch.reviewConfirmed : false,
         };
-        return revalidateFormPdfItem(next);
+        return revalidateExcelItem(next);
       })
     );
   };
 
-  const handleUpdatePdfMaterialRow = (
-    pdfId: string,
+  const handleUpdateExcelMaterialRow = (
+    itemId: string,
     rowIndex: number,
-    patch: Partial<FormWorksheetMaterial>
+    patch: Partial<FormExcelMaterial>
   ) => {
-    setUploadedPdfs((prev) =>
-      prev.map((p) => {
-        if (p.id !== pdfId || !p.materials) return p;
-        const nextMaterials = p.materials.map((m, idx) =>
-          idx === rowIndex
-            ? {
-                ...m,
-                ...patch,
-                isTotalAmbiguous: patch.total !== undefined ? false : m.isTotalAmbiguous,
-                needsReview: patch.total !== undefined ? false : m.needsReview,
-              }
-            : m
+    setUploadedExcels((prev) =>
+      prev.map((item) => {
+        if (item.id !== itemId || !item.materials) return item;
+        const nextMaterials = item.materials.map((m, idx) =>
+          idx === rowIndex ? { ...m, ...patch } : m
         );
-        return revalidateFormPdfItem({
-          ...p,
+        return revalidateExcelItem({
+          ...item,
           materials: nextMaterials,
           reviewConfirmed: false,
         });
@@ -477,279 +441,23 @@ export const ProductionScheduleView: React.FC = () => {
     );
   };
 
-  const MAX_RAW_PDF_JSON_BYTES = 2_800_000;
-  const CLIENT_ENDPOINT_TIMEOUT_MS = 28_000;
-
-  const postExtractEndpoint = async (payload: Record<string, unknown>, timeoutMs = CLIENT_ENDPOINT_TIMEOUT_MS) => {
-    const controller = new AbortController();
-    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
-    let res: Response;
-    let rawResponseBody = '';
-    try {
-      res = await fetch('/api/pdf/extract-worksheet', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-        signal: controller.signal,
-      });
-      rawResponseBody = await res.text();
-    } catch (fetchErr: any) {
-      if (fetchErr?.name === 'AbortError') {
-        throw new Error(
-          `Proses ekstraksi PDF melebihi batas waktu (${Math.round(timeoutMs / 1000)} detik).`
-        );
-      }
-      throw new Error(
-        'Gagal terhubung ke server ekstraksi PDF (/api/pdf/extract-worksheet). Periksa koneksi atau status server.'
-      );
-    } finally {
-      window.clearTimeout(timeoutId);
-    }
-
-    const parsedResponse = parseExtractWorksheetHttpResponse(
-      res.status,
-      res.headers.get('content-type'),
-      rawResponseBody
-    );
-
-    return { res, parsedResponse };
-  };
-
-  const updatePdfOcrState = (pdfId: string, ocrState: PdfOcrProgressState) => {
-    setUploadedPdfs((prev) =>
-      prev.map((p) => (p.id === pdfId ? { ...p, ocrState } : p))
-    );
-  };
-
-  const extractWorksheetForItem = async (item: FormPdfItem): Promise<{
-    extracted: ExtractedPdfWorksheet;
-    finalOcrState?: PdfOcrProgressState;
-  }> => {
-    if (!item.file) {
-      throw new Error(`Berkas asli "${item.fileName}" tidak tersedia di sesi ini. Silakan pilih file PDF ulang.`);
-    }
-
-    const file = item.file;
-    let latestOcrState: PdfOcrProgressState = {
-      mode: 'checking',
-      stageLabel: 'Memeriksa teks halaman 1...',
-    };
-
-    const pushOcrProgress = (patch: Partial<PdfOcrProgressState>) => {
-      latestOcrState = {
-        ...latestOcrState,
-        ...patch,
-      };
-      updatePdfOcrState(item.id, latestOcrState);
-    };
-
-    const runFirstPageOcr = async (
-      existingSession: Awaited<ReturnType<typeof openBrowserPdfSession>> | null
-    ): Promise<{ extracted: ExtractedPdfWorksheet; finalOcrState: PdfOcrProgressState }> => {
-      const session = existingSession || (await openBrowserPdfSession(file));
-      const shouldCloseLocally = !existingSession;
-      try {
-        pushOcrProgress({
-          mode: 'page-ocr',
-          stageLabel: 'Menyiapkan gambar halaman 1...',
-          attempt: 1,
-        });
-
-        const rendered = await session.renderFirstPageToJpeg();
-        const maxPageAttempts = 2;
-        let lastPageErr = '';
-
-        for (let attempt = 1; attempt <= maxPageAttempts; attempt++) {
-          pushOcrProgress({
-            mode: 'page-ocr',
-            stageLabel:
-              attempt > 1
-                ? `Mengulang OCR halaman 1 (percobaan ${attempt}/${maxPageAttempts})...`
-                : 'Menjalankan OCR halaman 1...',
-            attempt,
-          });
-
-          try {
-            const { res, parsedResponse } = await postExtractEndpoint(
-              {
-                pageImageBase64: rendered.base64,
-                pageMimeType: rendered.mimeType,
-                pageNumber: 1,
-                totalPages: 1,
-                fileName: item.fileName,
-              },
-              CLIENT_ENDPOINT_TIMEOUT_MS
-            );
-
-            if (parsedResponse.success && (parsedResponse.pageExtraction || parsedResponse.data)) {
-              let extracted: ExtractedPdfWorksheet | null = null;
-              let isUsable = false;
-
-              if (parsedResponse.pageExtraction) {
-                const built = buildWorksheetFromFirstPageOcr(
-                  parsedResponse.pageExtraction as PageOcrExtraction,
-                  item.fileName
-                );
-                extracted = built.worksheet;
-                isUsable = built.isValidatedUsable;
-              } else if (parsedResponse.data) {
-                extracted = parsedResponse.data;
-                isUsable = validateUsableOcrWorksheet(extracted);
-              }
-
-              if (!extracted || !isUsable) {
-                pushOcrProgress({
-                  mode: 'page-ocr',
-                  stageLabel: 'Data worksheet tidak ditemukan di halaman 1',
-                });
-                const err = new Error(
-                  `Data worksheet tidak ditemukan pada halaman pertama dokumen "${item.fileName}".`
-                );
-                (err as any).ocrState = latestOcrState;
-                throw err;
-              }
-
-              const doneState: PdfOcrProgressState = {
-                mode: 'page-ocr',
-                stageLabel: 'OCR halaman 1 selesai',
-              };
-              updatePdfOcrState(item.id, doneState);
-              return { extracted, finalOcrState: doneState };
-            }
-
-            lastPageErr =
-              parsedResponse.error ||
-              `Gagal OCR halaman pertama dokumen "${item.fileName}" (HTTP ${res.status}).`;
-            const canRetry =
-              attempt < maxPageAttempts &&
-              (parsedResponse.retryable ?? isRetryableOcrError(res.status, lastPageErr));
-            if (!canRetry) {
-              break;
-            }
-          } catch (reqErr: any) {
-            if ((reqErr as any)?.ocrState) {
-              throw reqErr;
-            }
-            lastPageErr = reqErr?.message || `Gagal OCR halaman pertama dokumen "${item.fileName}".`;
-            if (attempt >= maxPageAttempts || !isRetryableOcrError(undefined, lastPageErr)) {
-              break;
-            }
-          }
-
-          await new Promise((r) => window.setTimeout(r, 700));
-        }
-
-        pushOcrProgress({
-          mode: 'page-ocr',
-          stageLabel: 'Gagal OCR halaman 1',
-        });
-        const err = new Error(lastPageErr || `Gagal mengekstrak halaman pertama "${item.fileName}".`);
-        (err as any).ocrState = latestOcrState;
-        throw err;
-      } finally {
-        if (shouldCloseLocally) {
-          await session.close();
-        }
-      }
-    };
-
-    // Fast path for <= 2.8MB PDFs (safe under Vercel 4.5MB limit): extract Page 1 text layer first
-    if (file.size <= MAX_RAW_PDF_JSON_BYTES) {
-      pushOcrProgress({
-        mode: 'checking',
-        stageLabel: 'Mengekstrak teks halaman 1...',
-      });
-
-      const base64Data = await new Promise<string>((resolve, reject) => {
-        const reader = new FileReader();
-        reader.onload = () => {
-          const res = reader.result as string;
-          const b64 = res.includes(',') ? res.split(',')[1] : res;
-          resolve(b64);
-        };
-        reader.onerror = () => reject(new Error(`Gagal membaca file "${item.fileName}" di browser.`));
-        reader.readAsDataURL(file);
-      });
-
-      const { res, parsedResponse } = await postExtractEndpoint(
-        {
-          pdfBase64: base64Data,
-          fileName: item.fileName,
-          preferPageByPageOcr: true,
-        },
-        32_000
-      );
-
-      if (parsedResponse.success && parsedResponse.data) {
-        return {
-          extracted: parsedResponse.data,
-          finalOcrState: {
-            mode: 'text',
-            stageLabel: 'Teks halaman 1 selesai',
-          },
-        };
-      }
-
-      if (parsedResponse.requiresPageOcr) {
-        return runFirstPageOcr(null);
-      }
-
-      throw new Error(
-        parsedResponse.error || `Gagal mengekstrak halaman pertama PDF "${item.fileName}" (HTTP ${res.status}).`
-      );
-    }
-
-    // Large PDF (> 2.8MB): inspect ONLY Page 1 locally via PDF.js to avoid Vercel 4.5MB payload cap
-    pushOcrProgress({
-      mode: 'checking',
-      stageLabel: 'Memeriksa teks halaman 1...',
-    });
-
-    const session = await openBrowserPdfSession(file);
-    try {
-      const inspection = await session.inspectFirstPageCoordinates();
-      if (inspection.hasTextLayer && inspection.coordinatePages.length > 0) {
-        const { res, parsedResponse } = await postExtractEndpoint(
-          {
-            coordinatePages: inspection.coordinatePages,
-            fileName: item.fileName,
-          },
-          20_000
-        );
-        if (parsedResponse.success && parsedResponse.data) {
-          return {
-            extracted: parsedResponse.data,
-            finalOcrState: {
-              mode: 'text',
-              stageLabel: 'Teks halaman 1 selesai',
-            },
-          };
-        }
-        throw new Error(
-          parsedResponse.error ||
-            `Data worksheet tidak ditemukan pada halaman pertama dokumen "${item.fileName}" (HTTP ${res.status}).`
-        );
-      }
-
-      return await runFirstPageOcr(session);
-    } finally {
-      await session.close();
-    }
-  };
-
-  const applyExtractedWorksheetToPdfItem = async (
-    item: FormPdfItem,
-    extracted: ExtractedPdfWorksheet,
-    finalOcrState?: PdfOcrProgressState
+  /**
+   * Matches extracted Excel schedule materials strictly against ONLY the latest Master Data upload
+   * for the item's Nomor OR (Nomor OR + Kode Material).
+   * If Supabase is configured and the query succeeds (`connected: true`), uses the exact Supabase
+   * latest upload set (even if empty -> Diterima & Status become '-').
+   */
+  const applyExtractedExcelToItem = async (
+    targetItem: FormExcelScheduleItem,
+    extracted: ExtractedScheduleExcel
   ) => {
     const extractedOr = (extracted.orNumber || '').trim();
 
-    // Ambil data upload Excel paling terbaru khusus No. OR PDF ini (Supabase -> fallback state lokal)
     let reqSource = materialRequirements;
     let histSource = uploadHistory;
     if (getSupabaseCredentials().isConfigured && extractedOr) {
       const remoteLatest = await fetchLatestUploadMaterialsForOrs([extractedOr]);
-      if (remoteLatest?.connected && remoteLatest.uploadHistory.length > 0) {
+      if (remoteLatest?.connected) {
         histSource = remoteLatest.uploadHistory;
         reqSource = remoteLatest.materialRequirements;
       }
@@ -769,7 +477,7 @@ export const ProductionScheduleView: React.FC = () => {
           syncTimestamp
         )
       : (extracted.materials || []).map((m, idx) => ({
-          id: `wsm-${idx + 1}`,
+          id: m.id || `wsm-${idx + 1}`,
           materialCode: m.materialCode,
           materialName: m.materialName,
           unit: m.unit,
@@ -779,162 +487,89 @@ export const ProductionScheduleView: React.FC = () => {
           isFoundInMasterData: false,
         }));
 
-    const mergedMaterials: FormWorksheetMaterial[] = matchedMaterialsRaw.map((m, idx) => {
+    const mergedMaterials: FormExcelMaterial[] = matchedMaterialsRaw.map((m, idx) => {
       const src = extracted.materials?.[idx];
       return {
         ...m,
+        id: src?.id || m.id || `wsm-${idx + 1}`,
+        materialCode: src?.materialCode ?? m.materialCode,
+        materialName: src?.materialName ?? m.materialName,
+        unit: src?.unit ?? m.unit,
         total: src?.total ?? m.total ?? null,
         rawTotal: src?.rawTotal,
-        isTotalAmbiguous: src?.isTotalAmbiguous,
-        needsReview: src?.needsReview,
-        reviewNote: src?.reviewNote,
       };
     });
 
-    const updatedPdfItem = revalidateFormPdfItem({
-      id: item.id,
-      file: item.file,
-      fileName: item.fileName,
+    const updatedItem = revalidateExcelItem({
+      ...targetItem,
+      fileName: extracted.fileName,
       status: 'success',
       error: undefined,
       orNumber: extractedOr,
-      rawOrNumber: extracted.rawOrNumber,
-      worksheetNo: extracted.worksheetNo,
-      style: extracted.style || '',
-      target: extracted.target ?? null,
+      rawSource: extracted.rawSource,
+      productionNumber: extracted.productionNumber,
+      style: extracted.style,
+      target: extracted.target,
       rawTarget: extracted.rawTarget,
-      isTargetAmbiguous: extracted.isTargetAmbiguous,
-      extractionMethod: extracted.extractionMethod,
-      fieldWarnings: extracted.fieldWarnings,
-      reviewReasons: extracted.reviewReasons,
-      reviewConfirmed: false,
       materials: mergedMaterials,
+      reviewConfirmed: false,
       matchedUploadId: latestResolution.latestUpload?.id || null,
       matchedUploadDate: latestResolution.latestUpload?.updateDate || null,
       matchedUploadTime: latestResolution.latestUpload?.uploadTime || null,
       matchedUploadCreatedAt: latestResolution.latestUpload?.createdAt || null,
       lastSyncedAt: syncTimestamp,
-      ocrState: finalOcrState,
     });
 
-    setUploadedPdfs((prev) => {
-      const updated = prev.map((p) => (p.id === item.id ? updatedPdfItem : p));
-
-      // Auto-fill form values from cleanly extracted PDF fields when still at initial create defaults
-      const validItems = updated.filter((p) => p.status === 'success');
-      if (validItems.length > 0) {
-        setFormData((prevForm) => {
-          const totalTarget = validItems.reduce((acc, p) => acc + (p.target || 0), 0);
-          const firstValid = validItems[0];
-          const initialDefaultOr = availableOrList[0] || 'OR-2026-001';
-          const initialDefaultStyle = getStyleForOr(initialDefaultOr) || 'Casual Cotton Shirt Men Navy';
-          const shouldUpdateOr =
-            !prevForm.orNumber ||
-            prevForm.orNumber === 'OR-2026-001' ||
-            (modalMode === 'create' && prevForm.orNumber === initialDefaultOr);
-          const shouldUpdateStyle =
-            !prevForm.style ||
-            prevForm.style === 'Casual Cotton Shirt Men Navy' ||
-            (modalMode === 'create' &&
-              (prevForm.style === initialDefaultStyle || shouldUpdateOr));
-          return {
-            ...prevForm,
-            orNumber: shouldUpdateOr ? firstValid.orNumber || prevForm.orNumber : prevForm.orNumber,
-            style: shouldUpdateStyle ? firstValid.style || prevForm.style : prevForm.style,
-            target: totalTarget > 0 ? totalTarget : prevForm.target,
-          };
-        });
-      }
-
-      return updated;
-    });
-  };
-
-  // Handler for retrying ONLY one failed PDF without re-uploading other files or re-running finished pages
-  const handleRetryPdf = async (pdfId: string) => {
-    const targetItem = uploadedPdfs.find((p) => p.id === pdfId);
-    if (!targetItem || targetItem.status === 'parsing') return;
-
-    setFormValidationError(null);
-    setIsProcessingPdfs(true);
-    setUploadedPdfs((prev) =>
-      prev.map((p) =>
-        p.id === pdfId
-          ? {
-              ...p,
-              status: 'parsing' as const,
-              error: undefined,
-            }
-          : p
-      )
+    setUploadedExcels((prev) =>
+      prev.map((p) => (p.id === targetItem.id ? updatedItem : p))
     );
-
-    try {
-      const { extracted, finalOcrState } = await extractWorksheetForItem(targetItem);
-      await applyExtractedWorksheetToPdfItem(targetItem, extracted, finalOcrState);
-      setSelectedPreviewPdfId(pdfId);
-    } catch (err: any) {
-      setUploadedPdfs((prev) =>
-        prev.map((p) =>
-          p.id === pdfId
-            ? {
-                ...p,
-                status: 'error' as const,
-                error: err?.message || 'Gagal mengekstrak worksheet PDF.',
-                ocrState: err?.ocrState ?? p.ocrState,
-              }
-            : p
-        )
-      );
-    } finally {
-      setIsProcessingPdfs(false);
-    }
   };
 
-  // Handler for uploading one or multiple PDF Worksheets
-  const handlePdfFilesUpload = async (fileList: FileList | File[]) => {
+  const isSupportedExcelFile = (file: File): boolean => {
+    const lower = file.name.toLowerCase();
+    return lower.endsWith('.xls') || lower.endsWith('.xlsx') || lower.endsWith('.csv');
+  };
+
+  // Multi-file Excel upload (independent per file, preview before save)
+  const handleExcelFilesUpload = async (fileList: FileList | File[]) => {
     const rawFiles = Array.from(fileList);
-    const pdfFiles = rawFiles.filter(
-      (f) => f.name.toLowerCase().endsWith('.pdf') || f.type === 'application/pdf'
-    );
-    if (pdfFiles.length === 0) {
-      setFormValidationError('Hanya file berformat PDF yang didukung untuk Worksheet.');
+    const excelFiles = rawFiles.filter(isSupportedExcelFile);
+    if (excelFiles.length === 0) {
+      setFormValidationError('Hanya file Excel (.xls, .xlsx, .csv) yang didukung untuk Production Schedule.');
       return;
     }
 
-    setIsProcessingPdfs(true);
+    setIsProcessingExcels(true);
     setFormValidationError(null);
+    const defaults = getDefaultDateRange();
 
-    const newItems: FormPdfItem[] = pdfFiles.map((f) => ({
-      id: `ws-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
+    const newItems: FormExcelScheduleItem[] = excelFiles.map((f) => ({
+      id: `sch-xls-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`,
       file: f,
       fileName: f.name,
       status: 'parsing',
-      ocrState: {
-        mode: 'checking',
-        stageLabel: 'Menunggu antrean ekstraksi halaman 1...',
-      },
+      productionDate: defaults.start,
+      finishDate: defaults.end,
     }));
 
-    setUploadedPdfs((prev) => [...prev, ...newItems]);
-    if (!selectedPreviewPdfId && newItems.length > 0) {
-      setSelectedPreviewPdfId(newItems[0].id);
-    }
+    setUploadedExcels((prev) => [...prev, ...newItems]);
+    setSelectedPreviewId((prevSelected) => prevSelected || newItems[0]?.id || null);
 
     for (const item of newItems) {
       try {
-        const { extracted, finalOcrState } = await extractWorksheetForItem(item);
-        await applyExtractedWorksheetToPdfItem(item, extracted, finalOcrState);
+        if (!item.file) {
+          throw new Error(`File "${item.fileName}" tidak dapat dibaca.`);
+        }
+        const extracted = await parseScheduleExcelFile(item.file);
+        await applyExtractedExcelToItem(item, extracted);
       } catch (err: any) {
-        // Error is isolated strictly to this item; other already-succeeded PDFs remain intact
-        setUploadedPdfs((prev) =>
+        setUploadedExcels((prev) =>
           prev.map((p) =>
             p.id === item.id
               ? {
                   ...p,
-                  status: 'error' as const,
-                  error: err?.message || 'Gagal mengekstrak worksheet PDF.',
-                  ocrState: err?.ocrState ?? p.ocrState,
+                  status: 'error',
+                  error: err?.message || `Gagal membaca file Excel "${item.fileName}".`,
                 }
               : p
           )
@@ -942,32 +577,91 @@ export const ProductionScheduleView: React.FC = () => {
       }
     }
 
-    setIsProcessingPdfs(false);
+    setIsProcessingExcels(false);
   };
 
-  // Manual Refresh untuk preview PDF pada modal Form (hanya dijalankan atas aksi user)
-  const handleRefreshFormPdfSnapshots = async () => {
-    const successPdfs = uploadedPdfs.filter((p) => p.status === 'success' && p.materials && p.materials.length > 0);
-    if (successPdfs.length === 0) return;
+  // Replace a single Excel file in preview without disturbing other files
+  const handleReplaceExcelFile = async (itemId: string, file: File) => {
+    if (!isSupportedExcelFile(file)) {
+      setFormValidationError('File pengganti harus berformat .xls, .xlsx, atau .csv.');
+      return;
+    }
+    const existing = uploadedExcels.find((p) => p.id === itemId);
+    if (!existing) return;
+
+    setIsProcessingExcels(true);
+    setFormValidationError(null);
+
+    const pendingItem: FormExcelScheduleItem = {
+      ...existing,
+      file,
+      fileName: file.name,
+      status: 'parsing',
+      error: undefined,
+    };
+    setUploadedExcels((prev) => prev.map((p) => (p.id === itemId ? pendingItem : p)));
+
+    try {
+      const extracted = await parseScheduleExcelFile(file);
+      await applyExtractedExcelToItem(pendingItem, extracted);
+      setSelectedPreviewId(itemId);
+    } catch (err: any) {
+      setUploadedExcels((prev) =>
+        prev.map((p) =>
+          p.id === itemId
+            ? {
+                ...p,
+                status: 'error',
+                error: err?.message || `Gagal membaca file Excel "${file.name}".`,
+              }
+            : p
+        )
+      );
+    } finally {
+      setIsProcessingExcels(false);
+    }
+  };
+
+  const handleRemoveExcel = (itemId: string) => {
+    setUploadedExcels((prev) => {
+      const next = prev.filter((p) => p.id !== itemId);
+      if (selectedPreviewId === itemId) {
+        setSelectedPreviewId(next[0]?.id || null);
+      }
+      return next;
+    });
+  };
+
+  // Re-check Master Data availability on Preview (only updates Diterima & Status; aborts on Supabase error)
+  const handleRefreshFormExcelSnapshots = async () => {
+    const successItems = uploadedExcels.filter(
+      (p) => p.status === 'success' && p.materials && p.materials.length > 0
+    );
+    if (successItems.length === 0) return;
 
     setIsRefreshingFormPreview(true);
+    setFormValidationError(null);
     try {
       let reqSource = materialRequirements;
       let histSource = uploadHistory;
       if (getSupabaseCredentials().isConfigured) {
-        const ors = successPdfs.map((p) => p.orNumber || formData.orNumber).filter(Boolean);
+        const ors = successItems.map((p) => p.orNumber || '').filter(Boolean);
         const remoteLatest = await fetchLatestUploadMaterialsForOrs(ors);
-        if (remoteLatest?.connected && remoteLatest.uploadHistory.length > 0) {
-          histSource = remoteLatest.uploadHistory;
-          reqSource = remoteLatest.materialRequirements;
+        if (!remoteLatest || !remoteLatest.connected) {
+          setFormValidationError(
+            'Gagal mengambil data Master Data terbaru dari Supabase. Snapshot preview lama tetap dipertahankan.'
+          );
+          return;
         }
+        histSource = remoteLatest.uploadHistory;
+        reqSource = remoteLatest.materialRequirements;
       }
 
       const nowIso = new Date().toISOString();
-      setUploadedPdfs((prev) =>
+      setUploadedExcels((prev) =>
         prev.map((p) => {
           if (p.status !== 'success' || !p.materials) return p;
-          const targetOr = p.orNumber || formData.orNumber;
+          const targetOr = (p.orNumber || '').trim();
           const latestRes = targetOr
             ? findLatestUploadForOr(targetOr, reqSource, histSource)
             : { orNumber: '', latestUpload: null, rows: [] };
@@ -1013,7 +707,13 @@ export const ProductionScheduleView: React.FC = () => {
     }
   };
 
-  // Manual Refresh eksplisit untuk Detail Jadwal Produksi tersimpan (hanya saat user klik tombol)
+  /**
+   * Manual Refresh for saved schedule detail snapshot.
+   * Rules:
+   * - Updates ONLY Diterima & Status Kesiapan from latest Master Data upload per OR.
+   * - Preserves OR, Nomor Produksi, Style, Target, Dates, Material Code/Name/Unit/Kebutuhan verbatim.
+   * - If Supabase query/network fails, aborts Refresh and preserves the existing snapshot unchanged.
+   */
   const handleRefreshScheduleSnapshot = async () => {
     if (!activeDetailSchedule || !activeDetailSchedule.worksheets || activeDetailSchedule.worksheets.length === 0) {
       return;
@@ -1028,10 +728,16 @@ export const ProductionScheduleView: React.FC = () => {
       if (getSupabaseCredentials().isConfigured) {
         const orList = activeDetailSchedule.worksheets.map((ws) => ws.orNumber).filter(Boolean);
         const remoteLatest = await fetchLatestUploadMaterialsForOrs(orList);
-        if (remoteLatest?.connected && remoteLatest.uploadHistory.length > 0) {
-          histSource = remoteLatest.uploadHistory;
-          reqSource = remoteLatest.materialRequirements;
+        if (!remoteLatest || !remoteLatest.connected) {
+          setRefreshFeedback({
+            type: 'error',
+            message:
+              'Gagal mengambil Master Data terbaru dari Supabase. Refresh dibatalkan dan snapshot lama tetap dipertahankan.',
+          });
+          return;
         }
+        histSource = remoteLatest.uploadHistory;
+        reqSource = remoteLatest.materialRequirements;
       }
 
       const refreshedWorksheets = refreshScheduleWorksheetsSnapshot(
@@ -1047,7 +753,7 @@ export const ProductionScheduleView: React.FC = () => {
       if (!updateResult.success) {
         setRefreshFeedback({
           type: 'error',
-          message: updateResult.error || 'Gagal menyimpan hasil refresh snapshot ke database.',
+          message: updateResult.error || 'Gagal menyimpan hasil refresh snapshot ke database. Snapshot lama dipertahankan.',
         });
         return;
       }
@@ -1061,210 +767,305 @@ export const ProductionScheduleView: React.FC = () => {
         type: 'success',
         message:
           matchedOrsCount > 0
-            ? `Snapshot berhasil disinkronkan ulang terhadap upload Excel terbaru (${matchedOrsCount}/${refreshedWorksheets.length} worksheet memiliki upload aktif).`
-            : 'Sinkronisasi selesai: belum ditemukan transaksi upload Excel aktif di Master Data untuk No. OR pada jadwal ini (Diterima/Status disetel ke "-").',
+            ? `Ketersediaan material berhasil disinkronkan dari upload Master Data terbaru (${matchedOrsCount}/${refreshedWorksheets.length} jadwal).`
+            : 'Sinkronisasi selesai: belum ada upload Master Data aktif untuk Nomor OR ini (Diterima dan Status Kesiapan disetel ke "-").',
       });
     } catch (err: any) {
       setRefreshFeedback({
         type: 'error',
-        message: err?.message || 'Gagal menyegarkan snapshot ketersediaan material.',
+        message: err?.message || 'Gagal menyegarkan snapshot ketersediaan material. Snapshot lama dipertahankan.',
       });
     } finally {
       setIsRefreshingSnapshot(false);
     }
   };
 
-  // Remove a PDF from upload queue
-  const handleRemovePdf = (pdfId: string) => {
-    setUploadedPdfs((prev) => {
-      const next = prev.filter((p) => p.id !== pdfId);
-      if (selectedPreviewPdfId === pdfId) {
-        setSelectedPreviewPdfId(next[0]?.id || null);
-      }
-      return next;
-    });
-  };
-
-  // Manually re-sync total targets from PDFs to Form
-  const handleSyncPdfDataToForm = () => {
-    const valid = uploadedPdfs.filter((p) => p.status === 'success');
-    if (valid.length === 0) return;
-    const totalTarget = valid.reduce((acc, p) => acc + (p.target || 0), 0);
-    const firstValid = valid[0];
-    setFormData((prev) => ({
-      ...prev,
-      target: totalTarget > 0 ? totalTarget : prev.target,
-      orNumber: firstValid.orNumber || prev.orNumber,
-      style: firstValid.style || prev.style,
+  const buildFrozenWorksheetFromExcelItem = (
+    p: FormExcelScheduleItem,
+    saveTimestamp: string
+  ): WorksheetPdfItem => {
+    const normalizedMaterials: WorksheetMaterialItem[] = (p.materials || []).map((m, idx) => ({
+      id: m.id || `wsm-${idx + 1}`,
+      materialCode: m.materialCode.trim(),
+      materialName: m.materialName.trim(),
+      unit: m.unit.trim(),
+      total: Number(m.total ?? 0),
+      receivedQty: m.receivedQty ?? null,
+      status: m.status ?? null,
+      isFoundInMasterData: m.isFoundInMasterData,
+      matchedUploadId: m.matchedUploadId ?? p.matchedUploadId ?? null,
+      matchedUploadDate: m.matchedUploadDate ?? p.matchedUploadDate ?? null,
+      matchedUploadTime: m.matchedUploadTime ?? p.matchedUploadTime ?? null,
+      matchedUploadCreatedAt: m.matchedUploadCreatedAt ?? p.matchedUploadCreatedAt ?? null,
+      matchedAt: m.matchedAt ?? p.lastSyncedAt ?? saveTimestamp,
     }));
+
+    const hasExistingSnapshot = Boolean(
+      p.lastSyncedAt ||
+        normalizedMaterials.some((m) => m.isFoundInMasterData !== undefined || m.matchedAt)
+    );
+
+    if (hasExistingSnapshot) {
+      return {
+        id: p.id,
+        fileName: p.fileName,
+        orNumber: (p.orNumber || '').trim(),
+        rawOrNumber: p.rawSource,
+        worksheetNo: (p.productionNumber || '').trim(),
+        style: (p.style || '').trim(),
+        target: Number(p.target || 0),
+        materials: normalizedMaterials,
+        uploadedAt: p.lastSyncedAt || saveTimestamp,
+        matchedUploadId: p.matchedUploadId ?? null,
+        matchedUploadDate: p.matchedUploadDate ?? null,
+        matchedUploadTime: p.matchedUploadTime ?? null,
+        matchedUploadCreatedAt: p.matchedUploadCreatedAt ?? null,
+        lastSyncedAt: p.lastSyncedAt || saveTimestamp,
+      };
+    }
+
+    return buildWorksheetSnapshot(
+      {
+        id: p.id,
+        fileName: p.fileName,
+        orNumber: (p.orNumber || '').trim(),
+        rawOrNumber: p.rawSource,
+        worksheetNo: (p.productionNumber || '').trim(),
+        style: (p.style || '').trim(),
+        target: Number(p.target || 0),
+        materials: normalizedMaterials,
+        uploadedAt: saveTimestamp,
+      },
+      materialRequirements,
+      uploadHistory,
+      saveTimestamp
+    );
   };
 
-  // Submit Form (Validation: finish >= start, target > 0, no failed/unvalidated PDFs)
+  // Submit Form: 1 Excel file = 1 independent ProductionSchedule on create
   const handleSubmitForm = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (isSubmittingForm || isProcessingPdfs) return;
+    if (isSubmittingForm || isProcessingExcels) return;
     setFormValidationError(null);
 
-    if (!formData.orNumber.trim()) {
-      setFormValidationError('Nomor OR wajib diisi.');
-      return;
-    }
-    if (!formData.style.trim()) {
-      setFormValidationError('Style wajib diisi.');
-      return;
-    }
-    if (!formData.productionLine) {
-      setFormValidationError('Line Produksi wajib dipilih.');
-      return;
-    }
-    if (isFinishBeforeStart(formData.productionDate, formData.finishDate)) {
-      setFormValidationError('Tanggal selesai tidak boleh lebih awal daripada tanggal produksi.');
-      return;
-    }
-    if (formData.target <= 0) {
-      setFormValidationError('Target harus berupa angka positif lebih besar dari 0.');
-      return;
-    }
+    const hasExcelItems = uploadedExcels.length > 0;
 
-    // Block saving if any uploaded PDF failed or still has unresolved validation errors
-    const failedPdfs = uploadedPdfs.filter((p) => p.status === 'error');
-    if (failedPdfs.length > 0) {
-      setFormValidationError(
-        `Tidak dapat menyimpan karena terdapat PDF Worksheet yang gagal dibaca (${failedPdfs
-          .map((p) => p.fileName)
-          .join(', ')}). Klik "Coba Lagi" atau hapus PDF tersebut.`
-      );
-      return;
-    }
+    if (hasExcelItems) {
+      const failedExcels = uploadedExcels.filter((p) => p.status === 'error');
+      if (failedExcels.length > 0) {
+        setFormValidationError(
+          `Tidak dapat menyimpan karena terdapat file Excel yang gagal dibaca (${failedExcels
+            .map((p) => p.fileName)
+            .join(', ')}). Klik "Ganti File" atau hapus file tersebut.`
+        );
+        return;
+      }
 
-    for (const p of uploadedPdfs) {
-      if (p.status !== 'success') continue;
-      if (!p.orNumber?.trim()) {
-        setFormValidationError(`No. OR pada PDF "${p.fileName}" masih kosong. Lengkapi di Preview Worksheet.`);
-        setSelectedPreviewPdfId(p.id);
-        return;
-      }
-      if (!p.style?.trim()) {
-        setFormValidationError(`Style pada PDF "${p.fileName}" masih kosong. Lengkapi di Preview Worksheet.`);
-        setSelectedPreviewPdfId(p.id);
-        return;
-      }
-      if (p.target === null || p.target === undefined || p.target <= 0) {
-        setFormValidationError(
-          `Target (Total Qty) pada PDF "${p.fileName}" harus lebih dari 0. Periksa di Preview Worksheet.`
-        );
-        setSelectedPreviewPdfId(p.id);
-        return;
-      }
-      if (!p.materials || p.materials.length === 0) {
-        setFormValidationError(
-          `Daftar material pada PDF "${p.fileName}" kosong sehingga tidak dapat disimpan sebagai worksheet valid.`
-        );
-        setSelectedPreviewPdfId(p.id);
-        return;
-      }
-      const badRowIdx = p.materials.findIndex(
-        (m) =>
-          !m.materialCode?.trim() ||
-          !m.materialName?.trim() ||
-          !m.unit?.trim() ||
-          m.total === null ||
-          m.total === undefined ||
-          !Number.isFinite(m.total) ||
-          m.total < 0
-      );
-      if (badRowIdx !== -1) {
-        const badRow = p.materials[badRowIdx];
-        setFormValidationError(
-          `Baris material ke-${badRowIdx + 1} (${badRow.materialCode || '-'}) pada "${p.fileName}" memiliki kolom kosong/tidak valid (termasuk TOTAL yang kosong). Lengkapi terlebih dahulu di Preview Worksheet.`
-        );
-        setSelectedPreviewPdfId(p.id);
-        return;
-      }
-      if (p.needsReview && !p.reviewConfirmed) {
-        setFormValidationError(
-          `PDF "${p.fileName}" memiliki nilai yang perlu diperiksa/konfirmasi (${p.reviewReasons?.[0] || 'periksa angka/identitas'}). Konfirmasi pada Preview Worksheet sebelum menyimpan.`
-        );
-        setSelectedPreviewPdfId(p.id);
-        return;
-      }
-    }
-
-    // Simpan snapshot permanen untuk setiap worksheet & materialnya
-    const saveTimestamp = new Date().toISOString();
-    const validWorksheets: WorksheetPdfItem[] = uploadedPdfs
-      .filter((p) => p.status === 'success' && p.materials && p.materials.length > 0)
-      .map((p) => {
-        const normalizedMaterials: WorksheetMaterialItem[] = (p.materials || []).map((m, idx) => ({
-          id: m.id || `wsm-${idx + 1}`,
-          materialCode: m.materialCode.trim(),
-          materialName: m.materialName.trim(),
-          unit: m.unit.trim(),
-          total: Number(m.total ?? 0),
-          receivedQty: m.receivedQty ?? null,
-          status: m.status ?? null,
-          isFoundInMasterData: m.isFoundInMasterData,
-          matchedUploadId: m.matchedUploadId ?? p.matchedUploadId ?? null,
-          matchedUploadDate: m.matchedUploadDate ?? p.matchedUploadDate ?? null,
-          matchedUploadTime: m.matchedUploadTime ?? p.matchedUploadTime ?? null,
-          matchedUploadCreatedAt: m.matchedUploadCreatedAt ?? p.matchedUploadCreatedAt ?? null,
-          matchedAt: m.matchedAt ?? p.lastSyncedAt ?? saveTimestamp,
-        }));
-
-        const hasExistingSnapshot = Boolean(
-          p.lastSyncedAt ||
-            normalizedMaterials.some((m) => m.isFoundInMasterData !== undefined || m.matchedAt)
-        );
-        if (hasExistingSnapshot) {
-          return {
-            id: p.id,
-            fileName: p.fileName,
-            orNumber: (p.orNumber || formData.orNumber).trim(),
-            style: (p.style || formData.style).trim(),
-            target: Number(p.target || 0),
-            materials: normalizedMaterials,
-            uploadedAt: p.lastSyncedAt || saveTimestamp,
-            matchedUploadId: p.matchedUploadId ?? null,
-            matchedUploadDate: p.matchedUploadDate ?? null,
-            matchedUploadTime: p.matchedUploadTime ?? null,
-            matchedUploadCreatedAt: p.matchedUploadCreatedAt ?? null,
-            lastSyncedAt: p.lastSyncedAt || saveTimestamp,
-          };
+      for (const p of uploadedExcels) {
+        if (p.status !== 'success') continue;
+        if (!p.orNumber?.trim()) {
+          setFormValidationError(`Nomor OR pada "${p.fileName}" masih kosong.`);
+          setSelectedPreviewId(p.id);
+          return;
         }
-        return buildWorksheetSnapshot(
-          {
-            id: p.id,
-            fileName: p.fileName,
-            orNumber: (p.orNumber || formData.orNumber).trim(),
-            style: (p.style || formData.style).trim(),
-            target: Number(p.target || 0),
-            materials: normalizedMaterials,
-            uploadedAt: saveTimestamp,
-          },
-          materialRequirements,
-          uploadHistory,
-          saveTimestamp
+        if (!p.productionNumber?.trim()) {
+          setFormValidationError(`Nomor Produksi (Reference) pada "${p.fileName}" masih kosong.`);
+          setSelectedPreviewId(p.id);
+          return;
+        }
+        if (!p.style?.trim()) {
+          setFormValidationError(`Style pada "${p.fileName}" masih kosong.`);
+          setSelectedPreviewId(p.id);
+          return;
+        }
+        if (p.target === null || p.target === undefined || !Number.isFinite(p.target) || p.target <= 0) {
+          setFormValidationError(`Target Produksi pada "${p.fileName}" harus lebih dari 0.`);
+          setSelectedPreviewId(p.id);
+          return;
+        }
+        if (!p.productionDate || !p.finishDate) {
+          setFormValidationError(
+            `Tanggal Mulai dan Tanggal Selesai Produksi pada "${p.fileName}" wajib diisi secara manual.`
+          );
+          setSelectedPreviewId(p.id);
+          return;
+        }
+        if (isFinishBeforeStart(p.productionDate, p.finishDate)) {
+          setFormValidationError(
+            `Tanggal Selesai Produksi pada "${p.fileName}" tidak boleh lebih awal dari Tanggal Mulai Produksi.`
+          );
+          setSelectedPreviewId(p.id);
+          return;
+        }
+        if (!p.materials || p.materials.length === 0) {
+          setFormValidationError(`Daftar material pada "${p.fileName}" kosong.`);
+          setSelectedPreviewId(p.id);
+          return;
+        }
+        const badRowIdx = p.materials.findIndex(
+          (m) =>
+            !m.materialCode?.trim() ||
+            !m.materialName?.trim() ||
+            !m.unit?.trim() ||
+            m.total === null ||
+            m.total === undefined ||
+            !Number.isFinite(m.total) ||
+            m.total < 0
         );
-      });
+        if (badRowIdx !== -1) {
+          const badRow = p.materials[badRowIdx];
+          setFormValidationError(
+            `Baris material ke-${badRowIdx + 1} (${badRow.materialCode || '-'}) pada "${p.fileName}" memiliki kolom kosong atau nilai Kebutuhan tidak valid.`
+          );
+          setSelectedPreviewId(p.id);
+          return;
+        }
+      }
+    } else {
+      if (!formData.orNumber.trim()) {
+        setFormValidationError('Nomor OR wajib diisi atau unggah file Excel Production Schedule.');
+        return;
+      }
+      if (!formData.style.trim()) {
+        setFormValidationError('Style wajib diisi.');
+        return;
+      }
+      if (!formData.productionDate || !formData.finishDate) {
+        setFormValidationError('Tanggal Mulai Produksi dan Tanggal Selesai Produksi wajib diisi.');
+        return;
+      }
+      if (isFinishBeforeStart(formData.productionDate, formData.finishDate)) {
+        setFormValidationError('Tanggal Selesai Produksi tidak boleh lebih awal daripada Tanggal Mulai Produksi.');
+        return;
+      }
+      if (!Number.isFinite(formData.target) || formData.target <= 0) {
+        setFormValidationError('Target Produksi harus lebih besar dari 0.');
+        return;
+      }
+    }
 
     setIsSubmittingForm(true);
+    const saveTimestamp = new Date().toISOString();
+
     try {
-      const payload = {
-        orNumber: formData.orNumber.trim().toUpperCase(),
+      if (hasExcelItems) {
+        const validItems = uploadedExcels.filter((p) => p.status === 'success');
+
+        if (modalMode === 'create') {
+          const savedOrs: string[] = [];
+          for (let idx = 0; idx < validItems.length; idx++) {
+            const p = validItems[idx];
+            const frozenWs = buildFrozenWorksheetFromExcelItem(p, saveTimestamp);
+            const scheduleId = idx === 0 ? createDraftId : generateUuid();
+            const cleanOr = (p.orNumber || '').trim().toUpperCase();
+            const cleanStyle = (p.style || '').trim();
+
+            const result = await addProductionSchedule({
+              id: scheduleId,
+              orNumber: cleanOr,
+              productionDate: p.productionDate,
+              finishDate: p.finishDate,
+              productionLine: 'Produksi',
+              style: cleanStyle,
+              target: Number(p.target || 0),
+              status: 'Terjadwal',
+              worksheets: [frozenWs],
+            });
+
+            if (!result.success) {
+              setFormValidationError(
+                result.error || `Gagal menyimpan jadwal untuk file "${p.fileName}".`
+              );
+              return;
+            }
+            saveOrStyleRelation(cleanOr, cleanStyle);
+            savedOrs.push(cleanOr);
+          }
+
+          // Jump calendar view to the first newly saved schedule's month so the Gantt bar is immediately visible
+          const firstDateParts = validItems[0]?.productionDate?.split('-');
+          if (firstDateParts && firstDateParts.length === 3) {
+            const y = Number(firstDateParts[0]);
+            const m = Number(firstDateParts[1]) - 1;
+            if (Number.isFinite(y) && Number.isFinite(m) && m >= 0 && m <= 11) {
+              setCurrentYear(y);
+              setCurrentMonth(m);
+            }
+          }
+
+          setCrudFeedback({
+            type: 'success',
+            message:
+              savedOrs.length > 1
+                ? `${savedOrs.length} jadwal produksi berhasil disimpan (${savedOrs.join(', ')}).`
+                : `Jadwal produksi OR ${savedOrs[0]} berhasil disimpan.`,
+          });
+          setIsModalOpen(false);
+          return;
+        }
+
+        // Edit mode with Excel items attached
+        if (!editingScheduleId) {
+          setFormValidationError('ID jadwal yang akan diperbarui tidak ditemukan.');
+          return;
+        }
+        const primary = validItems[0];
+        const frozenList = validItems.map((p) => buildFrozenWorksheetFromExcelItem(p, saveTimestamp));
+        const cleanOr = (primary.orNumber || '').trim().toUpperCase();
+        const cleanStyle = (primary.style || '').trim();
+        const totalTarget =
+          validItems.length === 1
+            ? Number(primary.target || 0)
+            : validItems.reduce((acc, p) => acc + Number(p.target || 0), 0);
+
+        const result = await updateProductionSchedule(editingScheduleId, {
+          orNumber: cleanOr,
+          productionDate: primary.productionDate,
+          finishDate: primary.finishDate,
+          productionLine: editingOriginalLine || 'Produksi',
+          style: cleanStyle,
+          target: totalTarget,
+          status: formData.status,
+          worksheets: frozenList,
+        });
+
+        if (!result.success) {
+          setFormValidationError(result.error || 'Gagal menyimpan perubahan jadwal produksi.');
+          return;
+        }
+
+        frozenList.forEach((ws) => {
+          if (ws.orNumber && ws.style) {
+            saveOrStyleRelation(ws.orNumber.trim().toUpperCase(), ws.style.trim());
+          }
+        });
+
+        setCrudFeedback({
+          type: 'success',
+          message: `Perubahan jadwal produksi ${cleanOr} berhasil disimpan.`,
+        });
+        setIsModalOpen(false);
+        return;
+      }
+
+      // Manual schedule without uploaded Excel
+      const cleanOr = formData.orNumber.trim().toUpperCase();
+      const cleanStyle = formData.style.trim();
+      const manualPayload = {
+        orNumber: cleanOr,
         productionDate: formData.productionDate,
         finishDate: formData.finishDate,
-        productionLine: formData.productionLine,
-        style: formData.style.trim(),
+        productionLine: modalMode === 'edit' ? editingOriginalLine || 'Produksi' : 'Produksi',
+        style: cleanStyle,
         target: Number(formData.target),
         status: formData.status,
-        worksheets: validWorksheets.length > 0 ? validWorksheets : undefined,
       };
 
       const result =
         modalMode === 'create'
-          ? await addProductionSchedule({ id: createDraftId, ...payload })
+          ? await addProductionSchedule({ id: createDraftId, ...manualPayload })
           : editingScheduleId
-            ? await updateProductionSchedule(editingScheduleId, payload)
+            ? await updateProductionSchedule(editingScheduleId, manualPayload)
             : { success: false, error: 'ID jadwal yang akan diperbarui tidak ditemukan.' };
 
       if (!result.success) {
@@ -1272,20 +1073,26 @@ export const ProductionScheduleView: React.FC = () => {
         return;
       }
 
-      // Save relation for main schedule OR and each worksheet's OR
-      saveOrStyleRelation(payload.orNumber, payload.style);
-      validWorksheets.forEach((ws) => {
-        if (ws.orNumber && ws.style) {
-          saveOrStyleRelation(ws.orNumber.trim().toUpperCase(), ws.style.trim());
+      saveOrStyleRelation(cleanOr, cleanStyle);
+
+      if (modalMode === 'create') {
+        const parts = manualPayload.productionDate.split('-');
+        if (parts.length === 3) {
+          const y = Number(parts[0]);
+          const m = Number(parts[1]) - 1;
+          if (Number.isFinite(y) && Number.isFinite(m) && m >= 0 && m <= 11) {
+            setCurrentYear(y);
+            setCurrentMonth(m);
+          }
         }
-      });
+      }
 
       setCrudFeedback({
         type: 'success',
         message:
           modalMode === 'create'
-            ? `Jadwal produksi ${payload.orNumber} berhasil disimpan.`
-            : `Perubahan jadwal produksi ${payload.orNumber} berhasil disimpan.`,
+            ? `Jadwal produksi ${cleanOr} berhasil disimpan.`
+            : `Perubahan jadwal produksi ${cleanOr} berhasil disimpan.`,
       });
       setIsModalOpen(false);
     } catch (err: any) {
@@ -1321,37 +1128,36 @@ export const ProductionScheduleView: React.FC = () => {
     }
   };
 
-  // Filter lines to display
-  const displayLines = useMemo(() => {
-    if (selectedLineFilter === 'ALL') return defaultLines;
-    return defaultLines.filter((l) => l === selectedLineFilter);
-  }, [defaultLines, selectedLineFilter]);
-
-  // Total matching schedules based on line and typed OR / Style search
-  const totalVisibleSchedulesAcrossBoard = useMemo(() => {
+  // Visible schedules matching search filter across the board
+  const filteredSchedules = useMemo(() => {
     return productionSchedules.filter((s) => {
-      if (selectedLineFilter !== 'ALL' && s.productionLine !== selectedLineFilter) return false;
       if (orSearchInput.trim()) {
         const q = orSearchInput.trim().toUpperCase();
         const matchOr = s.orNumber.toUpperCase().includes(q);
         const matchStyle = (s.style || '').toUpperCase().includes(q);
-        if (!matchOr && !matchStyle) return false;
+        const matchProdNo = (s.worksheets?.[0]?.worksheetNo || '').toUpperCase().includes(q);
+        if (!matchOr && !matchStyle && !matchProdNo) return false;
       }
       return true;
     });
-  }, [productionSchedules, selectedLineFilter, orSearchInput]);
+  }, [productionSchedules, orSearchInput]);
 
-  // Color generator for schedule blocks
-  const getBlockColor = (sch: ProductionSchedule, hasConflict: boolean) => {
-    if (hasConflict) {
-      return {
-        bg: 'bg-amber-500 hover:bg-amber-600',
-        border: 'border-amber-600 ring-2 ring-amber-300',
-        text: 'text-white',
-        badge: 'bg-amber-800 text-amber-100',
-      };
-    }
-    // Color variants based on line / OR
+  // Schedules overlapping currently displayed month, packed onto horizontal non-overlapping lanes
+  const visibleMonthSchedules = useMemo(() => {
+    return filteredSchedules.filter((s) =>
+      doesScheduleOverlapMonth(s, currentYear, currentMonth, daysInMonth)
+    );
+  }, [filteredSchedules, currentYear, currentMonth, daysInMonth]);
+
+  const boardLayout = useMemo(() => {
+    return layoutGanttLineSchedules(visibleMonthSchedules, {
+      year: currentYear,
+      month0: currentMonth,
+      daysInMonth,
+    });
+  }, [visibleMonthSchedules, currentYear, currentMonth, daysInMonth]);
+
+  const getBlockColor = (sch: ProductionSchedule) => {
     const colors = [
       { bg: 'bg-blue-600 hover:bg-blue-700', border: 'border-blue-700', text: 'text-white', badge: 'bg-blue-800 text-blue-100' },
       { bg: 'bg-teal-600 hover:bg-teal-700', border: 'border-teal-700', text: 'text-white', badge: 'bg-teal-800 text-teal-100' },
@@ -1365,6 +1171,23 @@ export const ProductionScheduleView: React.FC = () => {
 
   return (
     <div className="space-y-6">
+      {/* Hidden input for per-card Replace Excel File */}
+      <input
+        ref={replaceFileInputRef}
+        type="file"
+        accept=".xls,.xlsx,.csv"
+        className="hidden"
+        onChange={(e) => {
+          const targetId = replacingItemId;
+          const file = e.target.files?.[0];
+          e.target.value = '';
+          setReplacingItemId(null);
+          if (targetId && file) {
+            handleReplaceExcelFile(targetId, file);
+          }
+        }}
+      />
+
       {/* Header bar */}
       <div className="p-5 bg-white rounded-lg border border-slate-200 shadow-xs flex flex-col md:flex-row md:items-center justify-between gap-4">
         <div>
@@ -1372,19 +1195,19 @@ export const ProductionScheduleView: React.FC = () => {
             <h2 className="text-base md:text-lg font-bold text-slate-900">
               Production Planning Board (Gantt Calendar)
             </h2>
-            <span className="text-xs px-2.5 py-0.5 rounded-full bg-blue-100 text-blue-800 font-semibold">
+            <span className="text-xs px-2.5 py-0.5 rounded bg-blue-100 text-blue-800 font-semibold">
               Gantt View
             </span>
           </div>
           <p className="text-xs text-slate-500 mt-0.5">
-            Jadwal produksi horizontal per Line Produksi. Klik blok jadwal untuk melihat detail, edit, atau hapus.
+            Unggah file Excel Production Schedule (`.xls` / `.xlsx`) dan atur rentang tanggal produksi. Klik blok jadwal untuk melihat detail, edit, atau hapus.
           </p>
         </div>
 
         <div className="flex flex-wrap items-center gap-2.5">
           <button
             onClick={openCreateModal}
-            className="px-3.5 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded-md shadow-xs transition-colors flex items-center gap-1.5"
+            className="px-3.5 py-2 text-xs font-semibold bg-blue-600 hover:bg-blue-700 text-white rounded-md shadow-xs transition-colors flex items-center gap-1.5 cursor-pointer"
           >
             <Plus className="w-4 h-4" />
             Tambah Jadwal Produksi
@@ -1421,45 +1244,7 @@ export const ProductionScheduleView: React.FC = () => {
         </div>
       )}
 
-      {/* Global Collision Notification Banner if any conflicts exist */}
-      {conflictsList.length > 0 && (
-        <div className="p-4 bg-amber-50 border border-amber-300 rounded-lg shadow-2xs">
-          <div className="flex items-start gap-3">
-            <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
-            <div className="space-y-1.5 flex-1">
-              <div className="text-xs font-bold text-amber-900 flex items-center gap-2">
-                Peringatan: Terdeteksi {conflictsList.length} Jadwal Produksi yang Bertabrakan (Collision)
-              </div>
-              <p className="text-xs text-amber-800">
-                Sesuai kebijakan PPIC, jadwal pada lini yang sama tetap diizinkan disimpan. Periksa detail lini berikut untuk antisipasi kapasitas:
-              </p>
-              <div className="flex flex-wrap gap-2 pt-1">
-                {conflictsList.map((c) => (
-                  <button
-                    key={c.scheduleId}
-                    onClick={() => {
-                      const sch = productionSchedules.find((s) => s.id === c.scheduleId);
-                      if (sch) {
-                        setDetailSelectedWsId(null);
-                        setRefreshFeedback(null);
-                        setDetailActionError(null);
-                        setConfirmDeleteId(null);
-                        setActiveDetailSchedule(sch);
-                      }
-                    }}
-                    className="inline-flex items-center gap-1 text-[11px] font-mono bg-white hover:bg-amber-100 px-2 py-0.5 rounded border border-amber-300 text-amber-900 shadow-2xs"
-                  >
-                    <span>{c.orNumber} ({c.line}):</span>
-                    <span className="font-bold underline">bentrok dg {c.conflictingWith.map((cw) => cw.orNumber).join(', ')}</span>
-                  </button>
-                ))}
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Toolbar: Month Navigation & Line Filter */}
+      {/* Toolbar: Month Navigation & OR/Style Search */}
       <div className="p-3.5 bg-white rounded-lg border border-slate-200 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-3">
         {/* Month Selector */}
         <div className="flex items-center gap-2">
@@ -1500,7 +1285,7 @@ export const ProductionScheduleView: React.FC = () => {
 
         {/* Holiday stats in toolbar */}
         <div className="hidden lg:flex items-center gap-2 px-3 py-1.5 bg-rose-50 border border-rose-200 rounded-md text-xs text-rose-900">
-          <span className="w-2 h-2 rounded-full bg-rose-500 animate-pulse"></span>
+          <span className="w-2 h-2 rounded-full bg-rose-500"></span>
           <span>
             Bulan ini: <strong>{holidayStats.totalHolidays} Hari Libur Produksi</strong> ({holidayStats.sundays} Minggu
             {holidayStats.nationalHolidays > 0 ? `, ${holidayStats.nationalHolidays} Libur Nasional` : ''}
@@ -1508,59 +1293,37 @@ export const ProductionScheduleView: React.FC = () => {
           </span>
         </div>
 
-        {/* Line & OR Filters */}
-        <div className="flex flex-wrap items-center gap-3">
-          {/* Line Filter */}
-          <div className="flex items-center gap-1.5">
-            <Filter className="w-3.5 h-3.5 text-slate-400" />
-            <span className="text-xs font-semibold text-slate-600">Filter Line:</span>
-            <select
-              value={selectedLineFilter}
-              onChange={(e) => setSelectedLineFilter(e.target.value)}
-              className="px-2.5 py-1.5 text-xs bg-slate-50 border border-slate-200 rounded-md text-slate-800 focus:outline-hidden focus:ring-1 focus:ring-blue-500"
-            >
-              <option value="ALL">Semua Line ({defaultLines.length})</option>
-              {defaultLines.map((ln) => (
-                <option key={ln} value={ln}>
-                  {ln}
-                </option>
-              ))}
-            </select>
-          </div>
-
-          {/* OR Searchbar (Input Ketik Manual - Single Source of Truth from Upload Excel) */}
-          <div className="flex items-center gap-1.5 min-w-[240px] max-w-xs">
-            <span className="text-xs font-semibold text-slate-600 whitespace-nowrap flex items-center gap-1">
-              <Hash className="w-3.5 h-3.5 text-blue-600" />
-              Cari OR:
-            </span>
-            <div className="relative w-full">
-              <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
-              <input
-                type="text"
-                value={orSearchInput}
-                onChange={(e) => setOrSearchInput(e.target.value)}
-                placeholder={registeredOrNumbers.length === 0 ? "Belum ada Nomor OR" : "Ketik Nomor OR / Style..."}
-                disabled={registeredOrNumbers.length === 0}
-                className="w-full pl-8 pr-7 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded-md font-mono font-semibold text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:bg-white"
-              />
-              {orSearchInput && (
-                <button
-                  type="button"
-                  onClick={() => setOrSearchInput('')}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
-                  title="Hapus pencarian"
-                >
-                  <X className="w-3.5 h-3.5" />
-                </button>
-              )}
-            </div>
+        {/* OR / Nomor Produksi / Style Searchbar */}
+        <div className="flex items-center gap-1.5 min-w-[260px] max-w-sm">
+          <span className="text-xs font-semibold text-slate-600 whitespace-nowrap flex items-center gap-1">
+            <Hash className="w-3.5 h-3.5 text-blue-600" />
+            Cari Jadwal:
+          </span>
+          <div className="relative w-full">
+            <Search className="w-3.5 h-3.5 text-slate-400 absolute left-2.5 top-1/2 -translate-y-1/2" />
+            <input
+              type="text"
+              value={orSearchInput}
+              onChange={(e) => setOrSearchInput(e.target.value)}
+              placeholder="Ketik Nomor OR / Style / No. Produksi..."
+              className="w-full pl-8 pr-7 py-1.5 text-xs bg-slate-50 border border-slate-300 rounded-md font-mono font-semibold text-slate-900 placeholder:text-slate-400 focus:outline-none focus:ring-1 focus:ring-blue-500 focus:bg-white"
+            />
+            {orSearchInput && (
+              <button
+                type="button"
+                onClick={() => setOrSearchInput('')}
+                className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-600 p-0.5 cursor-pointer"
+                title="Hapus pencarian"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            )}
           </div>
         </div>
       </div>
 
       {/* Message: Data tidak ditemukan when search query has no match */}
-      {orSearchInput.trim() && totalVisibleSchedulesAcrossBoard.length === 0 && (
+      {orSearchInput.trim() && filteredSchedules.length === 0 && (
         <div className="p-4 bg-amber-50 border border-amber-300 rounded-lg text-xs text-amber-900 flex items-center justify-between">
           <div className="flex items-center gap-2">
             <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
@@ -1577,15 +1340,15 @@ export const ProductionScheduleView: React.FC = () => {
         </div>
       )}
 
-      {/* Production Planning Board (Horizontal Gantt Calendar with Fixed Sticky Line Column & Holiday Markings) */}
+      {/* Production Planning Board (Horizontal Gantt Calendar with Non-Overlapping Lane Packing & Holiday Markings) */}
       <div className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
         <div className="overflow-x-auto relative">
           <div className="min-w-[1224px]">
             {/* Header: Dates Row */}
-            <div className="grid grid-cols-[170px_repeat(31,minmax(34px,1fr))] bg-slate-900 text-white text-xs border-b border-slate-700 font-semibold sticky top-0 z-30">
-              {/* Sticky Line Header Column */}
+            <div className="grid grid-cols-[180px_repeat(31,minmax(34px,1fr))] bg-slate-900 text-white text-xs border-b border-slate-700 font-semibold sticky top-0 z-30">
+              {/* Sticky Schedule Header Column */}
               <div className="sticky left-0 z-40 bg-slate-900 p-3 border-r border-slate-700 flex items-center justify-between shadow-[3px_0_6px_-1px_rgba(0,0,0,0.5)]">
-                <span className="font-bold text-white tracking-wide">Line Produksi</span>
+                <span className="font-bold text-white tracking-wide">Jadwal Produksi</span>
                 <span className="text-[10px] text-slate-400 font-mono">Tgl</span>
               </div>
               {daysArray.map((d) => {
@@ -1631,233 +1394,203 @@ export const ProductionScheduleView: React.FC = () => {
                   </div>
                 );
               })}
-              {/* Fill remaining columns if month < 31 days */}
               {Array.from({ length: 31 - daysInMonth }).map((_, i) => (
                 <div key={`empty-${i}`} className="bg-slate-900/60 border-r border-slate-800" />
               ))}
             </div>
 
-            {/* Rows: Each Production Line */}
-            <div className="divide-y divide-slate-200">
-              {displayLines.map((lineName) => {
-                // Find all schedules on this line
-                const lineSchedules = productionSchedules.filter((s) => s.productionLine === lineName);
+            {/* Unified Schedule Gantt Board Row with Date-Overlap Lane Packing */}
+            <div
+              data-board-row="all-schedules"
+              data-lane-count={boardLayout.laneCount}
+              style={{ minHeight: `${Math.max(boardLayout.rowHeightPx, 96)}px` }}
+              className="grid grid-cols-[180px_repeat(31,minmax(34px,1fr))] relative hover:bg-slate-50/30 transition-colors"
+            >
+              {/* Fixed Sticky Summary Column */}
+              <div className="sticky left-0 z-20 p-3 border-r border-slate-200 bg-white/95 backdrop-blur-xs flex flex-col justify-center shadow-[3px_0_6px_-1px_rgba(0,0,0,0.06)]">
+                <div className="font-bold text-xs text-slate-900 flex items-center gap-1.5">
+                  <Layers className="w-3.5 h-3.5 text-blue-600 shrink-0" />
+                  <span className="truncate">Rencana Produksi</span>
+                </div>
+                <div className="text-[11px] text-slate-600 mt-1 truncate">
+                  {visibleMonthSchedules.length} Jadwal di {monthNames[currentMonth].slice(0, 3)} {currentYear}
+                </div>
+                <div className="text-[10px] text-slate-400 mt-0.5">
+                  {boardLayout.laneCount} Baris Jadwal
+                </div>
+              </div>
 
-                // Filter schedules that touch this active month and match selected OR
-                const visibleSchedules = lineSchedules.filter((s) => {
-                  if (orSearchInput.trim()) {
-                    const q = orSearchInput.trim().toUpperCase();
-                    const matchOr = s.orNumber.toUpperCase().includes(q);
-                    const matchStyle = (s.style || '').toUpperCase().includes(q);
-                    if (!matchOr && !matchStyle) return false;
+              {/* Day Grid Cells */}
+              <div className="col-span-31 grid grid-cols-31 relative">
+                {daysArray.map((d) => {
+                  const isNational = d.holidayInfo.type === 'NATIONAL_HOLIDAY';
+                  const isCuti = d.holidayInfo.type === 'CUTI_BERSAMA';
+                  const isSunday = d.holidayInfo.type === 'SUNDAY';
+
+                  let cellBg = 'border-slate-100 hover:bg-slate-50/50';
+                  let holidayTag = null;
+
+                  if (isNational) {
+                    cellBg = 'bg-rose-100/75 border-rose-200/90';
+                    holidayTag = (
+                      <span className="text-[8px] font-bold text-rose-700/80 uppercase font-mono tracking-tighter select-none leading-none">
+                        LIBUR
+                      </span>
+                    );
+                  } else if (isCuti) {
+                    cellBg = 'bg-amber-100/70 border-amber-200/90';
+                    holidayTag = (
+                      <span className="text-[8px] font-bold text-amber-800/80 uppercase font-mono tracking-tighter select-none leading-none">
+                        CUTI
+                      </span>
+                    );
+                  } else if (isSunday) {
+                    cellBg = 'bg-rose-50/70 border-rose-100/80';
+                    holidayTag = (
+                      <span className="text-[8px] font-bold text-rose-500/70 uppercase font-mono tracking-tighter select-none leading-none">
+                        MIN
+                      </span>
+                    );
+                  } else if (d.isSaturday) {
+                    cellBg = 'bg-slate-50/40 border-slate-100';
                   }
-                  return doesScheduleOverlapMonth(s, currentYear, currentMonth, daysInMonth);
-                });
 
-                const lineLayout = layoutGanttLineSchedules(visibleSchedules, {
-                  year: currentYear,
-                  month0: currentMonth,
-                  daysInMonth,
-                });
-
-                return (
-                  <div
-                    key={lineName}
-                    data-line-name={lineName}
-                    data-lane-count={lineLayout.laneCount}
-                    style={{ minHeight: `${lineLayout.rowHeightPx}px` }}
-                    className="grid grid-cols-[170px_repeat(31,minmax(34px,1fr))] relative hover:bg-slate-50/40 transition-colors"
-                  >
-                    {/* Fixed Sticky Line Column (Left side remains visible while horizontal scrolling) */}
-                    <div className="sticky left-0 z-20 p-3 border-r border-slate-200 bg-white/95 backdrop-blur-xs flex flex-col justify-center shadow-[3px_0_6px_-1px_rgba(0,0,0,0.06)]">
-                      <div className="font-bold text-xs text-slate-900 flex items-center gap-1.5">
-                        <Layers className="w-3.5 h-3.5 text-blue-600 shrink-0" />
-                        <span className="truncate">{lineName}</span>
-                      </div>
-                      <div className="text-[11px] text-slate-500 mt-1 truncate">
-                        {visibleSchedules.length} Jadwal di {monthNames[currentMonth].slice(0, 3)}
-                      </div>
+                  return (
+                    <div
+                      key={d.day}
+                      className={`border-r h-full relative flex flex-col justify-between items-center py-1 transition-colors ${cellBg}`}
+                      title={d.holidayInfo.isHoliday ? `${d.dateStr} - ${d.holidayInfo.name} (Hari Libur Produksi)` : undefined}
+                    >
+                      {holidayTag}
+                      <span />
                     </div>
+                  );
+                })}
+                {Array.from({ length: 31 - daysInMonth }).map((_, i) => (
+                  <div key={`blank-${i}`} className="bg-slate-100/40 border-r border-slate-100" />
+                ))}
 
-                    {/* Day Grid Cells (Background Lines with Holiday Markings) */}
-                    <div className="col-span-31 grid grid-cols-31 relative">
-                      {daysArray.map((d) => {
-                        const isNational = d.holidayInfo.type === 'NATIONAL_HOLIDAY';
-                        const isCuti = d.holidayInfo.type === 'CUTI_BERSAMA';
-                        const isSunday = d.holidayInfo.type === 'SUNDAY';
+                {/* Horizontal Gantt Schedule Blocks packed into non-overlapping lanes */}
+                <div className="absolute inset-0 pointer-events-none">
+                  {boardLayout.items.length === 0 && (
+                    <div className="h-full flex items-center justify-center text-xs text-slate-400">
+                      Belum ada jadwal produksi pada bulan {monthNames[currentMonth]} {currentYear}.
+                    </div>
+                  )}
+                  {boardLayout.items.map(({ schedule: sch, barSpan, laneIndex }) => {
+                    const { startDay, endDay, leftPct, widthPct } = barSpan;
+                    const topPx =
+                      GANTT_ROW_PADDING_Y_PX +
+                      laneIndex * (GANTT_LANE_HEIGHT_PX + GANTT_LANE_GAP_PX);
+                    const colors = getBlockColor(sch);
+                    const prodNo = sch.worksheets?.[0]?.worksheetNo;
 
-                        let cellBg = 'border-slate-100 hover:bg-slate-50/50';
-                        let holidayTag = null;
-
-                        if (isNational) {
-                          cellBg = 'bg-rose-100/75 border-rose-200/90';
-                          holidayTag = (
-                            <span className="text-[8px] font-bold text-rose-700/80 uppercase font-mono tracking-tighter select-none leading-none">
-                              LIBUR
+                    return (
+                      <button
+                        type="button"
+                        key={sch.id}
+                        data-or-number={sch.orNumber}
+                        data-start-day={startDay}
+                        data-end-day={endDay}
+                        data-lane-index={laneIndex}
+                        data-production-date={sch.productionDate}
+                        data-finish-date={sch.finishDate}
+                        aria-label={`Detail jadwal ${sch.orNumber} ${sch.style}`}
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setDetailSelectedWsId(null);
+                          setRefreshFeedback(null);
+                          setDetailActionError(null);
+                          setConfirmDeleteId(null);
+                          setActiveDetailSchedule(sch);
+                        }}
+                        style={{
+                          top: `${topPx}px`,
+                          left: `${leftPct}%`,
+                          width: `${widthPct}%`,
+                          height: `${GANTT_LANE_HEIGHT_PX}px`,
+                        }}
+                        className={`absolute pointer-events-auto rounded-md shadow-xs p-1.5 cursor-pointer transition-colors duration-150 flex items-center justify-between text-left text-xs font-semibold overflow-hidden group ${colors.bg} ${colors.border} ${colors.text}`}
+                        title={`OR ${sch.orNumber}${prodNo ? ` (${prodNo})` : ''} - ${sch.style} | Target: ${formatPpicNumber(sch.target)} | ${sch.productionDate} s/d ${sch.finishDate}`}
+                      >
+                        <div className="flex items-center gap-1.5 truncate">
+                          <span className="font-mono font-bold truncate">
+                            OR {sch.orNumber}
+                          </span>
+                          {prodNo && (
+                            <span className="opacity-85 text-[10px] font-mono truncate hidden lg:inline">
+                              [{prodNo}]
                             </span>
-                          );
-                        } else if (isCuti) {
-                          cellBg = 'bg-amber-100/70 border-amber-200/90';
-                          holidayTag = (
-                            <span className="text-[8px] font-bold text-amber-800/80 uppercase font-mono tracking-tighter select-none leading-none">
-                              CUTI
-                            </span>
-                          );
-                        } else if (isSunday) {
-                          cellBg = 'bg-rose-50/70 border-rose-100/80';
-                          holidayTag = (
-                            <span className="text-[8px] font-bold text-rose-500/70 uppercase font-mono tracking-tighter select-none leading-none">
-                              MIN
-                            </span>
-                          );
-                        } else if (d.isSaturday) {
-                          cellBg = 'bg-slate-50/40 border-slate-100';
-                        }
+                          )}
+                          <span className="opacity-80 text-[11px] truncate hidden md:inline">
+                            · {sch.style}
+                          </span>
+                        </div>
 
-                        return (
-                          <div
-                            key={d.day}
-                            className={`border-r h-full relative flex flex-col justify-between items-center py-1 transition-colors ${cellBg}`}
-                            title={d.holidayInfo.isHoliday ? `${d.dateStr} - ${d.holidayInfo.name} (Hari Libur Produksi)` : undefined}
-                          >
-                            {holidayTag}
-                            <span />
-                          </div>
-                        );
-                      })}
-                      {/* Blank pads for months < 31 */}
-                      {Array.from({ length: 31 - daysInMonth }).map((_, i) => (
-                        <div key={`blank-${i}`} className="bg-slate-100/40 border-r border-slate-100" />
-                      ))}
-
-                      {/* Render Horizontal Gantt Schedule Blocks packed into non-overlapping lanes */}
-                      <div className="absolute inset-0 pointer-events-none">
-                        {lineLayout.items.map(({ schedule: sch, barSpan, laneIndex }) => {
-                          const conflict = getConflictForSchedule(sch.id);
-                          const hasConflict = Boolean(conflict);
-
-                          const { startDay, endDay, leftPct, widthPct } = barSpan;
-                          const topPx =
-                            GANTT_ROW_PADDING_Y_PX +
-                            laneIndex * (GANTT_LANE_HEIGHT_PX + GANTT_LANE_GAP_PX);
-                          const colors = getBlockColor(sch, hasConflict);
-
-                          return (
-                            <button
-                              type="button"
-                              key={sch.id}
-                              data-or-number={sch.orNumber}
-                              data-start-day={startDay}
-                              data-end-day={endDay}
-                              data-lane-index={laneIndex}
-                              data-production-date={sch.productionDate}
-                              data-finish-date={sch.finishDate}
-                              aria-label={`Detail jadwal ${sch.orNumber} ${sch.style}`}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                setDetailSelectedWsId(null);
-                                setRefreshFeedback(null);
-                                setDetailActionError(null);
-                                setConfirmDeleteId(null);
-                                setActiveDetailSchedule(sch);
-                              }}
-                              style={{
-                                top: `${topPx}px`,
-                                left: `${leftPct}%`,
-                                width: `${widthPct}%`,
-                                height: `${GANTT_LANE_HEIGHT_PX}px`,
-                              }}
-                              className={`absolute pointer-events-auto rounded-md shadow-xs p-1.5 cursor-pointer transition-colors duration-150 flex items-center justify-between text-left text-xs font-semibold overflow-hidden group ${colors.bg} ${colors.border} ${colors.text}`}
-                              title={`${sch.orNumber} - ${sch.style} | Target: ${sch.target} | ${sch.productionDate} s/d ${sch.finishDate}${hasConflict ? ' [BENTROK DENGAN ' + conflict?.conflictingWith.map(cw => cw.orNumber).join(', ') + ']' : ''}`}
+                        <div className="flex items-center gap-1 shrink-0 ml-1">
+                          {sch.worksheets && sch.worksheets.length > 0 && (
+                            <span
+                              className="text-[10px] bg-white/25 px-1 py-0.2 rounded flex items-center gap-0.5 font-bold"
+                              title={`${sch.worksheets.length} file Excel terlampir`}
                             >
-                              <div className="flex items-center gap-1.5 truncate">
-                                {hasConflict && (
-                                  <AlertTriangle className="w-3.5 h-3.5 text-white animate-pulse shrink-0" />
-                                )}
-                                <span className="font-mono font-bold truncate">
-                                  {sch.orNumber}
-                                </span>
-                                <span className="opacity-80 text-[11px] truncate hidden md:inline">
-                                  · {sch.style}
-                                </span>
-                              </div>
-
-                              <div className="flex items-center gap-1 shrink-0 ml-1">
-                                {sch.worksheets && sch.worksheets.length > 0 && (
-                                  <span
-                                    className="text-[10px] bg-white/30 backdrop-blur-xs px-1 py-0.2 rounded flex items-center gap-0.5 font-bold"
-                                    title={`${sch.worksheets.length} PDF Worksheet terlampir`}
-                                  >
-                                    <Paperclip className="w-2.5 h-2.5" />
-                                    <span>{sch.worksheets.length}</span>
-                                  </span>
-                                )}
-                                <span className={`text-[10px] font-mono px-1 py-0.2 rounded font-bold ${colors.badge}`}>
-                                  {sch.target.toLocaleString('id-ID')}
-                                </span>
-                              </div>
-
-                              {/* Hover Indicator tooltip badge */}
-                              {hasConflict && (
-                                <span className="absolute top-0.5 right-0.5 w-2 h-2 rounded-full bg-red-400 animate-ping" />
-                              )}
-                            </button>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  </div>
-                );
-              })}
+                              <Paperclip className="w-2.5 h-2.5" />
+                              <span>{sch.worksheets.length}</span>
+                            </span>
+                          )}
+                          <span className={`text-[10px] font-mono px-1 py-0.2 rounded font-bold ${colors.badge}`}>
+                            {formatPpicNumber(sch.target)}
+                          </span>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
             </div>
           </div>
         </div>
 
-        {/* Board Legend with Holiday & Schedule indicators */}
+        {/* Board Legend */}
         <div className="p-3.5 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-4 text-xs text-slate-600">
           <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
             <span className="font-bold text-slate-800 flex items-center gap-1.5">
               <Info className="w-4 h-4 text-blue-600" />
               Legenda Kalender:
             </span>
-            {/* Hari Libur Nasional */}
             <div className="flex items-center gap-1.5">
               <span className="w-3.5 h-3.5 rounded-xs bg-rose-100 border border-rose-300 inline-block shadow-2xs" />
               <span className="font-medium text-rose-950">Hari Libur Nasional (Tanggal Merah)</span>
             </div>
-            {/* Cuti Bersama */}
             <div className="flex items-center gap-1.5">
               <span className="w-3.5 h-3.5 rounded-xs bg-amber-100 border border-amber-300 inline-block shadow-2xs" />
               <span className="font-medium text-amber-950">Cuti Bersama</span>
             </div>
-            {/* Hari Minggu */}
             <div className="flex items-center gap-1.5">
               <span className="w-3.5 h-3.5 rounded-xs bg-rose-50 border border-rose-200 inline-block shadow-2xs" />
               <span className="font-medium text-slate-700">Hari Minggu (Libur Rutin)</span>
             </div>
-            {/* Jadwal Normal */}
             <div className="flex items-center gap-1.5">
               <span className="w-3.5 h-3.5 rounded-xs bg-blue-600 inline-block" />
-              <span>Jadwal Normal (Line Terjadwal)</span>
-            </div>
-            {/* Jadwal Bertabrakan */}
-            <div className="flex items-center gap-1.5">
-              <span className="w-3.5 h-3.5 rounded-xs bg-amber-500 ring-2 ring-amber-300 inline-block" />
-              <span className="font-semibold text-amber-900">Jadwal Bertabrakan (Collision)</span>
+              <span>Jadwal Produksi</span>
             </div>
           </div>
 
           <div className="text-[11px] text-slate-500">
-            * Kolom nama line tetap terkunci di sisi kiri saat kalender digeser secara horizontal.
+            * Kolom informasi jadwal tetap terkunci di sisi kiri saat kalender digeser secara horizontal.
           </div>
         </div>
       </div>
 
-
       {/* Schedule Detail Modal */}
       {activeDetailSchedule && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
-          <div className={`bg-white rounded-xl shadow-2xl border border-slate-200 w-full ${activeDetailSchedule.worksheets && activeDetailSchedule.worksheets.length > 0 ? 'max-w-4xl max-h-[92vh] overflow-y-auto' : 'max-w-lg'} overflow-hidden animate-in fade-in zoom-in-95 duration-150`}>
+          <div
+            className={`bg-white rounded-xl shadow-2xl border border-slate-200 w-full ${
+              activeDetailSchedule.worksheets && activeDetailSchedule.worksheets.length > 0
+                ? 'max-w-4xl max-h-[92vh] overflow-y-auto'
+                : 'max-w-lg'
+            } overflow-hidden animate-in fade-in zoom-in-95 duration-150`}
+          >
             {/* Modal Header */}
             <div className="p-4 bg-slate-900 text-white flex items-center justify-between sticky top-0 z-20">
               <div className="flex items-center gap-2">
@@ -1867,6 +1600,7 @@ export const ProductionScheduleView: React.FC = () => {
               <button
                 onClick={() => setActiveDetailSchedule(null)}
                 className="text-slate-400 hover:text-white"
+                aria-label="Tutup detail jadwal"
               >
                 <X className="w-4 h-4" />
               </button>
@@ -1874,24 +1608,8 @@ export const ProductionScheduleView: React.FC = () => {
 
             {/* Modal Body */}
             <div className="p-5 space-y-4">
-              {/* Collision Alert if active schedule has clash */}
-              {(() => {
-                const conf = getConflictForSchedule(activeDetailSchedule.id);
-                if (!conf) return null;
-                return (
-                  <div className="p-3 bg-amber-50 border border-amber-300 rounded-lg text-xs space-y-1">
-                    <div className="flex items-center gap-1.5 font-bold text-amber-900">
-                      <AlertTriangle className="w-4 h-4 text-amber-600" />
-                      Peringatan Bentrok Jadwal di {activeDetailSchedule.productionLine}
-                    </div>
-                    <p className="text-amber-800">
-                      Jadwal ini bertabrakan tanggal dengan Nomor OR: <strong>{conf.conflictingWith.map((cw) => cw.orNumber).join(', ')}</strong>.
-                    </p>
-                  </div>
-                );
-              })()}
-
-              <div className="grid grid-cols-2 gap-4 text-xs">
+              {/* Primary Schedule Info Grid (NO Line Produksi, NO Delivery Date) */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 text-xs">
                 <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
                   <span className="text-slate-500 block mb-0.5">Nomor OR</span>
                   <span className="text-sm font-bold font-mono text-slate-900">
@@ -1899,15 +1617,15 @@ export const ProductionScheduleView: React.FC = () => {
                   </span>
                 </div>
                 <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
-                  <span className="text-slate-500 block mb-0.5">Line Produksi</span>
-                  <span className="text-sm font-bold text-blue-700">
-                    {activeDetailSchedule.productionLine}
+                  <span className="text-slate-500 block mb-0.5">Nomor Produksi</span>
+                  <span className="text-sm font-bold font-mono text-blue-700">
+                    {activeDetailSchedule.worksheets?.[0]?.worksheetNo || '-'}
                   </span>
                 </div>
               </div>
 
               <div className="p-3 bg-slate-50 rounded-lg border border-slate-100 text-xs">
-                <span className="text-slate-500 block mb-0.5">Style Pakaian / Produk</span>
+                <span className="text-slate-500 block mb-0.5">Style</span>
                 <span className="text-xs font-semibold text-slate-800">
                   {activeDetailSchedule.style}
                 </span>
@@ -1917,24 +1635,24 @@ export const ProductionScheduleView: React.FC = () => {
                 <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
                   <span className="text-slate-500 block mb-0.5">Target Produksi</span>
                   <span className="text-sm font-bold font-mono text-slate-900">
-                    {activeDetailSchedule.target.toLocaleString('id-ID')} pcs
+                    {formatPpicNumber(activeDetailSchedule.target)}
                   </span>
                 </div>
                 <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
-                  <span className="text-slate-500 block mb-0.5">Tanggal Mulai</span>
+                  <span className="text-slate-500 block mb-0.5">Tanggal Mulai Produksi</span>
                   <span className="text-xs font-mono font-bold text-slate-800">
                     {activeDetailSchedule.productionDate}
                   </span>
                 </div>
                 <div className="p-3 bg-slate-50 rounded-lg border border-slate-100">
-                  <span className="text-slate-500 block mb-0.5">Tanggal Selesai</span>
+                  <span className="text-slate-500 block mb-0.5">Tanggal Selesai Produksi</span>
                   <span className="text-xs font-mono font-bold text-slate-800">
                     {activeDetailSchedule.finishDate}
                   </span>
                 </div>
               </div>
 
-              {/* Attached PDF Worksheets Section (Menampilkan Snapshot Tersimpan - Tanpa Auto-Rematch) */}
+              {/* Attached Excel Schedule Section (Saved Frozen Snapshot) */}
               {activeDetailSchedule.worksheets && activeDetailSchedule.worksheets.length > 0 && (() => {
                 const wsList = activeDetailSchedule.worksheets;
                 const activeWs = wsList.find((w) => w.id === detailSelectedWsId) || wsList[0];
@@ -1962,7 +1680,7 @@ export const ProductionScheduleView: React.FC = () => {
                   ? `${activeWs.matchedUploadDate}${activeWs.matchedUploadTime ? ` · ${activeWs.matchedUploadTime}` : ''}`
                   : activeWs.matchedUploadId
                     ? `Upload ID ${activeWs.matchedUploadId.slice(0, 8)}`
-                    : 'Belum ada upload Excel untuk OR ini saat snapshot';
+                    : 'Belum ada upload Master Data untuk OR ini saat snapshot';
                 const syncedTimeLabel = activeWs.lastSyncedAt
                   ? new Intl.DateTimeFormat('id-ID', {
                       timeZone: 'Asia/Jakarta',
@@ -1978,32 +1696,26 @@ export const ProductionScheduleView: React.FC = () => {
                   <div className="pt-3 border-t border-slate-200 space-y-3">
                     <div className="flex flex-wrap items-center justify-between gap-2">
                       <div className="flex items-center gap-2">
-                        <Paperclip className="w-4 h-4 text-blue-600" />
+                        <FileSpreadsheet className="w-4 h-4 text-blue-600" />
                         <h4 className="text-xs font-bold text-slate-900">
-                          Worksheet PDF Terlampir ({wsList.length} File)
+                          Data Excel Production Schedule ({snapshotRows.length} Material)
                         </h4>
                         <span className="text-[10px] px-2 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-200 font-semibold">
                           Snapshot Tersimpan
                         </span>
                       </div>
-                      <div className="flex items-center gap-2">
-                        <span className="text-[11px] text-slate-500">
-                          Total Target: {wsList.reduce((acc, w) => acc + (w.target || 0), 0).toLocaleString('id-ID')} pcs
-                        </span>
-                        <button
-                          type="button"
-                          onClick={handleRefreshScheduleSnapshot}
-                          disabled={isRefreshingSnapshot}
-                          className="px-2.5 py-1 text-[11px] font-semibold bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white rounded-md shadow-2xs transition-colors flex items-center gap-1.5 cursor-pointer"
-                          title="Sinkronkan ulang Diterima & Status terhadap upload Excel terbaru per masing-masing No. OR"
-                        >
-                          <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingSnapshot ? 'animate-spin' : ''}`} />
-                          <span>{isRefreshingSnapshot ? 'Menyegarkan...' : 'Refresh Ketersediaan Material'}</span>
-                        </button>
-                      </div>
+                      <button
+                        type="button"
+                        onClick={handleRefreshScheduleSnapshot}
+                        disabled={isRefreshingSnapshot}
+                        className="px-2.5 py-1 text-[11px] font-semibold bg-blue-600 hover:bg-blue-700 disabled:opacity-60 text-white rounded-md shadow-2xs transition-colors flex items-center gap-1.5 cursor-pointer"
+                        title="Perbarui Diterima & Status Kesiapan dari upload Master Data terbaru untuk Nomor OR ini"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${isRefreshingSnapshot ? 'animate-spin' : ''}`} />
+                        <span>{isRefreshingSnapshot ? 'Menyegarkan...' : 'Refresh Ketersediaan Material'}</span>
+                      </button>
                     </div>
 
-                    {/* Inline Feedback after Manual Refresh */}
                     {refreshFeedback && (
                       <div
                         className={`p-2.5 rounded-lg border text-[11px] flex items-center gap-2 ${
@@ -2014,16 +1726,19 @@ export const ProductionScheduleView: React.FC = () => {
                               : 'bg-blue-50 border-blue-200 text-blue-800'
                         }`}
                       >
-                        <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                        {refreshFeedback.type === 'error' ? (
+                          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                        ) : (
+                          <CheckCircle2 className="w-3.5 h-3.5 shrink-0" />
+                        )}
                         <span>{refreshFeedback.message}</span>
                       </div>
                     )}
 
-                    {/* Worksheet Tabs if multiple */}
                     {wsList.length > 1 && (
                       <div className="flex items-center gap-1.5 overflow-x-auto pb-1">
                         {wsList.map((ws, idx) => {
-                          const isSelected = (activeWs.id === ws.id);
+                          const isSelected = activeWs.id === ws.id;
                           return (
                             <button
                               key={ws.id || idx}
@@ -2035,9 +1750,13 @@ export const ProductionScheduleView: React.FC = () => {
                                   : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
                               }`}
                             >
-                              <FileText className="w-3.5 h-3.5" />
+                              <FileSpreadsheet className="w-3.5 h-3.5" />
                               <span>{ws.fileName}</span>
-                              <span className={`text-[10px] px-1.5 py-0.2 rounded-full ${isSelected ? 'bg-blue-700 text-blue-100' : 'bg-slate-200 text-slate-600'}`}>
+                              <span
+                                className={`text-[10px] px-1.5 py-0.2 rounded ${
+                                  isSelected ? 'bg-blue-700 text-blue-100' : 'bg-slate-200 text-slate-600'
+                                }`}
+                              >
                                 OR {ws.orNumber}
                               </span>
                             </button>
@@ -2046,29 +1765,32 @@ export const ProductionScheduleView: React.FC = () => {
                       </div>
                     )}
 
-                    {/* Active Worksheet Overview Card */}
                     <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-2">
                       <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
-                        <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-2 flex-wrap">
                           <span className="font-bold text-slate-800">{activeWs.fileName}</span>
                           <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-blue-100 text-blue-800 font-bold">
-                            No. OR: {activeWs.orNumber}
+                            OR: {activeWs.orNumber}
                           </span>
+                          {activeWs.worksheetNo && (
+                            <span className="text-[11px] font-mono px-2 py-0.5 rounded bg-slate-200 text-slate-800 font-semibold">
+                              No. Prod: {activeWs.worksheetNo}
+                            </span>
+                          )}
                         </div>
                         <div className="flex items-center gap-3 text-xs">
                           <span className="text-slate-600">
                             Style: <strong>{activeWs.style}</strong>
                           </span>
                           <span className="text-slate-600">
-                            Target (Total Qty): <strong className="font-mono text-slate-900">{activeWs.target.toLocaleString('id-ID')} pcs</strong>
+                            Target Produksi: <strong className="font-mono text-slate-900">{formatPpicNumber(activeWs.target)}</strong>
                           </span>
                         </div>
                       </div>
 
-                      {/* Status Badges & Provenance */}
                       <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] pt-1 border-t border-slate-200/60">
                         <div className="flex flex-wrap items-center gap-2">
-                          <span className="text-slate-500 font-medium">Material ({snapshotRows.length} item):</span>
+                          <span className="text-slate-500 font-medium">Material ({snapshotRows.length} baris):</span>
                           <span className="px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 font-semibold">
                             READY: {readyCount}
                           </span>
@@ -2086,7 +1808,9 @@ export const ProductionScheduleView: React.FC = () => {
                             Sumber Upload: <strong className="text-slate-700 font-mono">{uploadSourceLabel}</strong>
                           </span>
                           {syncedTimeLabel && (
-                            <span>· Disinkronkan: <strong className="text-slate-700">{syncedTimeLabel}</strong></span>
+                            <span>
+                              · Disinkronkan: <strong className="text-slate-700">{syncedTimeLabel}</strong>
+                            </span>
                           )}
                         </div>
                       </div>
@@ -2101,9 +1825,9 @@ export const ProductionScheduleView: React.FC = () => {
                               <th className="py-2 px-3">Kode Material</th>
                               <th className="py-2 px-3">Nama Material</th>
                               <th className="py-2 px-2 text-center">Satuan</th>
-                              <th className="py-2 px-3 text-right">Total</th>
+                              <th className="py-2 px-3 text-right">Kebutuhan</th>
                               <th className="py-2 px-3 text-right">Diterima</th>
-                              <th className="py-2 px-3 text-center">Status</th>
+                              <th className="py-2 px-3 text-center">Status Kesiapan</th>
                             </tr>
                           </thead>
                           <tbody className="divide-y divide-slate-100">
@@ -2112,20 +1836,18 @@ export const ProductionScheduleView: React.FC = () => {
                                 <td className="py-2 px-3 font-mono font-medium text-slate-900 whitespace-nowrap">
                                   {item.materialCode}
                                 </td>
-                                <td className="py-2 px-3 text-slate-800">
-                                  {item.materialName}
-                                </td>
+                                <td className="py-2 px-3 text-slate-800">{item.materialName}</td>
                                 <td className="py-2 px-2 text-center text-slate-600 font-mono text-[11px]">
                                   {item.unit}
                                 </td>
                                 <td className="py-2 px-3 text-right font-mono font-semibold text-slate-900">
                                   {item.total !== null && item.total !== undefined
-                                    ? item.total.toLocaleString('id-ID', { maximumFractionDigits: 4 })
+                                    ? formatPpicNumber(item.total)
                                     : '-'}
                                 </td>
                                 <td className="py-2 px-3 text-right font-mono text-slate-900">
                                   {item.receivedQty !== null && item.receivedQty !== undefined ? (
-                                    <span className="font-bold">{item.receivedQty.toLocaleString('id-ID')}</span>
+                                    <span className="font-bold">{formatPpicNumber(item.receivedQty)}</span>
                                   ) : (
                                     <span className="text-slate-400">-</span>
                                   )}
@@ -2140,7 +1862,10 @@ export const ProductionScheduleView: React.FC = () => {
                                       BELUM READY
                                     </span>
                                   ) : (
-                                    <span className="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-100 text-slate-500 border border-slate-300" title="Tidak ditemukan di upload Excel terbaru untuk No. OR ini">
+                                    <span
+                                      className="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-100 text-slate-500 border border-slate-300"
+                                      title="Tidak ditemukan di upload Master Data terbaru untuk Nomor OR ini"
+                                    >
                                       -
                                     </span>
                                   )}
@@ -2184,9 +1909,7 @@ export const ProductionScheduleView: React.FC = () => {
                 <div className="flex items-center gap-2">
                   {confirmDeleteId === activeDetailSchedule.id ? (
                     <div className="flex items-center gap-1.5 bg-rose-50 border border-rose-200 px-2.5 py-1 rounded">
-                      <span className="text-[11px] font-semibold text-rose-800">
-                        Yakin hapus?
-                      </span>
+                      <span className="text-[11px] font-semibold text-rose-800">Yakin hapus?</span>
                       <button
                         type="button"
                         onClick={() => confirmDeleteSchedule(activeDetailSchedule.id)}
@@ -2238,13 +1961,19 @@ export const ProductionScheduleView: React.FC = () => {
       {/* Add / Edit Schedule Form Modal */}
       {isModalOpen && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
-          <div className={`bg-white rounded-xl shadow-2xl border border-slate-200 w-full ${uploadedPdfs.length > 0 ? 'max-w-4xl' : 'max-w-xl'} max-h-[92vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-150`}>
+          <div
+            className={`bg-white rounded-xl shadow-2xl border border-slate-200 w-full ${
+              uploadedExcels.length > 0 ? 'max-w-5xl' : 'max-w-xl'
+            } max-h-[92vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-150`}
+          >
             {/* Header */}
             <div className="p-4 bg-slate-900 text-white flex items-center justify-between sticky top-0 z-20">
               <div className="flex items-center gap-2">
                 <Calendar className="w-4 h-4 text-blue-400" />
                 <h3 className="text-sm font-bold">
-                  {modalMode === 'create' ? 'Tambah Jadwal Produksi Baru' : 'Perbarui Jadwal Produksi'}
+                  {modalMode === 'create'
+                    ? 'Tambah Jadwal Produksi (Upload Excel Production Schedule)'
+                    : 'Perbarui Jadwal Produksi'}
                 </h3>
               </div>
               <button
@@ -2260,127 +1989,103 @@ export const ProductionScheduleView: React.FC = () => {
 
             {/* Form */}
             <form onSubmit={handleSubmitForm} className="p-5 space-y-4">
-              {/* Validation error banner */}
               {formValidationError && (
-                <div className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700 flex items-center gap-2">
+                <div
+                  role="alert"
+                  className="p-3 bg-red-50 border border-red-200 rounded-lg text-xs text-red-700 flex items-center gap-2"
+                >
                   <AlertTriangle className="w-4 h-4 shrink-0 text-red-500" />
                   <span>{formValidationError}</span>
                 </div>
               )}
 
-              {/* Conflict warning preview (Allowed to save!) */}
-              {formConflictPreview && (
-                <div className="p-3 bg-amber-50 border border-amber-300 rounded-lg text-xs space-y-1">
-                  <div className="flex items-center gap-1.5 font-bold text-amber-900">
-                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
-                    Peringatan Bentrok Jadwal di {formData.productionLine}
-                  </div>
-                  <p className="text-amber-800">
-                    Jadwal bertabrakan dengan:
-                  </p>
-                  <ul className="list-disc pl-4 space-y-0.5 text-amber-900">
-                    {formConflictPreview.map((c, i) => (
-                      <li key={i}>
-                        <strong>{c.orNumber}</strong> ({c.style}) rentang {c.dates}
-                      </li>
-                    ))}
-                  </ul>
-                  <p className="text-[11px] text-amber-700 pt-1 font-medium">
-                    * Sesuai ketentuan PPIC, Anda tetap dapat menyimpan jadwal ini tanpa diblokir.
-                  </p>
-                </div>
-              )}
-
-              {/* SECTION: Upload PDF Worksheet (Multiple Files Supported) */}
+              {/* SECTION: Upload Excel Production Schedule (Multi-File, Preview Before Save) */}
               <div className="p-4 bg-slate-50 border border-slate-200 rounded-xl space-y-3">
                 <div className="flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <div className="w-7 h-7 rounded-lg bg-blue-100 flex items-center justify-center text-blue-600">
-                      <FileText className="w-4 h-4" />
+                    <div className="w-7 h-7 rounded-lg bg-emerald-100 flex items-center justify-center text-emerald-700">
+                      <FileSpreadsheet className="w-4 h-4" />
                     </div>
                     <div>
                       <h4 className="text-xs font-bold text-slate-900 flex items-center gap-1.5">
-                        Upload PDF Worksheet (Multi-File)
+                        Upload Excel Production Schedule (Multi-File)
                         <span className="text-[10px] px-1.5 py-0.2 rounded font-normal bg-blue-50 text-blue-700 border border-blue-200">
-                          Opsional / Otomatis
+                          1 File = 1 Jadwal Produksi
                         </span>
                       </h4>
                       <p className="text-[11px] text-slate-500">
-                        Ekstraksi otomatis No. OR, Style, Target Produksi (Total Qty), dan Kebutuhan Material dari dokumen PDF Worksheet.
+                        Membaca Nomor OR (dari Source), Nomor Produksi (Reference), Style, Target Produksi, dan Raw Materials dari file Excel (.xls / .xlsx / .csv). Data dipreview terlebih dahulu dan baru disimpan setelah konfirmasi.
                       </p>
                     </div>
                   </div>
                 </div>
 
-                {/* Dropzone Upload Button */}
+                {/* Dropzone / Add File Button */}
                 <div>
                   <label
-                    htmlFor="worksheet-pdf-input"
+                    htmlFor="schedule-excel-input"
                     className={`border-2 border-dashed rounded-lg p-3.5 flex flex-col items-center justify-center cursor-pointer transition-colors ${
-                      isProcessingPdfs
+                      isProcessingExcels
                         ? 'border-blue-400 bg-blue-50/50'
                         : 'border-slate-300 hover:border-blue-500 hover:bg-white bg-slate-50/60'
                     }`}
                   >
                     <input
-                      id="worksheet-pdf-input"
+                      id="schedule-excel-input"
                       type="file"
-                      accept=".pdf,application/pdf"
-                      multiple
-                      disabled={isProcessingPdfs}
+                      accept=".xls,.xlsx,.csv"
+                      multiple={modalMode === 'create'}
+                      disabled={isProcessingExcels}
                       className="hidden"
                       onChange={(e) => {
                         if (e.target.files && e.target.files.length > 0) {
-                          handlePdfFilesUpload(e.target.files);
+                          handleExcelFilesUpload(e.target.files);
                           e.target.value = '';
                         }
                       }}
                     />
-                    {isProcessingPdfs ? (
+                    {isProcessingExcels ? (
                       <div className="flex items-center gap-2 text-xs font-semibold text-blue-700">
                         <Loader2 className="w-4 h-4 animate-spin text-blue-600" />
-                        <span>Mengekstrak teks PDF & mencocokkan dengan Master Data...</span>
+                        <span>Membaca file Excel & mencocokkan dengan Master Data terbaru...</span>
                       </div>
                     ) : (
                       <div className="flex flex-col items-center text-center gap-1">
                         <div className="flex items-center gap-1.5 text-xs font-semibold text-slate-700">
                           <Upload className="w-4 h-4 text-blue-600" />
-                          <span>Klik untuk memilih atau seret beberapa file PDF Worksheet ke sini</span>
+                          <span>
+                            {uploadedExcels.length > 0
+                              ? 'Klik untuk menambah file Excel Production Schedule lainnya'
+                              : 'Klik untuk memilih satu atau beberapa file Excel Production Schedule (.xls / .xlsx)'}
+                          </span>
                         </div>
                         <span className="text-[10px] text-slate-400">
-                          Mendukung satu atau banyak file PDF sekaligus (No. OR boleh sama maupun berbeda)
+                          Setiap file diproses secara independen dan dapat ditambah, diganti, atau dihapus sebelum disimpan.
                         </span>
                       </div>
                     )}
                   </label>
                 </div>
 
-                {/* Uploaded PDF List */}
-                {uploadedPdfs.length > 0 && (
-                  <div className="space-y-2 pt-1">
+                {/* Uploaded Excel Queue */}
+                {uploadedExcels.length > 0 && (
+                  <div className="space-y-3 pt-1">
                     <div className="flex items-center justify-between text-xs">
                       <span className="font-semibold text-slate-700">
-                        File Terunggah ({uploadedPdfs.length} PDF):
+                        Daftar File dalam Preview ({uploadedExcels.length} File Excel):
                       </span>
-                      {uploadedPdfs.some((p) => p.status === 'success') && (
-                        <button
-                          type="button"
-                          onClick={handleSyncPdfDataToForm}
-                          className="text-[11px] font-semibold text-blue-700 hover:text-blue-800 flex items-center gap-1"
-                        >
-                          <RefreshCw className="w-3 h-3" />
-                          Sinkronkan Ulang ke Form
-                        </button>
-                      )}
+                      <span className="text-[11px] text-slate-500">
+                        Klik kartu file untuk memeriksa preview & mengisi tanggal mulai/selesai produksi
+                      </span>
                     </div>
 
                     <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                      {uploadedPdfs.map((pdf) => {
-                        const isSelected = selectedPreviewPdfId === pdf.id;
+                      {uploadedExcels.map((excelItem) => {
+                        const isSelected = selectedPreviewId === excelItem.id;
                         return (
                           <div
-                            key={pdf.id}
-                            onClick={() => setSelectedPreviewPdfId(pdf.id)}
+                            key={excelItem.id}
+                            onClick={() => setSelectedPreviewId(excelItem.id)}
                             className={`p-2.5 rounded-lg border text-xs cursor-pointer transition-all flex items-start justify-between gap-2 ${
                               isSelected
                                 ? 'bg-white border-blue-500 shadow-xs ring-1 ring-blue-500'
@@ -2389,181 +2094,115 @@ export const ProductionScheduleView: React.FC = () => {
                           >
                             <div className="min-w-0 flex-1">
                               <div className="flex items-center gap-1.5">
-                                <FileText className={`w-3.5 h-3.5 shrink-0 ${isSelected ? 'text-blue-600' : 'text-slate-400'}`} />
-                                <span className="font-bold text-slate-800 truncate" title={pdf.fileName}>
-                                  {pdf.fileName}
+                                <FileSpreadsheet
+                                  className={`w-3.5 h-3.5 shrink-0 ${
+                                    isSelected ? 'text-blue-600' : 'text-emerald-600'
+                                  }`}
+                                />
+                                <span className="font-bold text-slate-800 truncate" title={excelItem.fileName}>
+                                  {excelItem.fileName}
                                 </span>
                               </div>
 
-                              {pdf.status === 'parsing' && (
-                                <div className="space-y-1 mt-1.5">
-                                  <div className="flex items-center justify-between gap-2 text-[11px] text-blue-700">
-                                    <div className="flex items-center gap-1.5 min-w-0">
-                                      <Loader2 className="w-3 h-3 animate-spin shrink-0" />
-                                      <span className="truncate font-medium">
-                                        {pdf.ocrState?.stageLabel || 'Mengekstrak halaman 1...'}
-                                      </span>
-                                    </div>
-                                    <span className="font-mono text-[10px] font-semibold bg-blue-50 text-blue-700 px-1.5 py-0.2 rounded border border-blue-200 shrink-0">
-                                      Hal. 1
-                                    </span>
-                                  </div>
+                              {excelItem.status === 'parsing' && (
+                                <div className="flex items-center gap-1.5 text-[11px] text-blue-700 mt-1.5">
+                                  <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                                  <span>Memproses Excel & mencocokkan Master Data...</span>
                                 </div>
                               )}
 
-                              {pdf.status === 'error' && (
-                                <div className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded px-2 py-1.5 mt-1.5 space-y-1.5">
+                              {excelItem.status === 'error' && (
+                                <div className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded px-2 py-1.5 mt-1.5">
                                   <div className="flex items-start gap-1.5">
                                     <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-red-600" />
-                                    <span className="leading-snug">{pdf.error}</span>
-                                  </div>
-                                  <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
-                                    <span className="text-[10px] text-red-500">
-                                      PDF lain yang sudah berhasil tetap aman
-                                    </span>
-                                    <button
-                                      type="button"
-                                      onClick={(e) => {
-                                        e.stopPropagation();
-                                        handleRetryPdf(pdf.id);
-                                      }}
-                                      disabled={isProcessingPdfs}
-                                      className="px-2 py-0.5 text-[10px] font-bold bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded flex items-center gap-1 cursor-pointer transition-colors"
-                                    >
-                                      <RefreshCw className="w-2.5 h-2.5" />
-                                      <span>Coba Lagi</span>
-                                    </button>
+                                    <span className="leading-snug">{excelItem.error}</span>
                                   </div>
                                 </div>
                               )}
 
-                              {pdf.status === 'success' && (
+                              {excelItem.status === 'success' && (
                                 <div className="space-y-1 mt-1 text-[11px]">
                                   <div className="flex items-center gap-1.5 flex-wrap">
                                     <span className="px-1.5 py-0.2 rounded font-mono font-bold bg-blue-50 text-blue-700 border border-blue-200">
-                                      OR: {pdf.orNumber || '-'}
+                                      OR: {excelItem.orNumber || '-'}
                                     </span>
-                                    {pdf.worksheetNo && (
-                                      <span className="px-1.5 py-0.2 rounded font-mono bg-slate-100 text-slate-700 border border-slate-200">
-                                        WS: {pdf.worksheetNo}
-                                      </span>
-                                    )}
+                                    <span className="px-1.5 py-0.2 rounded font-mono bg-slate-100 text-slate-700 border border-slate-200">
+                                      No. Prod: {excelItem.productionNumber || '-'}
+                                    </span>
                                     <span className="px-1.5 py-0.2 rounded font-mono font-bold bg-slate-100 text-slate-800 border border-slate-200">
-                                      Target: {pdf.target !== null && pdf.target !== undefined ? pdf.target.toLocaleString('id-ID') : '-'} pcs
+                                      Target:{' '}
+                                      {excelItem.target !== null && excelItem.target !== undefined
+                                        ? formatPpicNumber(excelItem.target)
+                                        : '-'}
                                     </span>
                                     <span className="px-1.5 py-0.2 rounded font-medium bg-emerald-50 text-emerald-700 border border-emerald-200">
-                                      {pdf.materials?.length || 0} Material
+                                      {excelItem.materials?.length || 0} Material
                                     </span>
-                                    {pdf.needsReview && !pdf.reviewConfirmed && (
-                                      <span className="px-1.5 py-0.2 rounded font-semibold bg-amber-50 text-amber-800 border border-amber-300">
-                                        Perlu Review
-                                      </span>
-                                    )}
-                                    {pdf.reviewConfirmed && (
-                                      <span className="px-1.5 py-0.2 rounded font-semibold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                                        Terkonfirmasi
-                                      </span>
-                                    )}
                                   </div>
                                   <p className="text-slate-600 truncate text-[10px]">
-                                    Style: {pdf.style || '-'}
+                                    Style: {excelItem.style || '-'} · Tanggal: {excelItem.productionDate} s/d{' '}
+                                    {excelItem.finishDate}
                                   </p>
                                 </div>
                               )}
                             </div>
 
-                            <button
-                              type="button"
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleRemovePdf(pdf.id);
-                              }}
-                              className="text-slate-400 hover:text-red-600 p-1 rounded hover:bg-red-50 transition-colors shrink-0"
-                              title="Hapus PDF ini"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
+                            <div className="flex items-center gap-1 shrink-0">
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  setReplacingItemId(excelItem.id);
+                                  replaceFileInputRef.current?.click();
+                                }}
+                                disabled={isProcessingExcels}
+                                className="px-2 py-1 text-[10px] font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded transition-colors cursor-pointer"
+                                title="Ganti file Excel ini"
+                              >
+                                Ganti File
+                              </button>
+                              <button
+                                type="button"
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleRemoveExcel(excelItem.id);
+                                }}
+                                className="text-slate-400 hover:text-red-600 p-1 rounded hover:bg-red-50 transition-colors cursor-pointer"
+                                title="Hapus file ini"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </div>
                           </div>
                         );
                       })}
                     </div>
 
-                    {/* Aggregated Target Banner */}
-                    {uploadedPdfs.some((p) => p.status === 'success') && (() => {
-                      const valid = uploadedPdfs.filter((p) => p.status === 'success');
-                      const totalTarget = valid.reduce((acc, p) => acc + (p.target || 0), 0);
-                      return (
-                        <div className="p-2.5 bg-blue-50 border border-blue-200 rounded-lg flex flex-wrap items-center justify-between gap-2 text-xs text-blue-900">
-                          <div className="flex items-center gap-1.5 font-medium">
-                            <Sparkles className="w-3.5 h-3.5 text-blue-600 shrink-0" />
-                            <span>
-                              Total Akumulasi Target ({valid.length} PDF): <strong className="font-mono font-bold">{totalTarget.toLocaleString('id-ID')} pcs</strong>
-                            </span>
-                          </div>
-                          <button
-                            type="button"
-                            onClick={handleSyncPdfDataToForm}
-                            className="px-2.5 py-1 text-[11px] font-bold bg-blue-600 hover:bg-blue-700 text-white rounded shadow-2xs transition-colors"
-                          >
-                            Gunakan sebagai Target Jadwal
-                          </button>
-                        </div>
-                      );
-                    })()}
-
-                    {/* Preview, Validation & Inline Review/Edit Panel for Selected PDF */}
+                    {/* Preview, Validation, Manual Dates & 6-Column Raw Material Table */}
                     {(() => {
-                      const activePdf =
-                        uploadedPdfs.find((p) => p.id === selectedPreviewPdfId) ||
-                        uploadedPdfs.find((p) => p.status === 'success');
-                      if (!activePdf || activePdf.status !== 'success') {
+                      const activeExcel =
+                        uploadedExcels.find((p) => p.id === selectedPreviewId) ||
+                        uploadedExcels.find((p) => p.status === 'success');
+                      if (!activeExcel || activeExcel.status !== 'success') {
                         return null;
                       }
 
-                      const previewRows: FormWorksheetMaterial[] = activePdf.materials || [];
+                      const previewRows: FormExcelMaterial[] = activeExcel.materials || [];
                       const readyCount = previewRows.filter((m) => m.status === 'READY').length;
                       const notReadyCount = previewRows.filter((m) => m.status === 'BELUM READY').length;
                       const notFoundCount = previewRows.filter((m) => !m.isFoundInMasterData).length;
-                      const emptyTotalCount = previewRows.filter(
-                        (m) => m.total === null || m.total === undefined
-                      ).length;
-                      const uploadBadgeLabel = activePdf.matchedUploadDate
-                        ? `Upload Terbaru: ${activePdf.matchedUploadDate}${activePdf.matchedUploadTime ? ` ${activePdf.matchedUploadTime}` : ''}`
-                        : 'Belum ada upload Excel untuk OR ini';
-
-                      const hasBlockingMissingFields =
-                        !activePdf.orNumber?.trim() ||
-                        !activePdf.style?.trim() ||
-                        activePdf.target === null ||
-                        activePdf.target === undefined ||
-                        activePdf.target <= 0 ||
-                        previewRows.length === 0 ||
-                        previewRows.some(
-                          (m) =>
-                            !m.materialCode?.trim() ||
-                            !m.materialName?.trim() ||
-                            !m.unit?.trim() ||
-                            m.total === null ||
-                            m.total === undefined
-                        );
+                      const uploadBadgeLabel = activeExcel.matchedUploadDate
+                        ? `Upload Terbaru: ${activeExcel.matchedUploadDate}${activeExcel.matchedUploadTime ? ` ${activeExcel.matchedUploadTime}` : ''}`
+                        : 'Belum ada upload Master Data untuk OR ini';
 
                       return (
-                        <div className="mt-3 bg-white border border-slate-200 rounded-lg p-3 space-y-3">
+                        <div className="mt-2 bg-white border border-slate-200 rounded-lg p-3 space-y-3">
                           <div className="flex flex-wrap items-center justify-between gap-2 text-xs">
                             <div className="flex items-center gap-1.5">
                               <Eye className="w-3.5 h-3.5 text-blue-600" />
                               <span className="font-bold text-slate-800">
-                                Preview & Validasi Worksheet: {activePdf.fileName}
+                                Preview Jadwal & Material: {activeExcel.fileName}
                               </span>
-                              {activePdf.extractionMethod && (
-                                <span className="text-[10px] px-1.5 py-0.2 rounded bg-slate-100 text-slate-600 border border-slate-200 font-mono">
-                                  {activePdf.extractionMethod === 'gemini'
-                                    ? 'OCR/AI'
-                                    : activePdf.extractionMethod === 'hybrid'
-                                      ? 'Hybrid Teks+AI'
-                                      : 'Teks PDF'}
-                                </span>
-                              )}
                             </div>
                             <div className="flex flex-wrap items-center gap-2 text-[11px]">
                               <span className="px-1.5 py-0.2 rounded bg-emerald-50 text-emerald-700 font-semibold border border-emerald-200">
@@ -2579,10 +2218,10 @@ export const ProductionScheduleView: React.FC = () => {
                               )}
                               <button
                                 type="button"
-                                onClick={handleRefreshFormPdfSnapshots}
+                                onClick={handleRefreshFormExcelSnapshots}
                                 disabled={isRefreshingFormPreview}
                                 className="px-2 py-0.5 text-[10px] font-semibold bg-slate-100 hover:bg-slate-200 text-slate-700 border border-slate-300 rounded flex items-center gap-1 cursor-pointer"
-                                title="Periksa ulang kecocokan terhadap upload Excel terbaru per OR"
+                                title="Periksa ulang kecocokan terhadap upload Master Data terbaru per OR"
                               >
                                 <RefreshCw className={`w-3 h-3 ${isRefreshingFormPreview ? 'animate-spin' : ''}`} />
                                 <span>Refresh Ketersediaan</span>
@@ -2590,55 +2229,35 @@ export const ProductionScheduleView: React.FC = () => {
                             </div>
                           </div>
 
-                          {/* Review / Warning Banner when validation flags exist */}
-                          {activePdf.needsReview && !activePdf.reviewConfirmed && (
-                            <div className="p-2.5 bg-amber-50 border border-amber-300 rounded-lg text-[11px] text-amber-900 space-y-1.5">
-                              <div className="flex flex-wrap items-center justify-between gap-2">
-                                <div className="flex items-center gap-1.5 font-bold">
-                                  <FileWarning className="w-4 h-4 text-amber-600 shrink-0" />
-                                  <span>Perlu Review & Konfirmasi Pengguna Sebelum Disimpan</span>
-                                </div>
-                                {!hasBlockingMissingFields && (
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      handleUpdatePdfField(activePdf.id, { reviewConfirmed: true })
-                                    }
-                                    className="px-2.5 py-1 text-[10px] font-bold bg-amber-600 hover:bg-amber-700 text-white rounded flex items-center gap-1"
-                                  >
-                                    <CheckCircle2 className="w-3 h-3" />
-                                    <span>Konfirmasi Data Sudah Benar</span>
-                                  </button>
-                                )}
+                          {activeExcel.needsReview && activeExcel.reviewReasons && activeExcel.reviewReasons.length > 0 && (
+                            <div className="p-2.5 bg-amber-50 border border-amber-300 rounded-lg text-[11px] text-amber-900 space-y-1">
+                              <div className="flex items-center gap-1.5 font-bold">
+                                <FileWarning className="w-4 h-4 text-amber-600 shrink-0" />
+                                <span>Periksa Data Berikut Sebelum Menyimpan</span>
                               </div>
                               <ul className="list-disc pl-4 space-y-0.5 text-amber-800">
-                                {(activePdf.reviewReasons || []).map((reason, rIdx) => (
+                                {activeExcel.reviewReasons.map((reason, rIdx) => (
                                   <li key={rIdx}>{reason}</li>
                                 ))}
                               </ul>
-                              {emptyTotalCount > 0 && (
-                                <p className="text-[10px] font-semibold text-amber-900">
-                                  * Lengkapi {emptyTotalCount} kolom TOTAL yang masih kosong pada tabel di bawah sebelum menyimpan jadwal.
-                                </p>
-                              )}
                             </div>
                           )}
 
-                          {/* Editable Extracted Identity Grid */}
-                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-2 p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-[11px]">
+                          {/* Extracted Info + Manual Production Start/Finish Dates */}
+                          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-2.5 p-3 bg-slate-50 border border-slate-200 rounded-lg text-[11px]">
                             <div>
                               <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
-                                No. OR * {activePdf.rawOrNumber ? `(${activePdf.rawOrNumber})` : ''}
+                                Nomor OR *{activeExcel.rawSource ? ` (Source: ${activeExcel.rawSource})` : ''}
                               </label>
                               <input
                                 type="text"
-                                value={activePdf.orNumber || ''}
+                                value={activeExcel.orNumber || ''}
                                 onChange={(e) =>
-                                  handleUpdatePdfField(activePdf.id, { orNumber: e.target.value })
+                                  handleUpdateExcelField(activeExcel.id, { orNumber: e.target.value })
                                 }
-                                placeholder="Contoh: 1014"
+                                placeholder="Contoh: 1036"
                                 className={`w-full px-2 py-1 text-xs font-mono font-bold rounded border bg-white ${
-                                  !activePdf.orNumber?.trim()
+                                  !activeExcel.orNumber?.trim()
                                     ? 'border-rose-400 bg-rose-50'
                                     : 'border-slate-300'
                                 }`}
@@ -2646,213 +2265,213 @@ export const ProductionScheduleView: React.FC = () => {
                             </div>
                             <div>
                               <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
-                                No. Worksheet
+                                Nomor Produksi (Reference) *
                               </label>
                               <input
                                 type="text"
-                                value={activePdf.worksheetNo || ''}
+                                value={activeExcel.productionNumber || ''}
                                 onChange={(e) =>
-                                  handleUpdatePdfField(activePdf.id, { worksheetNo: e.target.value })
+                                  handleUpdateExcelField(activeExcel.id, { productionNumber: e.target.value })
                                 }
-                                placeholder="Contoh: WH/MO/22512 · Lot - 1"
+                                placeholder="Contoh: WH/MO/22743"
+                                className={`w-full px-2 py-1 text-xs font-mono rounded border bg-white ${
+                                  !activeExcel.productionNumber?.trim()
+                                    ? 'border-rose-400 bg-rose-50'
+                                    : 'border-slate-300'
+                                }`}
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
+                                Style *
+                              </label>
+                              <input
+                                type="text"
+                                value={activeExcel.style || ''}
+                                onChange={(e) =>
+                                  handleUpdateExcelField(activeExcel.id, { style: e.target.value })
+                                }
+                                placeholder="Style List/Display Name"
+                                className={`w-full px-2 py-1 text-xs rounded border bg-white ${
+                                  !activeExcel.style?.trim()
+                                    ? 'border-rose-400 bg-rose-50'
+                                    : 'border-slate-300'
+                                }`}
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
+                                Target Produksi *
+                              </label>
+                              <input
+                                type="number"
+                                min="0.0001"
+                                step="any"
+                                value={activeExcel.target ?? ''}
+                                onChange={(e) =>
+                                  handleUpdateExcelField(activeExcel.id, {
+                                    target: e.target.value === '' ? null : Number(e.target.value),
+                                  })
+                                }
+                                placeholder="Quantity To Produce"
+                                className={`w-full px-2 py-1 text-xs font-mono font-bold rounded border bg-white ${
+                                  activeExcel.target === null ||
+                                  activeExcel.target === undefined ||
+                                  activeExcel.target <= 0
+                                    ? 'border-rose-400 bg-rose-50'
+                                    : 'border-slate-300'
+                                }`}
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
+                                Tanggal Mulai Produksi (Manual) *
+                              </label>
+                              <input
+                                type="date"
+                                required
+                                value={activeExcel.productionDate}
+                                onChange={(e) =>
+                                  handleUpdateExcelField(activeExcel.id, { productionDate: e.target.value })
+                                }
                                 className="w-full px-2 py-1 text-xs font-mono rounded border border-slate-300 bg-white"
                               />
                             </div>
                             <div>
                               <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
-                                Style No *
+                                Tanggal Selesai Produksi (Manual) *
                               </label>
                               <input
-                                type="text"
-                                value={activePdf.style || ''}
+                                type="date"
+                                required
+                                min={activeExcel.productionDate}
+                                value={activeExcel.finishDate}
                                 onChange={(e) =>
-                                  handleUpdatePdfField(activePdf.id, { style: e.target.value })
+                                  handleUpdateExcelField(activeExcel.id, { finishDate: e.target.value })
                                 }
-                                placeholder="Nama / Kode Style"
-                                className={`w-full px-2 py-1 text-xs rounded border bg-white ${
-                                  !activePdf.style?.trim()
-                                    ? 'border-rose-400 bg-rose-50'
-                                    : 'border-slate-300'
-                                }`}
-                              />
-                            </div>
-                            <div>
-                              <label className="block text-[10px] font-semibold text-slate-500 mb-0.5">
-                                Target Qty * {activePdf.rawTarget ? `(PDF: "${activePdf.rawTarget}")` : ''}
-                              </label>
-                              <input
-                                type="number"
-                                min="1"
-                                step="any"
-                                value={activePdf.target ?? ''}
-                                onChange={(e) =>
-                                  handleUpdatePdfField(activePdf.id, {
-                                    target: e.target.value === '' ? null : Number(e.target.value),
-                                  })
-                                }
-                                placeholder="Target Qty"
-                                className={`w-full px-2 py-1 text-xs font-mono font-bold rounded border bg-white ${
-                                  activePdf.target === null ||
-                                  activePdf.target === undefined ||
-                                  activePdf.target <= 0
-                                    ? 'border-rose-400 bg-rose-50'
-                                    : activePdf.isTargetAmbiguous
-                                      ? 'border-amber-400 bg-amber-50'
-                                      : 'border-slate-300'
-                                }`}
+                                className="w-full px-2 py-1 text-xs font-mono rounded border border-slate-300 bg-white"
                               />
                             </div>
                           </div>
 
-                          <div className="text-[10px] text-slate-500 flex items-center justify-between">
+                          <div className="text-[10px] text-slate-500 flex flex-wrap items-center justify-between gap-2">
                             <span>
-                              Sumber Pencocokan:{' '}
+                              Sumber Pencocokan Master Data:{' '}
                               <strong className="font-mono text-slate-700">{uploadBadgeLabel}</strong>
                             </span>
                             <span className="text-slate-400">
-                              Nilai di preview dapat diperiksa & diedit langsung sebelum disimpan
+                              Satuan dan nilai desimal Kebutuhan dipertahankan persis seperti pada file Excel
                             </span>
                           </div>
 
-                          {/* Mandatory 6-Column Editable Review Table */}
-                          {previewRows.length === 0 ? (
-                            <div className="p-3 bg-rose-50 border border-rose-200 rounded text-xs text-rose-700">
-                              Tidak ada baris material yang terbaca dari tabel MATERIAL & KONSUMSI.
+                          {/* Exact 6-Column Material Preview Table */}
+                          <div className="border border-slate-200 rounded-md overflow-hidden">
+                            <div className="max-h-60 overflow-y-auto">
+                              <table className="w-full text-left text-xs border-collapse">
+                                <thead className="bg-slate-100 text-slate-700 font-semibold text-[11px] uppercase tracking-wider sticky top-0 z-10 border-b border-slate-200">
+                                  <tr>
+                                    <th className="py-2 px-2.5">Kode Material</th>
+                                    <th className="py-2 px-2.5">Nama Material</th>
+                                    <th className="py-2 px-2 text-center">Satuan</th>
+                                    <th className="py-2 px-2.5 text-right">Kebutuhan</th>
+                                    <th className="py-2 px-2.5 text-right">Diterima</th>
+                                    <th className="py-2 px-2.5 text-center">Status Kesiapan</th>
+                                  </tr>
+                                </thead>
+                                <tbody className="divide-y divide-slate-100">
+                                  {previewRows.map((item, idx) => {
+                                    const isMissingTotal = item.total === null || item.total === undefined;
+                                    return (
+                                      <tr
+                                        key={item.id || idx}
+                                        className={`transition-colors ${
+                                          isMissingTotal ? 'bg-amber-50/50 hover:bg-amber-50' : 'hover:bg-slate-50'
+                                        }`}
+                                      >
+                                        <td className="py-1.5 px-2.5 font-mono font-medium text-slate-900 whitespace-nowrap">
+                                          <input
+                                            type="text"
+                                            value={item.materialCode}
+                                            onChange={(e) =>
+                                              handleUpdateExcelMaterialRow(activeExcel.id, idx, {
+                                                materialCode: e.target.value,
+                                              })
+                                            }
+                                            className="w-28 px-1.5 py-0.5 text-[11px] font-mono border border-slate-200 rounded bg-white focus:border-blue-500 focus:outline-hidden"
+                                          />
+                                        </td>
+                                        <td className="py-1.5 px-2.5 text-slate-800">
+                                          <input
+                                            type="text"
+                                            value={item.materialName}
+                                            onChange={(e) =>
+                                              handleUpdateExcelMaterialRow(activeExcel.id, idx, {
+                                                materialName: e.target.value,
+                                              })
+                                            }
+                                            className="w-full min-w-[180px] px-1.5 py-0.5 text-[11px] border border-slate-200 rounded bg-white focus:border-blue-500 focus:outline-hidden"
+                                          />
+                                        </td>
+                                        <td className="py-1.5 px-2 text-center text-slate-600 font-mono text-[11px]">
+                                          <input
+                                            type="text"
+                                            value={item.unit}
+                                            onChange={(e) =>
+                                              handleUpdateExcelMaterialRow(activeExcel.id, idx, {
+                                                unit: e.target.value,
+                                              })
+                                            }
+                                            className="w-16 text-center px-1 py-0.5 text-[11px] font-mono border border-slate-200 rounded bg-white focus:border-blue-500 focus:outline-hidden"
+                                          />
+                                        </td>
+                                        <td className="py-1.5 px-2.5 text-right font-mono font-semibold text-slate-900">
+                                          <input
+                                            type="number"
+                                            min="0"
+                                            step="any"
+                                            value={item.total ?? ''}
+                                            onChange={(e) =>
+                                              handleUpdateExcelMaterialRow(activeExcel.id, idx, {
+                                                total: e.target.value === '' ? null : Number(e.target.value),
+                                              })
+                                            }
+                                            className="w-28 text-right px-1.5 py-0.5 text-[11px] font-mono font-semibold rounded border border-slate-200 bg-white focus:border-blue-500 focus:outline-hidden"
+                                          />
+                                        </td>
+                                        <td className="py-1.5 px-2.5 text-right font-mono text-slate-900">
+                                          {item.receivedQty !== null && item.receivedQty !== undefined ? (
+                                            <span className="font-bold">{formatPpicNumber(item.receivedQty)}</span>
+                                          ) : (
+                                            <span className="text-slate-400">-</span>
+                                          )}
+                                        </td>
+                                        <td className="py-1.5 px-2.5 text-center whitespace-nowrap">
+                                          {item.status === 'READY' ? (
+                                            <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
+                                              READY
+                                            </span>
+                                          ) : item.status === 'BELUM READY' ? (
+                                            <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold bg-rose-100 text-rose-800 border border-rose-300">
+                                              BELUM READY
+                                            </span>
+                                          ) : (
+                                            <span
+                                              className="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-100 text-slate-500 border border-slate-300"
+                                              title="Tidak ditemukan di upload Master Data terbaru untuk Nomor OR ini"
+                                            >
+                                              -
+                                            </span>
+                                          )}
+                                        </td>
+                                      </tr>
+                                    );
+                                  })}
+                                </tbody>
+                              </table>
                             </div>
-                          ) : (
-                            <div className="border border-slate-200 rounded-md overflow-hidden">
-                              <div className="max-h-60 overflow-y-auto">
-                                <table className="w-full text-left text-xs border-collapse">
-                                  <thead className="bg-slate-100 text-slate-700 font-semibold text-[11px] uppercase tracking-wider sticky top-0 z-10 border-b border-slate-200">
-                                    <tr>
-                                      <th className="py-2 px-2.5">Kode Material</th>
-                                      <th className="py-2 px-2.5">Nama Material</th>
-                                      <th className="py-2 px-2 text-center">Satuan</th>
-                                      <th className="py-2 px-2.5 text-right">Total</th>
-                                      <th className="py-2 px-2.5 text-right">Diterima</th>
-                                      <th className="py-2 px-2.5 text-center">Status</th>
-                                    </tr>
-                                  </thead>
-                                  <tbody className="divide-y divide-slate-100">
-                                    {previewRows.map((item, idx) => {
-                                      const isMissingTotal = item.total === null || item.total === undefined;
-                                      const rowWarning = isMissingTotal || item.isTotalAmbiguous || item.needsReview;
-                                      return (
-                                        <tr
-                                          key={item.id || idx}
-                                          className={`transition-colors ${
-                                            rowWarning ? 'bg-amber-50/50 hover:bg-amber-50' : 'hover:bg-slate-50'
-                                          }`}
-                                          title={item.reviewNote || undefined}
-                                        >
-                                          <td className="py-1.5 px-2.5 font-mono font-medium text-slate-900 whitespace-nowrap">
-                                            <input
-                                              type="text"
-                                              value={item.materialCode}
-                                              onChange={(e) =>
-                                                handleUpdatePdfMaterialRow(activePdf.id, idx, {
-                                                  materialCode: e.target.value,
-                                                })
-                                              }
-                                              className="w-28 px-1.5 py-0.5 text-[11px] font-mono border border-slate-200 rounded bg-white focus:border-blue-500 focus:outline-hidden"
-                                            />
-                                          </td>
-                                          <td className="py-1.5 px-2.5 text-slate-800">
-                                            <input
-                                              type="text"
-                                              value={item.materialName}
-                                              onChange={(e) =>
-                                                handleUpdatePdfMaterialRow(activePdf.id, idx, {
-                                                  materialName: e.target.value,
-                                                })
-                                              }
-                                              className="w-full min-w-[160px] px-1.5 py-0.5 text-[11px] border border-slate-200 rounded bg-white focus:border-blue-500 focus:outline-hidden"
-                                            />
-                                          </td>
-                                          <td className="py-1.5 px-2 text-center text-slate-600 font-mono text-[11px]">
-                                            <input
-                                              type="text"
-                                              value={item.unit}
-                                              onChange={(e) =>
-                                                handleUpdatePdfMaterialRow(activePdf.id, idx, {
-                                                  unit: e.target.value,
-                                                })
-                                              }
-                                              className="w-16 text-center px-1 py-0.5 text-[11px] font-mono border border-slate-200 rounded bg-white focus:border-blue-500 focus:outline-hidden"
-                                            />
-                                          </td>
-                                          <td className="py-1.5 px-2.5 text-right font-mono font-semibold text-slate-900">
-                                            <div className="flex flex-col items-end gap-0.5">
-                                              <input
-                                                type="number"
-                                                min="0"
-                                                step="any"
-                                                value={item.total ?? ''}
-                                                placeholder="Kosong"
-                                                onChange={(e) =>
-                                                  handleUpdatePdfMaterialRow(activePdf.id, idx, {
-                                                    total:
-                                                      e.target.value === '' ? null : Number(e.target.value),
-                                                  })
-                                                }
-                                                className={`w-24 text-right px-1.5 py-0.5 text-[11px] font-mono font-semibold rounded border focus:outline-hidden ${
-                                                  isMissingTotal
-                                                    ? 'border-amber-400 bg-amber-50 text-amber-900'
-                                                    : item.isTotalAmbiguous
-                                                      ? 'border-amber-400 bg-amber-50'
-                                                      : 'border-slate-200 bg-white focus:border-blue-500'
-                                                }`}
-                                              />
-                                              {item.rawTotal && (
-                                                <span className="text-[9px] text-slate-400 font-normal">
-                                                  PDF: {item.rawTotal}
-                                                </span>
-                                              )}
-                                              {isMissingTotal && (
-                                                <span className="text-[9px] text-amber-700 font-semibold">
-                                                  Kosong di PDF
-                                                </span>
-                                              )}
-                                            </div>
-                                          </td>
-                                          <td className="py-1.5 px-2.5 text-right font-mono text-slate-900">
-                                            {item.receivedQty !== null && item.receivedQty !== undefined ? (
-                                              <span className="font-bold">
-                                                {item.receivedQty.toLocaleString('id-ID')}
-                                              </span>
-                                            ) : (
-                                              <span className="text-slate-400">-</span>
-                                            )}
-                                          </td>
-                                          <td className="py-1.5 px-2.5 text-center whitespace-nowrap">
-                                            {item.status === 'READY' ? (
-                                              <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold bg-emerald-100 text-emerald-800 border border-emerald-300">
-                                                READY
-                                              </span>
-                                            ) : item.status === 'BELUM READY' ? (
-                                              <span className="inline-block px-2 py-0.5 rounded text-[10px] font-bold bg-rose-100 text-rose-800 border border-rose-300">
-                                                BELUM READY
-                                              </span>
-                                            ) : (
-                                              <span
-                                                className="inline-block px-2 py-0.5 rounded text-[10px] font-semibold bg-slate-100 text-slate-500 border border-slate-300"
-                                                title="Tidak ditemukan di upload Excel terbaru untuk No. OR ini"
-                                              >
-                                                -
-                                              </span>
-                                            )}
-                                          </td>
-                                        </tr>
-                                      );
-                                    })}
-                                  </tbody>
-                                </table>
-                              </div>
-                            </div>
-                          )}
+                          </div>
                           <p className="text-[10px] text-slate-400 italic">
-                            * Pencocokan hanya mengambil data dari transaksi upload Excel terbaru untuk OR{' '}
-                            {activePdf.orNumber || '-'}. Hasil yang sudah valid akan disimpan sebagai snapshot permanen saat jadwal disimpan.
+                            * Pencocokan menggunakan Nomor OR ({activeExcel.orNumber || '-'}) + Kode Material pada upload Master Data terbaru. Nilai snapshot akan dibekukan saat jadwal disimpan.
                           </p>
                         </div>
                       );
@@ -2861,147 +2480,106 @@ export const ProductionScheduleView: React.FC = () => {
                 )}
               </div>
 
-              {/* Form Divider */}
-              <div className="pt-2 border-t border-slate-200">
-                <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400 block mb-2">
-                  Formulir Jadwal Produksi (6 Kolom Wajib)
-                </span>
-              </div>
-
-              {/* Field 1: Nomor OR */}
-              <div>
-                <div className="flex items-center justify-between mb-1">
-                  <label className="block text-xs font-semibold text-slate-700">
-                    1. Nomor OR *
-                  </label>
-                  <span className="text-[10px] text-blue-600 font-medium">
-                    Terdaftar via Upload Excel ({registeredOrNumbers.length} OR)
+              {/* Manual Form Fields shown only when no Excel file is uploaded */}
+              {uploadedExcels.length === 0 && (
+                <div className="space-y-3 pt-2 border-t border-slate-200">
+                  <span className="text-[11px] font-bold uppercase tracking-wider text-slate-400 block">
+                    Atau Isi Jadwal Produksi Secara Manual
                   </span>
-                </div>
-                <div className="space-y-1.5">
-                  <input
-                    type="text"
-                    required
-                    value={formData.orNumber}
-                    onChange={(e) => handleOrChange(e.target.value)}
-                    placeholder="Ketik Nomor OR (Contoh: OR-2026-001)"
-                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md font-mono uppercase focus:outline-hidden focus:ring-2 focus:ring-blue-500"
-                  />
 
-                  {/* Quick OR selector chips */}
-                  {registeredOrNumbers.length > 0 ? (
-                    <div className="flex items-center gap-1.5 flex-wrap pt-0.5">
-                      <span className="text-[10px] text-slate-400">Pilih cepat:</span>
-                      {registeredOrNumbers.slice(0, 5).map((or) => (
-                        <button
-                          key={or}
-                          type="button"
-                          onClick={() => handleOrChange(or)}
-                          className={`text-[10px] px-2 py-0.5 rounded font-mono border transition-colors ${
-                            formData.orNumber === or
-                              ? 'bg-blue-600 text-white border-blue-600 font-bold'
-                              : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
-                          }`}
-                        >
-                          {or}
-                        </button>
-                      ))}
+                  <div>
+                    <div className="flex items-center justify-between mb-1">
+                      <label className="block text-xs font-semibold text-slate-700">1. Nomor OR *</label>
+                      <span className="text-[10px] text-blue-600 font-medium">
+                        Terdaftar di Master Data ({registeredOrNumbers.length} OR)
+                      </span>
                     </div>
-                  ) : (
-                    <div className="text-[11px] text-amber-600 font-medium py-1">
-                      Belum ada Nomor OR. Unggah file Excel terlebih dahulu.
+                    <input
+                      type="text"
+                      required
+                      value={formData.orNumber}
+                      onChange={(e) => handleOrChange(e.target.value)}
+                      placeholder="Contoh: 1036"
+                      className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md font-mono uppercase focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                    />
+                    {registeredOrNumbers.length > 0 && (
+                      <div className="flex items-center gap-1.5 flex-wrap pt-1.5">
+                        <span className="text-[10px] text-slate-400">Pilih cepat:</span>
+                        {registeredOrNumbers.slice(0, 5).map((or) => (
+                          <button
+                            key={or}
+                            type="button"
+                            onClick={() => handleOrChange(or)}
+                            className={`text-[10px] px-2 py-0.5 rounded font-mono border transition-colors ${
+                              formData.orNumber === or
+                                ? 'bg-blue-600 text-white border-blue-600 font-bold'
+                                : 'bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200'
+                            }`}
+                          >
+                            {or}
+                          </button>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">2. Style *</label>
+                    <input
+                      type="text"
+                      required
+                      value={formData.style}
+                      onChange={(e) => setFormData({ ...formData, style: e.target.value })}
+                      placeholder="Contoh: Casual Cotton Shirt Men Navy"
+                      className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">
+                        3. Tanggal Mulai Produksi *
+                      </label>
+                      <input
+                        type="date"
+                        required
+                        value={formData.productionDate}
+                        onChange={(e) => setFormData({ ...formData, productionDate: e.target.value })}
+                        className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md font-mono focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                      />
                     </div>
-                  )}
+                    <div>
+                      <label className="block text-xs font-semibold text-slate-700 mb-1">
+                        4. Tanggal Selesai Produksi *
+                      </label>
+                      <input
+                        type="date"
+                        required
+                        min={formData.productionDate}
+                        value={formData.finishDate}
+                        onChange={(e) => setFormData({ ...formData, finishDate: e.target.value })}
+                        className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md font-mono focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                      />
+                    </div>
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">5. Target Produksi *</label>
+                    <input
+                      type="number"
+                      min="1"
+                      step="any"
+                      required
+                      value={formData.target || ''}
+                      onChange={(e) =>
+                        setFormData({ ...formData, target: parseFloat(e.target.value) || 0 })
+                      }
+                      placeholder="Jumlah target produksi"
+                      className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md font-mono font-bold focus:outline-hidden focus:ring-2 focus:ring-blue-500"
+                    />
+                  </div>
                 </div>
-                <p className="text-[11px] text-slate-400 mt-1">
-                  Pilih dari Nomor OR yang terdaftar di Upload Excel atau isi sesuai No. OR Worksheet PDF.
-                </p>
-              </div>
-
-              {/* Field 5: Style */}
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  2. Style *
-                </label>
-                <input
-                  type="text"
-                  required
-                  value={formData.style}
-                  onChange={(e) => setFormData({ ...formData, style: e.target.value })}
-                  placeholder="Contoh: Casual Cotton Shirt Men Navy"
-                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-blue-500"
-                />
-              </div>
-
-              {/* Field 4: Line Produksi */}
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  3. Line Produksi *
-                </label>
-                <select
-                  required
-                  value={formData.productionLine}
-                  onChange={(e) => setFormData({ ...formData, productionLine: e.target.value })}
-                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md focus:outline-hidden focus:ring-2 focus:ring-blue-500 bg-white"
-                >
-                  {defaultLines.map((ln) => (
-                    <option key={ln} value={ln}>
-                      {ln}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              {/* Dates: Tanggal Produksi & Tanggal Selesai */}
-              <div className="grid grid-cols-2 gap-3">
-                {/* Field 2: Tanggal Produksi */}
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    4. Tanggal Produksi (Mulai) *
-                  </label>
-                  <input
-                    type="date"
-                    required
-                    value={formData.productionDate}
-                    onChange={(e) => setFormData({ ...formData, productionDate: e.target.value })}
-                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md font-mono focus:outline-hidden focus:ring-2 focus:ring-blue-500"
-                  />
-                </div>
-
-                {/* Field 3: Tanggal Selesai */}
-                <div>
-                  <label className="block text-xs font-semibold text-slate-700 mb-1">
-                    5. Tanggal Selesai *
-                  </label>
-                  <input
-                    type="date"
-                    required
-                    min={formData.productionDate}
-                    value={formData.finishDate}
-                    onChange={(e) => setFormData({ ...formData, finishDate: e.target.value })}
-                    className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md font-mono focus:outline-hidden focus:ring-2 focus:ring-blue-500"
-                  />
-                </div>
-              </div>
-
-              {/* Field 6: Target */}
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  6. Target (Pcs) *
-                </label>
-                <input
-                  type="number"
-                  min="1"
-                  required
-                  value={formData.target}
-                  onChange={(e) => setFormData({ ...formData, target: parseFloat(e.target.value) || 0 })}
-                  placeholder="Jumlah target output (angka positif)"
-                  className="w-full px-3 py-2 text-xs border border-slate-300 rounded-md font-mono font-bold focus:outline-hidden focus:ring-2 focus:ring-blue-500"
-                />
-                <p className="text-[11px] text-slate-400 mt-1">
-                  Target terakumulasi otomatis dari seluruh PDF Worksheet yang diunggah (atau dapat disesuaikan manual).
-                </p>
-              </div>
+              )}
 
               {/* Action Buttons */}
               <div className="pt-3 border-t border-slate-200 flex items-center justify-end gap-2">
@@ -3015,8 +2593,8 @@ export const ProductionScheduleView: React.FC = () => {
                 </button>
                 <button
                   type="submit"
-                  disabled={isProcessingPdfs || isSubmittingForm}
-                  className="px-4 py-2 text-xs font-bold bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-md shadow-xs transition-colors flex items-center gap-1.5"
+                  disabled={isProcessingExcels || isSubmittingForm}
+                  className="px-4 py-2 text-xs font-bold bg-blue-600 hover:bg-blue-700 disabled:opacity-50 text-white rounded-md shadow-xs transition-colors flex items-center gap-1.5 cursor-pointer"
                 >
                   {isSubmittingForm ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
@@ -3027,7 +2605,9 @@ export const ProductionScheduleView: React.FC = () => {
                     {isSubmittingForm
                       ? 'Menyimpan...'
                       : modalMode === 'create'
-                        ? 'Simpan Jadwal'
+                        ? uploadedExcels.filter((p) => p.status === 'success').length > 1
+                          ? `Simpan ${uploadedExcels.filter((p) => p.status === 'success').length} Jadwal`
+                          : 'Simpan Jadwal'
                         : 'Simpan Perubahan'}
                   </span>
                 </button>

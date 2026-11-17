@@ -2090,6 +2090,8 @@ export function buildWorksheetSnapshot(
     id: worksheet.id,
     fileName: worksheet.fileName,
     orNumber: worksheet.orNumber,
+    rawOrNumber: worksheet.rawOrNumber,
+    worksheetNo: worksheet.worksheetNo,
     style: worksheet.style,
     target: worksheet.target,
     uploadedAt: worksheet.uploadedAt || timestamp,

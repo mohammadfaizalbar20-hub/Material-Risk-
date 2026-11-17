@@ -55,12 +55,14 @@ export interface WorksheetPdfItem {
   id: string;
   fileName: string;
   orNumber: string;
+  rawOrNumber?: string;
+  worksheetNo?: string; // Nomor Produksi (Reference Excel) atau No. Worksheet legacy
   style: string;
   target: number;
   materials: WorksheetMaterialItem[];
   error?: string;
   uploadedAt?: string;
-  // Provenance transaksi upload Excel terbaru untuk No. OR PDF ini
+  // Provenance transaksi upload Excel terbaru untuk No. OR file ini
   matchedUploadId?: string | null;
   matchedUploadDate?: string | null;
   matchedUploadTime?: string | null;
