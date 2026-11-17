@@ -367,6 +367,7 @@ test('7. Simulasi Node.js ESM murni (/var/task): transpile file-by-file ke .js t
       'src/server/aiHandlers.ts',
       'src/server/vercelHttp.ts',
       'src/utils/pdfWorksheetParser.ts',
+      'src/utils/pdfOcrWorkflow.ts',
     ];
 
     // Write package.json with "type": "module" & symlink node_modules (mimicking /var/task)

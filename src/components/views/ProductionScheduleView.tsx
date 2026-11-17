@@ -33,6 +33,7 @@ import {
 import { getIndonesianHolidayInfo, DayHolidayInfo } from '../../utils/indonesianHolidays';
 import {
   buildWorksheetSnapshot,
+  ExtractedPdfWorksheet,
   findLatestUploadForOr,
   matchMaterialsWithMasterData,
   parseExtractWorksheetHttpResponse,
@@ -41,6 +42,14 @@ import {
   WorksheetFieldWarning,
   WorksheetMaterialMatched,
 } from '../../utils/pdfWorksheetParser';
+import {
+  getPendingOcrPageNumbers,
+  isRetryableOcrError,
+  mergePageOcrExtractions,
+  PageOcrExtraction,
+  PdfOcrProgressState,
+} from '../../utils/pdfOcrWorkflow';
+import { openBrowserPdfSession } from '../../utils/pdfClientRenderer';
 import {
   fetchLatestUploadMaterialsForOrs,
   getSupabaseCredentials,
@@ -120,6 +129,7 @@ export const ProductionScheduleView: React.FC = () => {
     matchedUploadTime?: string | null;
     matchedUploadCreatedAt?: string | null;
     lastSyncedAt?: string | null;
+    ocrState?: PdfOcrProgressState;
   }
 
   const [uploadedPdfs, setUploadedPdfs] = useState<FormPdfItem[]>([]);
@@ -467,6 +477,468 @@ export const ProductionScheduleView: React.FC = () => {
     );
   };
 
+  const MAX_RAW_PDF_JSON_BYTES = 2_800_000;
+  const CLIENT_ENDPOINT_TIMEOUT_MS = 28_000;
+
+  const postExtractEndpoint = async (payload: Record<string, unknown>, timeoutMs = CLIENT_ENDPOINT_TIMEOUT_MS) => {
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+    let res: Response;
+    let rawResponseBody = '';
+    try {
+      res = await fetch('/api/pdf/extract-worksheet', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+        signal: controller.signal,
+      });
+      rawResponseBody = await res.text();
+    } catch (fetchErr: any) {
+      if (fetchErr?.name === 'AbortError') {
+        throw new Error(
+          `Proses ekstraksi PDF melebihi batas waktu (${Math.round(timeoutMs / 1000)} detik).`
+        );
+      }
+      throw new Error(
+        'Gagal terhubung ke server ekstraksi PDF (/api/pdf/extract-worksheet). Periksa koneksi atau status server.'
+      );
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
+
+    const parsedResponse = parseExtractWorksheetHttpResponse(
+      res.status,
+      res.headers.get('content-type'),
+      rawResponseBody
+    );
+
+    return { res, parsedResponse };
+  };
+
+  const updatePdfOcrState = (pdfId: string, ocrState: PdfOcrProgressState) => {
+    setUploadedPdfs((prev) =>
+      prev.map((p) => (p.id === pdfId ? { ...p, ocrState } : p))
+    );
+  };
+
+  const extractWorksheetForItem = async (item: FormPdfItem): Promise<{
+    extracted: ExtractedPdfWorksheet;
+    finalOcrState?: PdfOcrProgressState;
+  }> => {
+    if (!item.file) {
+      throw new Error(`Berkas asli "${item.fileName}" tidak tersedia di sesi ini. Silakan pilih file PDF ulang.`);
+    }
+
+    const file = item.file;
+    let latestOcrState: PdfOcrProgressState = item.ocrState
+      ? {
+          ...item.ocrState,
+          completedPages: { ...item.ocrState.completedPages },
+          failedPages: [...item.ocrState.failedPages],
+        }
+      : {
+          mode: 'checking',
+          totalPages: 1,
+          currentPage: 0,
+          completedPages: {},
+          failedPages: [],
+          stageLabel: 'Memeriksa teks PDF...',
+        };
+
+    const pushOcrProgress = (patch: Partial<PdfOcrProgressState>) => {
+      latestOcrState = {
+        ...latestOcrState,
+        ...patch,
+        completedPages: { ...(patch.completedPages ?? latestOcrState.completedPages) },
+        failedPages: [...(patch.failedPages ?? latestOcrState.failedPages)],
+      };
+      updatePdfOcrState(item.id, latestOcrState);
+    };
+
+    const runPageByPageOcr = async (
+      existingSession: Awaited<ReturnType<typeof openBrowserPdfSession>> | null,
+      expectedTotalPages?: number
+    ): Promise<{ extracted: ExtractedPdfWorksheet; finalOcrState: PdfOcrProgressState }> => {
+      const session = existingSession || (await openBrowserPdfSession(file));
+      const shouldCloseLocally = !existingSession;
+      try {
+        const totalPages = session.numPages || expectedTotalPages || 1;
+        const completedPages: Record<number, PageOcrExtraction> = {
+          ...latestOcrState.completedPages,
+        };
+        const pendingPages = getPendingOcrPageNumbers(totalPages, completedPages);
+        const maxPageAttempts = 2;
+
+        for (const pageNum of pendingPages) {
+          pushOcrProgress({
+            mode: 'page-ocr',
+            totalPages,
+            currentPage: pageNum,
+            completedPages,
+            failedPages: [],
+            stageLabel: `Menyiapkan halaman ${pageNum}/${totalPages}...`,
+            attempt: 1,
+          });
+
+          const rendered = await session.renderPageToJpeg(pageNum);
+          let pageSuccess = false;
+          let lastPageErr = '';
+
+          for (let attempt = 1; attempt <= maxPageAttempts; attempt++) {
+            pushOcrProgress({
+              mode: 'page-ocr',
+              totalPages,
+              currentPage: pageNum,
+              completedPages,
+              failedPages: [],
+              stageLabel:
+                attempt > 1
+                  ? `Mengulang OCR halaman ${pageNum}/${totalPages} (percobaan ${attempt}/${maxPageAttempts})...`
+                  : `OCR halaman ${pageNum}/${totalPages}...`,
+              attempt,
+            });
+
+            try {
+              const { res, parsedResponse } = await postExtractEndpoint(
+                {
+                  pageImageBase64: rendered.base64,
+                  pageMimeType: rendered.mimeType,
+                  pageNumber: pageNum,
+                  totalPages,
+                  fileName: item.fileName,
+                },
+                CLIENT_ENDPOINT_TIMEOUT_MS
+              );
+
+              if (parsedResponse.success && parsedResponse.pageExtraction) {
+                completedPages[pageNum] = parsedResponse.pageExtraction as PageOcrExtraction;
+                pushOcrProgress({
+                  mode: 'page-ocr',
+                  totalPages,
+                  currentPage: pageNum,
+                  completedPages,
+                  failedPages: [],
+                  stageLabel: `Halaman ${pageNum}/${totalPages} selesai`,
+                });
+                pageSuccess = true;
+                break;
+              }
+
+              lastPageErr =
+                parsedResponse.error ||
+                `Gagal OCR halaman ${pageNum}/${totalPages} (HTTP ${res.status}).`;
+              const canRetry =
+                attempt < maxPageAttempts &&
+                (parsedResponse.retryable ?? isRetryableOcrError(res.status, lastPageErr));
+              if (!canRetry) {
+                break;
+              }
+            } catch (reqErr: any) {
+              lastPageErr = reqErr?.message || `Gagal OCR halaman ${pageNum}/${totalPages}.`;
+              if (attempt >= maxPageAttempts || !isRetryableOcrError(undefined, lastPageErr)) {
+                break;
+              }
+            }
+
+            await new Promise((r) => window.setTimeout(r, 700));
+          }
+
+          if (!pageSuccess) {
+            const doneCount = Object.keys(completedPages).length;
+            pushOcrProgress({
+              mode: 'page-ocr',
+              totalPages,
+              currentPage: pageNum,
+              completedPages,
+              failedPages: [pageNum],
+              stageLabel: `Gagal pada halaman ${pageNum}/${totalPages}`,
+            });
+            const err = new Error(
+              doneCount > 0
+                ? `${lastPageErr} (${doneCount}/${totalPages} halaman berhasil tersimpan — klik "Coba Lagi" untuk melanjutkan).`
+                : lastPageErr
+            );
+            (err as any).ocrState = latestOcrState;
+            throw err;
+          }
+        }
+
+        const merged = mergePageOcrExtractions(completedPages, item.fileName);
+        if (!merged.isValidatedUsable) {
+          pushOcrProgress({
+            mode: 'page-ocr',
+            totalPages,
+            currentPage: totalPages,
+            completedPages: {},
+            failedPages: [],
+            stageLabel: 'Hasil OCR belum terbaca/tidak valid',
+          });
+          const err = new Error(
+            `Hasil OCR untuk "${item.fileName}" tidak terbaca atau tidak mengandung data Worksheet yang valid. Klik "Coba Lagi" atau gunakan scan yang lebih jelas.`
+          );
+          (err as any).ocrState = latestOcrState;
+          throw err;
+        }
+
+        return { extracted: merged.worksheet, finalOcrState: latestOcrState };
+      } finally {
+        if (shouldCloseLocally) {
+          await session.close();
+        }
+      }
+    };
+
+    // Resume directly without re-probing or re-running already-completed pages if prior OCR attempt saved state
+    if (latestOcrState.mode === 'page-ocr' && latestOcrState.totalPages > 0) {
+      return runPageByPageOcr(null, latestOcrState.totalPages);
+    }
+
+    // Fast path for <= 2.8MB PDFs (safe under Vercel 4.5MB limit): try text-layer extraction first
+    if (file.size <= MAX_RAW_PDF_JSON_BYTES) {
+      pushOcrProgress({
+        mode: 'checking',
+        totalPages: 1,
+        currentPage: 0,
+        stageLabel: 'Mengekstrak teks PDF...',
+      });
+
+      const base64Data = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          const res = reader.result as string;
+          const b64 = res.includes(',') ? res.split(',')[1] : res;
+          resolve(b64);
+        };
+        reader.onerror = () => reject(new Error(`Gagal membaca file "${item.fileName}" di browser.`));
+        reader.readAsDataURL(file);
+      });
+
+      const { res, parsedResponse } = await postExtractEndpoint(
+        {
+          pdfBase64: base64Data,
+          fileName: item.fileName,
+          preferPageByPageOcr: true,
+        },
+        32_000
+      );
+
+      if (parsedResponse.success && parsedResponse.data) {
+        return {
+          extracted: parsedResponse.data,
+          finalOcrState: {
+            mode: 'text',
+            totalPages: 1,
+            currentPage: 1,
+            completedPages: {},
+            failedPages: [],
+            stageLabel: 'Teks PDF selesai',
+          },
+        };
+      }
+
+      if (parsedResponse.requiresPageOcr) {
+        return runPageByPageOcr(null, parsedResponse.numPages || 1);
+      }
+
+      throw new Error(
+        parsedResponse.error || `Gagal mengekstrak PDF "${item.fileName}" (HTTP ${res.status}).`
+      );
+    }
+
+    // Large PDF (> 2.8MB): inspect locally via PDF.js to avoid Vercel 4.5MB payload cap
+    pushOcrProgress({
+      mode: 'checking',
+      totalPages: 1,
+      currentPage: 0,
+      stageLabel: 'Memeriksa lapisan teks PDF...',
+    });
+
+    const session = await openBrowserPdfSession(file);
+    try {
+      const inspection = await session.inspectCoordinatePages();
+      if (inspection.hasTextLayer && inspection.coordinatePages.length > 0) {
+        const { parsedResponse } = await postExtractEndpoint(
+          {
+            coordinatePages: inspection.coordinatePages,
+            fileName: item.fileName,
+          },
+          20_000
+        );
+        if (parsedResponse.success && parsedResponse.data) {
+          return {
+            extracted: parsedResponse.data,
+            finalOcrState: {
+              mode: 'text',
+              totalPages: inspection.numPages,
+              currentPage: inspection.numPages,
+              completedPages: {},
+              failedPages: [],
+              stageLabel: 'Teks PDF selesai',
+            },
+          };
+        }
+      }
+
+      return await runPageByPageOcr(session, inspection.numPages);
+    } finally {
+      await session.close();
+    }
+  };
+
+  const applyExtractedWorksheetToPdfItem = async (
+    item: FormPdfItem,
+    extracted: ExtractedPdfWorksheet,
+    finalOcrState?: PdfOcrProgressState
+  ) => {
+    const extractedOr = (extracted.orNumber || '').trim();
+
+    // Ambil data upload Excel paling terbaru khusus No. OR PDF ini (Supabase -> fallback state lokal)
+    let reqSource = materialRequirements;
+    let histSource = uploadHistory;
+    if (getSupabaseCredentials().isConfigured && extractedOr) {
+      const remoteLatest = await fetchLatestUploadMaterialsForOrs([extractedOr]);
+      if (remoteLatest?.connected && remoteLatest.uploadHistory.length > 0) {
+        histSource = remoteLatest.uploadHistory;
+        reqSource = remoteLatest.materialRequirements;
+      }
+    }
+
+    const syncTimestamp = new Date().toISOString();
+    const latestResolution = extractedOr
+      ? findLatestUploadForOr(extractedOr, reqSource, histSource)
+      : { orNumber: '', latestUpload: null, rows: [] };
+
+    const matchedMaterialsRaw = extractedOr
+      ? matchMaterialsWithMasterData(
+          extracted.materials || [],
+          extractedOr,
+          reqSource,
+          histSource,
+          syncTimestamp
+        )
+      : (extracted.materials || []).map((m, idx) => ({
+          id: `wsm-${idx + 1}`,
+          materialCode: m.materialCode,
+          materialName: m.materialName,
+          unit: m.unit,
+          total: m.total,
+          receivedQty: null,
+          status: null,
+          isFoundInMasterData: false,
+        }));
+
+    const mergedMaterials: FormWorksheetMaterial[] = matchedMaterialsRaw.map((m, idx) => {
+      const src = extracted.materials?.[idx];
+      return {
+        ...m,
+        total: src?.total ?? m.total ?? null,
+        rawTotal: src?.rawTotal,
+        isTotalAmbiguous: src?.isTotalAmbiguous,
+        needsReview: src?.needsReview,
+        reviewNote: src?.reviewNote,
+      };
+    });
+
+    const updatedPdfItem = revalidateFormPdfItem({
+      id: item.id,
+      file: item.file,
+      fileName: item.fileName,
+      status: 'success',
+      error: undefined,
+      orNumber: extractedOr,
+      rawOrNumber: extracted.rawOrNumber,
+      worksheetNo: extracted.worksheetNo,
+      style: extracted.style || '',
+      target: extracted.target ?? null,
+      rawTarget: extracted.rawTarget,
+      isTargetAmbiguous: extracted.isTargetAmbiguous,
+      extractionMethod: extracted.extractionMethod,
+      fieldWarnings: extracted.fieldWarnings,
+      reviewReasons: extracted.reviewReasons,
+      reviewConfirmed: false,
+      materials: mergedMaterials,
+      matchedUploadId: latestResolution.latestUpload?.id || null,
+      matchedUploadDate: latestResolution.latestUpload?.updateDate || null,
+      matchedUploadTime: latestResolution.latestUpload?.uploadTime || null,
+      matchedUploadCreatedAt: latestResolution.latestUpload?.createdAt || null,
+      lastSyncedAt: syncTimestamp,
+      ocrState: finalOcrState,
+    });
+
+    setUploadedPdfs((prev) => {
+      const updated = prev.map((p) => (p.id === item.id ? updatedPdfItem : p));
+
+      // Auto-fill form values from cleanly extracted PDF fields when still at initial create defaults
+      const validItems = updated.filter((p) => p.status === 'success');
+      if (validItems.length > 0) {
+        setFormData((prevForm) => {
+          const totalTarget = validItems.reduce((acc, p) => acc + (p.target || 0), 0);
+          const firstValid = validItems[0];
+          const initialDefaultOr = availableOrList[0] || 'OR-2026-001';
+          const initialDefaultStyle = getStyleForOr(initialDefaultOr) || 'Casual Cotton Shirt Men Navy';
+          const shouldUpdateOr =
+            !prevForm.orNumber ||
+            prevForm.orNumber === 'OR-2026-001' ||
+            (modalMode === 'create' && prevForm.orNumber === initialDefaultOr);
+          const shouldUpdateStyle =
+            !prevForm.style ||
+            prevForm.style === 'Casual Cotton Shirt Men Navy' ||
+            (modalMode === 'create' &&
+              (prevForm.style === initialDefaultStyle || shouldUpdateOr));
+          return {
+            ...prevForm,
+            orNumber: shouldUpdateOr ? firstValid.orNumber || prevForm.orNumber : prevForm.orNumber,
+            style: shouldUpdateStyle ? firstValid.style || prevForm.style : prevForm.style,
+            target: totalTarget > 0 ? totalTarget : prevForm.target,
+          };
+        });
+      }
+
+      return updated;
+    });
+  };
+
+  // Handler for retrying ONLY one failed PDF without re-uploading other files or re-running finished pages
+  const handleRetryPdf = async (pdfId: string) => {
+    const targetItem = uploadedPdfs.find((p) => p.id === pdfId);
+    if (!targetItem || targetItem.status === 'parsing') return;
+
+    setFormValidationError(null);
+    setIsProcessingPdfs(true);
+    setUploadedPdfs((prev) =>
+      prev.map((p) =>
+        p.id === pdfId
+          ? {
+              ...p,
+              status: 'parsing' as const,
+              error: undefined,
+            }
+          : p
+      )
+    );
+
+    try {
+      const { extracted, finalOcrState } = await extractWorksheetForItem(targetItem);
+      await applyExtractedWorksheetToPdfItem(targetItem, extracted, finalOcrState);
+      setSelectedPreviewPdfId(pdfId);
+    } catch (err: any) {
+      setUploadedPdfs((prev) =>
+        prev.map((p) =>
+          p.id === pdfId
+            ? {
+                ...p,
+                status: 'error' as const,
+                error: err?.message || 'Gagal mengekstrak worksheet PDF.',
+                ocrState: err?.ocrState ?? p.ocrState,
+              }
+            : p
+        )
+      );
+    } finally {
+      setIsProcessingPdfs(false);
+    }
+  };
+
   // Handler for uploading one or multiple PDF Worksheets
   const handlePdfFilesUpload = async (fileList: FileList | File[]) => {
     const rawFiles = Array.from(fileList);
@@ -486,6 +958,14 @@ export const ProductionScheduleView: React.FC = () => {
       file: f,
       fileName: f.name,
       status: 'parsing',
+      ocrState: {
+        mode: 'checking',
+        totalPages: 1,
+        currentPage: 0,
+        completedPages: {},
+        failedPages: [],
+        stageLabel: 'Menunggu antrean ekstraksi...',
+      },
     }));
 
     setUploadedPdfs((prev) => [...prev, ...newItems]);
@@ -495,163 +975,10 @@ export const ProductionScheduleView: React.FC = () => {
 
     for (const item of newItems) {
       try {
-        const base64Data = await new Promise<string>((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => {
-            const res = reader.result as string;
-            const b64 = res.includes(',') ? res.split(',')[1] : res;
-            resolve(b64);
-          };
-          reader.onerror = () => reject(new Error(`Gagal membaca file "${item.fileName}" di browser.`));
-          reader.readAsDataURL(item.file!);
-        });
-
-        const controller = new AbortController();
-        const timeoutId = window.setTimeout(() => controller.abort(), 35000);
-        let res: Response;
-        let rawResponseBody = '';
-        try {
-          res = await fetch('/api/pdf/extract-worksheet', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              pdfBase64: base64Data,
-              fileName: item.fileName,
-            }),
-            signal: controller.signal,
-          });
-          rawResponseBody = await res.text();
-        } catch (fetchErr: any) {
-          if (fetchErr?.name === 'AbortError') {
-            throw new Error(
-              `Proses ekstraksi PDF "${item.fileName}" melebihi batas waktu (35 detik). Coba unggah ulang.`
-            );
-          }
-          throw new Error(
-            'Gagal terhubung ke server ekstraksi PDF (/api/pdf/extract-worksheet). Periksa koneksi atau status server.'
-          );
-        } finally {
-          window.clearTimeout(timeoutId);
-        }
-
-        const parsedResponse = parseExtractWorksheetHttpResponse(
-          res.status,
-          res.headers.get('content-type'),
-          rawResponseBody
-        );
-
-        if (!parsedResponse.success || !parsedResponse.data) {
-          throw new Error(
-            parsedResponse.error || `Gagal mengekstrak PDF "${item.fileName}" (HTTP ${res.status}).`
-          );
-        }
-
-        const extracted = parsedResponse.data;
-        const extractedOr = (extracted.orNumber || '').trim();
-
-        // Ambil data upload Excel paling terbaru khusus No. OR PDF ini (Supabase -> fallback state lokal)
-        let reqSource = materialRequirements;
-        let histSource = uploadHistory;
-        if (getSupabaseCredentials().isConfigured && extractedOr) {
-          const remoteLatest = await fetchLatestUploadMaterialsForOrs([extractedOr]);
-          if (remoteLatest?.connected && remoteLatest.uploadHistory.length > 0) {
-            histSource = remoteLatest.uploadHistory;
-            reqSource = remoteLatest.materialRequirements;
-          }
-        }
-
-        const syncTimestamp = new Date().toISOString();
-        const latestResolution = extractedOr
-          ? findLatestUploadForOr(extractedOr, reqSource, histSource)
-          : { orNumber: '', latestUpload: null, rows: [] };
-
-        const matchedMaterialsRaw = extractedOr
-          ? matchMaterialsWithMasterData(
-              extracted.materials || [],
-              extractedOr,
-              reqSource,
-              histSource,
-              syncTimestamp
-            )
-          : (extracted.materials || []).map((m, idx) => ({
-              id: `wsm-${idx + 1}`,
-              materialCode: m.materialCode,
-              materialName: m.materialName,
-              unit: m.unit,
-              total: m.total,
-              receivedQty: null,
-              status: null,
-              isFoundInMasterData: false,
-            }));
-
-        const mergedMaterials: FormWorksheetMaterial[] = matchedMaterialsRaw.map((m, idx) => {
-          const src = extracted.materials?.[idx];
-          return {
-            ...m,
-            total: src?.total ?? m.total ?? null,
-            rawTotal: src?.rawTotal,
-            isTotalAmbiguous: src?.isTotalAmbiguous,
-            needsReview: src?.needsReview,
-            reviewNote: src?.reviewNote,
-          };
-        });
-
-        const updatedPdfItem = revalidateFormPdfItem({
-          id: item.id,
-          file: item.file,
-          fileName: item.fileName,
-          status: 'success',
-          orNumber: extractedOr,
-          rawOrNumber: extracted.rawOrNumber,
-          worksheetNo: extracted.worksheetNo,
-          style: extracted.style || '',
-          target: extracted.target ?? null,
-          rawTarget: extracted.rawTarget,
-          isTargetAmbiguous: extracted.isTargetAmbiguous,
-          extractionMethod: extracted.extractionMethod,
-          fieldWarnings: extracted.fieldWarnings,
-          reviewReasons: extracted.reviewReasons,
-          reviewConfirmed: false,
-          materials: mergedMaterials,
-          matchedUploadId: latestResolution.latestUpload?.id || null,
-          matchedUploadDate: latestResolution.latestUpload?.updateDate || null,
-          matchedUploadTime: latestResolution.latestUpload?.uploadTime || null,
-          matchedUploadCreatedAt: latestResolution.latestUpload?.createdAt || null,
-          lastSyncedAt: syncTimestamp,
-        });
-
-        setUploadedPdfs((prev) => {
-          const updated = prev.map((p) => (p.id === item.id ? updatedPdfItem : p));
-
-          // Auto-fill form values from cleanly extracted PDF fields when still at initial create defaults
-          const validItems = updated.filter((p) => p.status === 'success');
-          if (validItems.length > 0) {
-            setFormData((prevForm) => {
-              const totalTarget = validItems.reduce((acc, p) => acc + (p.target || 0), 0);
-              const firstValid = validItems[0];
-              const initialDefaultOr = availableOrList[0] || 'OR-2026-001';
-              const initialDefaultStyle = getStyleForOr(initialDefaultOr) || 'Casual Cotton Shirt Men Navy';
-              const shouldUpdateOr =
-                !prevForm.orNumber ||
-                prevForm.orNumber === 'OR-2026-001' ||
-                (modalMode === 'create' && prevForm.orNumber === initialDefaultOr);
-              const shouldUpdateStyle =
-                !prevForm.style ||
-                prevForm.style === 'Casual Cotton Shirt Men Navy' ||
-                (modalMode === 'create' &&
-                  (prevForm.style === initialDefaultStyle || shouldUpdateOr));
-              return {
-                ...prevForm,
-                orNumber: shouldUpdateOr ? firstValid.orNumber || prevForm.orNumber : prevForm.orNumber,
-                style: shouldUpdateStyle ? firstValid.style || prevForm.style : prevForm.style,
-                target: totalTarget > 0 ? totalTarget : prevForm.target,
-              };
-            });
-          }
-
-          return updated;
-        });
+        const { extracted, finalOcrState } = await extractWorksheetForItem(item);
+        await applyExtractedWorksheetToPdfItem(item, extracted, finalOcrState);
       } catch (err: any) {
+        // Error is isolated strictly to this item; other already-succeeded PDFs remain intact
         setUploadedPdfs((prev) =>
           prev.map((p) =>
             p.id === item.id
@@ -659,6 +986,7 @@ export const ProductionScheduleView: React.FC = () => {
                   ...p,
                   status: 'error' as const,
                   error: err?.message || 'Gagal mengekstrak worksheet PDF.',
+                  ocrState: err?.ocrState ?? p.ocrState,
                 }
               : p
           )
@@ -856,7 +1184,7 @@ export const ProductionScheduleView: React.FC = () => {
       setFormValidationError(
         `Tidak dapat menyimpan karena terdapat PDF Worksheet yang gagal dibaca (${failedPdfs
           .map((p) => p.fileName)
-          .join(', ')}). Hapus atau unggah ulang PDF tersebut.`
+          .join(', ')}). Klik "Coba Lagi" atau hapus PDF tersebut.`
       );
       return;
     }
@@ -2119,19 +2447,77 @@ export const ProductionScheduleView: React.FC = () => {
                                 </span>
                               </div>
 
-                              {pdf.status === 'parsing' && (
-                                <div className="flex items-center gap-1 text-[11px] text-blue-600 mt-1">
-                                  <Loader2 className="w-3 h-3 animate-spin" />
-                                  <span>Mengekstrak data...</span>
-                                </div>
-                              )}
+                              {pdf.status === 'parsing' && (() => {
+                                const ocr = pdf.ocrState;
+                                const doneCount = ocr ? Object.keys(ocr.completedPages || {}).length : 0;
+                                const totalPages = ocr?.totalPages || 1;
+                                const pct =
+                                  ocr?.mode === 'page-ocr' && totalPages > 0
+                                    ? Math.min(100, Math.round((doneCount / totalPages) * 100))
+                                    : null;
+                                return (
+                                  <div className="space-y-1 mt-1.5">
+                                    <div className="flex items-center justify-between gap-2 text-[11px] text-blue-700">
+                                      <div className="flex items-center gap-1.5 min-w-0">
+                                        <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                                        <span className="truncate font-medium">
+                                          {ocr?.stageLabel || 'Mengekstrak data...'}
+                                        </span>
+                                      </div>
+                                      {ocr?.mode === 'page-ocr' && totalPages > 0 && (
+                                        <span className="font-mono text-[10px] font-semibold bg-blue-50 text-blue-700 px-1.5 py-0.2 rounded border border-blue-200 shrink-0">
+                                          {doneCount}/{totalPages} hal
+                                        </span>
+                                      )}
+                                    </div>
+                                    {pct !== null && (
+                                      <div className="w-full h-1.5 bg-blue-100 rounded-full overflow-hidden">
+                                        <div
+                                          className="h-full bg-blue-600 transition-all duration-300"
+                                          style={{ width: `${Math.max(8, pct)}%` }}
+                                        />
+                                      </div>
+                                    )}
+                                  </div>
+                                );
+                              })()}
 
-                              {pdf.status === 'error' && (
-                                <div className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded px-2 py-1 mt-1.5 flex items-start gap-1.5">
-                                  <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-red-600" />
-                                  <span className="leading-snug">{pdf.error}</span>
-                                </div>
-                              )}
+                              {pdf.status === 'error' && (() => {
+                                const ocr = pdf.ocrState;
+                                const doneCount = ocr ? Object.keys(ocr.completedPages || {}).length : 0;
+                                const totalPages = ocr?.totalPages || 0;
+                                return (
+                                  <div className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded px-2 py-1.5 mt-1.5 space-y-1.5">
+                                    <div className="flex items-start gap-1.5">
+                                      <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-red-600" />
+                                      <span className="leading-snug">{pdf.error}</span>
+                                    </div>
+                                    <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
+                                      {doneCount > 0 && totalPages > 0 ? (
+                                        <span className="text-[10px] text-red-600 font-medium">
+                                          {doneCount}/{totalPages} halaman berhasil tersimpan
+                                        </span>
+                                      ) : (
+                                        <span className="text-[10px] text-red-500">
+                                          PDF lain yang sudah berhasil tetap aman
+                                        </span>
+                                      )}
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          handleRetryPdf(pdf.id);
+                                        }}
+                                        disabled={isProcessingPdfs}
+                                        className="px-2 py-0.5 text-[10px] font-bold bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded flex items-center gap-1 cursor-pointer transition-colors"
+                                      >
+                                        <RefreshCw className="w-2.5 h-2.5" />
+                                        <span>Coba Lagi</span>
+                                      </button>
+                                    </div>
+                                  </div>
+                                );
+                              })()}
 
                               {pdf.status === 'success' && (
                                 <div className="space-y-1 mt-1 text-[11px]">

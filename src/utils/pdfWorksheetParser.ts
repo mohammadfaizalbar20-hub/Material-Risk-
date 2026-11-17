@@ -89,6 +89,10 @@ export interface ExtractedPdfWorksheet {
 export interface ParsedExtractApiResult {
   success: boolean;
   data?: ExtractedPdfWorksheet;
+  pageExtraction?: unknown;
+  requiresPageOcr?: boolean;
+  numPages?: number;
+  retryable?: boolean;
   error?: string;
   status?: number;
   isNonJsonResponse?: boolean;
@@ -145,6 +149,22 @@ export function parseExtractWorksheetHttpResponse(
     try {
       const parsed = JSON.parse(trimmed);
       if (parsed && typeof parsed === 'object') {
+        if (status >= 200 && status < 300 && parsed.success && parsed.pageExtraction) {
+          return {
+            success: true,
+            pageExtraction: parsed.pageExtraction,
+            status,
+          };
+        }
+        if (status >= 200 && status < 300 && parsed.requiresPageOcr) {
+          return {
+            success: false,
+            requiresPageOcr: true,
+            numPages: typeof parsed.numPages === 'number' ? parsed.numPages : 1,
+            error: typeof parsed.error === 'string' ? parsed.error : undefined,
+            status,
+          };
+        }
         if (status >= 200 && status < 300 && parsed.success && parsed.data) {
           return {
             success: true,
@@ -161,6 +181,7 @@ export function parseExtractWorksheetHttpResponse(
         return {
           success: false,
           error: serverMsg,
+          retryable: typeof parsed.retryable === 'boolean' ? parsed.retryable : undefined,
           status,
         };
       }
