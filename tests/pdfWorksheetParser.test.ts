@@ -1396,5 +1396,65 @@ test('21. Pembedaan TOTAL kosong vs TOTAL gagal terbaca (unreadable): tidak mene
   assert.ok(reconciledUnreadable.fieldWarnings?.some((w) => w.field === 'materials[0].total'));
 });
 
+test('22. Aturan Halaman Pertama Saja pada Parser Koordinat: mengabaikan material/OR halaman 2 dan menolak jika halaman 1 tidak memuat worksheet', () => {
+  const twoPages: PdfCoordinatePage[] = [
+    {
+      pageNum: 1,
+      items: [
+        { str: 'NO. OR : OR/2026/05/1041', x: 40, y: 740, width: 150, height: 10 },
+        { str: 'STYLE NO : [S-HAL1] HOODIE', x: 40, y: 720, width: 160, height: 10 },
+        { str: 'TOTAL QTY : 500', x: 40, y: 700, width: 100, height: 10 },
+        { str: 'MATERIAL & KONSUMSI', x: 40, y: 670, width: 140, height: 10 },
+        { str: 'CODE ACC', x: 40, y: 650, width: 60, height: 9 },
+        { str: 'DESCRIPTION', x: 130, y: 650, width: 120, height: 9 },
+        { str: 'UNIT', x: 375, y: 650, width: 35, height: 9 },
+        { str: 'TOTAL', x: 430, y: 650, width: 45, height: 9 },
+        { str: 'FAB-HAL1', x: 40, y: 630, width: 65, height: 9 },
+        { str: 'FLEECE HAL 1', x: 130, y: 630, width: 110, height: 9 },
+        { str: 'yard', x: 375, y: 630, width: 25, height: 9 },
+        { str: '500,0000', x: 430, y: 630, width: 45, height: 9 },
+      ],
+    },
+    {
+      pageNum: 2,
+      items: [
+        { str: 'NO. OR : OR/2026/05/9999', x: 40, y: 740, width: 150, height: 10 },
+        { str: 'MATERIAL & KONSUMSI', x: 40, y: 670, width: 140, height: 10 },
+        { str: 'CODE ACC', x: 40, y: 650, width: 60, height: 9 },
+        { str: 'DESCRIPTION', x: 130, y: 650, width: 120, height: 9 },
+        { str: 'UNIT', x: 375, y: 650, width: 35, height: 9 },
+        { str: 'TOTAL', x: 430, y: 650, width: 45, height: 9 },
+        { str: 'MAT-HAL2-IGNORED', x: 40, y: 630, width: 85, height: 9 },
+        { str: 'MATERIAL HALAMAN 2', x: 130, y: 630, width: 110, height: 9 },
+        { str: 'Pcs', x: 375, y: 630, width: 25, height: 9 },
+        { str: '999,0000', x: 430, y: 630, width: 45, height: 9 },
+      ],
+    },
+  ];
+
+  const page1Only = extractWorksheetFromPdfCoordinates(twoPages, 'TwoPages.pdf');
+  assert.equal(page1Only.success, true);
+  assert.equal(page1Only.data?.orNumber, '1041');
+  assert.equal(page1Only.data?.materials.length, 1);
+  assert.equal(page1Only.data?.materials[0].materialCode, 'FAB-HAL1');
+
+  // Jika halaman 1 hanya cover dan worksheet ada di halaman 2 -> wajib gagal
+  const coverThenWorksheet: PdfCoordinatePage[] = [
+    {
+      pageNum: 1,
+      items: [
+        { str: 'HALAMAN SAMPUL PRODUKSI', x: 60, y: 720, width: 180, height: 10 },
+        { str: 'TIDAK ADA DATA WORKSHEET DI SINI', x: 60, y: 700, width: 200, height: 10 },
+      ],
+    },
+    twoPages[1],
+  ];
+
+  const rejected = extractWorksheetFromPdfCoordinates(coverThenWorksheet, 'CoverFirst.pdf');
+  assert.equal(rejected.success, false);
+  assert.match(rejected.error || '', /data worksheet tidak ditemukan pada halaman pertama/i);
+});
+
+
 
 

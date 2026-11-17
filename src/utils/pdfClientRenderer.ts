@@ -1,7 +1,7 @@
 import type { PdfCoordinatePage } from './pdfWorksheetParser.js';
 
 export interface RenderedPdfPageImage {
-  pageNumber: number;
+  pageNumber: 1;
   base64: string;
   mimeType: 'image/jpeg';
   width: number;
@@ -17,8 +17,8 @@ export interface BrowserPdfInspectionResult {
 
 export interface BrowserPdfSession {
   numPages: number;
-  inspectCoordinatePages: () => Promise<BrowserPdfInspectionResult>;
-  renderPageToJpeg: (pageNumber: number) => Promise<RenderedPdfPageImage>;
+  inspectFirstPageCoordinates: () => Promise<BrowserPdfInspectionResult>;
+  renderFirstPageToJpeg: () => Promise<RenderedPdfPageImage>;
   close: () => Promise<void>;
 }
 
@@ -41,8 +41,8 @@ async function getPdfJsClient(): Promise<typeof import('pdfjs-dist')> {
 }
 
 /**
- * Opens a client-side PDF.js session for a File so multi-page coordinate inspection
- * or page-by-page JPEG rendering parses the PDF binary only once and cleans up safely.
+ * Opens a client-side PDF.js session for a File and restricts ALL coordinate inspection
+ * and JPEG rendering strictly to Page 1 (Page 2+ are completely skipped).
  */
 export async function openBrowserPdfSession(file: File): Promise<BrowserPdfSession> {
   const pdfjsLib = await getPdfJsClient();
@@ -53,42 +53,46 @@ export async function openBrowserPdfSession(file: File): Promise<BrowserPdfSessi
 
   return {
     numPages,
-    async inspectCoordinatePages(): Promise<BrowserPdfInspectionResult> {
-      const coordinatePages: PdfCoordinatePage[] = [];
+    async inspectFirstPageCoordinates(): Promise<BrowserPdfInspectionResult> {
+      if (numPages < 1) {
+        return { numPages: 0, hasTextLayer: false, coordinatePages: [] };
+      }
+      const page = await doc.getPage(1);
+      const viewport = page.getViewport({ scale: 1 });
+      const textContent = await page.getTextContent();
       let hasTextLayer = false;
 
-      for (let pageNum = 1; pageNum <= numPages; pageNum++) {
-        const page = await doc.getPage(pageNum);
-        const viewport = page.getViewport({ scale: 1 });
-        const textContent = await page.getTextContent();
-        const items = Array.isArray(textContent?.items)
-          ? textContent.items.map((it: any) => {
-              const tr = Array.isArray(it?.transform) ? it.transform : [1, 0, 0, 1, 0, 0];
-              const str = String(it?.str || '');
-              if (str.trim().length > 0) hasTextLayer = true;
-              return {
-                str,
-                x: Number(tr[4] ?? 0),
-                y: Number(tr[5] ?? 0),
-                width: Number(it?.width ?? 0),
-                height: Number(it?.height ?? Math.abs(Number(tr[3] ?? 10))),
-              };
-            })
-          : [];
+      const items = Array.isArray(textContent?.items)
+        ? textContent.items.map((it: any) => {
+            const tr = Array.isArray(it?.transform) ? it.transform : [1, 0, 0, 1, 0, 0];
+            const str = String(it?.str || '');
+            if (str.trim().length > 0) hasTextLayer = true;
+            return {
+              str,
+              x: Number(tr[4] ?? 0),
+              y: Number(tr[5] ?? 0),
+              width: Number(it?.width ?? 0),
+              height: Number(it?.height ?? Math.abs(Number(tr[3] ?? 10))),
+            };
+          })
+        : [];
 
-        coordinatePages.push({
-          pageNum,
-          width: viewport.width,
-          height: viewport.height,
-          items,
-        });
-      }
-
-      return { numPages, hasTextLayer, coordinatePages };
+      return {
+        numPages,
+        hasTextLayer,
+        coordinatePages: [
+          {
+            pageNum: 1,
+            width: viewport.width,
+            height: viewport.height,
+            items,
+          },
+        ],
+      };
     },
 
-    async renderPageToJpeg(pageNumber: number): Promise<RenderedPdfPageImage> {
-      const page = await doc.getPage(pageNumber);
+    async renderFirstPageToJpeg(): Promise<RenderedPdfPageImage> {
+      const page = await doc.getPage(1);
       const baseViewport = page.getViewport({ scale: 1 });
 
       const renderAtWidth = async (targetWidthPx: number, quality: number): Promise<RenderedPdfPageImage> => {
@@ -120,7 +124,7 @@ export async function openBrowserPdfSession(file: File): Promise<BrowserPdfSessi
           const approxBytes = Math.ceil((base64.length * 3) / 4);
 
           return {
-            pageNumber,
+            pageNumber: 1,
             base64,
             mimeType: 'image/jpeg',
             width: canvas.width,
@@ -133,9 +137,9 @@ export async function openBrowserPdfSession(file: File): Promise<BrowserPdfSessi
         }
       };
 
-      // Primary crisp OCR pass (~1500px width, JPEG 0.82 -> typically 150-350KB)
+      // Crisp OCR pass (~1500px width, JPEG 0.82 -> typically 150-350KB)
       let rendered = await renderAtWidth(1500, 0.82);
-      // Safety downscale if single page scan is exceptionally dense (>1.2MB)
+      // Safety downscale if Page 1 scan is exceptionally dense (>1.2MB)
       if (rendered.approxBytes > 1_200_000) {
         rendered = await renderAtWidth(1220, 0.70);
       }

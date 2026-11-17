@@ -11,7 +11,9 @@ import {
   type PdfCoordinatePage,
 } from '../utils/pdfWorksheetParser.js';
 import {
+  buildWorksheetFromFirstPageOcr,
   isRetryableOcrError,
+  validateUsableOcrWorksheet,
   type PageOcrExtraction,
 } from '../utils/pdfOcrWorkflow.js';
 import {
@@ -148,11 +150,39 @@ function sleepMs(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function reconstructFirstPageText(page: PdfCoordinatePage | undefined): string {
+  if (!page || !Array.isArray(page.items) || page.items.length === 0) return '';
+  const validItems = page.items.filter((it) => it.str && it.str.trim().length > 0);
+  if (validItems.length === 0) return '';
+  const sorted = [...validItems].sort((a, b) => {
+    const dy = b.y - a.y;
+    if (Math.abs(dy) > 3.5) return dy;
+    return a.x - b.x;
+  });
+  const rows: PdfCoordinatePage['items'][] = [];
+  for (const it of sorted) {
+    const last = rows[rows.length - 1];
+    if (last && Math.abs(last[0].y - it.y) <= Math.max(3.5, (it.height || 10) * 0.45)) {
+      last.push(it);
+    } else {
+      rows.push([it]);
+    }
+  }
+  return rows
+    .map((r) =>
+      [...r]
+        .sort((a, b) => a.x - b.x)
+        .map((it) => it.str.trim())
+        .join('\t')
+    )
+    .join('\n');
+}
+
 /**
- * Executes a Gemini structured OCR call with:
+ * Executes a Gemini structured OCR call for Page 1 with:
  * - Low thinking latency (`ThinkingLevel.LOW`)
  * - `AbortController` + strict per-attempt timeout
- * - Bounded retry for transient timeout/rate-limit/5xx errors within a Vercel Hobby budget
+ * - Bounded retry for transient timeout/rate-limit/5xx errors within Vercel Hobby budget
  */
 async function invokeGeminiOcrWithRetry(params: {
   mimeType: string;
@@ -186,7 +216,6 @@ async function invokeGeminiOcrWithRetry(params: {
     });
 
   let lastError: Error | null = null;
-
   const minAttemptWindowMs = Math.min(Math.floor(perAttemptMs * 0.25), 2500);
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -273,7 +302,8 @@ async function invokeGeminiOcrWithRetry(params: {
 }
 
 /**
- * Extracts a single rendered page image (scanned PDF page) using Gemini OCR.
+ * Extracts Page 1 rendered JPEG/PNG image (scanned PDF Page 1 ONLY) using Gemini OCR.
+ * Rejects any request for pageNumber !== 1.
  */
 export async function extractSinglePageImageOcr(
   params: {
@@ -285,7 +315,19 @@ export async function extractSinglePageImageOcr(
   },
   options?: PdfWorksheetHandlerOptions
 ): Promise<ExtractWorksheetHttpResult> {
-  const { pageImageBase64, pageNumber, totalPages, fileName } = params;
+  const { pageImageBase64, pageNumber, fileName } = params;
+
+  if (pageNumber !== 1) {
+    return {
+      status: 400,
+      body: {
+        success: false,
+        retryable: false,
+        error: `Ekstraksi PDF Worksheet "${fileName}" hanya memproses halaman pertama (halaman 1). Halaman ke-${pageNumber} tidak diproses.`,
+      },
+    };
+  }
+
   const pageMimeType =
     params.pageMimeType && /^image\/(jpeg|jpg|png|webp)$/i.test(params.pageMimeType)
       ? params.pageMimeType.toLowerCase() === 'image/jpg'
@@ -303,7 +345,7 @@ export async function extractSinglePageImageOcr(
       body: {
         success: false,
         retryable: false,
-        error: `Gambar halaman ${pageNumber} pada "${fileName}" kosong.`,
+        error: `Gambar halaman pertama pada "${fileName}" kosong.`,
       },
     };
   }
@@ -315,45 +357,38 @@ export async function extractSinglePageImageOcr(
       body: {
         success: false,
         retryable: false,
-        error: `Ukuran gambar halaman ${pageNumber} terlalu besar (>4MB) untuk diproses server.`,
+        error: `Ukuran gambar halaman pertama terlalu besar (>4MB) untuk diproses server.`,
       },
     };
   }
 
   const { apiKey, isRealKey } = resolveGeminiKey(options?.apiKey);
-  if (!isRealKey) {
+  if (!isRealKey && !options?.generateContentFn) {
     return {
       status: 422,
       body: {
         success: false,
         retryable: false,
-        error: `Dokumen "${fileName}" tidak memiliki lapisan teks (hasil scan/gambar) sehingga memerlukan layanan OCR/AI (GEMINI_API_KEY) yang aktif.`,
+        error: `Dokumen "${fileName}" tidak memiliki lapisan teks pada halaman pertama (hasil scan/gambar) sehingga memerlukan layanan OCR/AI (GEMINI_API_KEY) yang aktif.`,
       },
     };
   }
 
   const systemInstruction = `Anda adalah sistem OCR dokumen Worksheet produksi garmen berpresisi tinggi.
-Ekstrak hanya nilai yang benar-benar tercetak pada gambar halaman ini tanpa mengarang atau menebak kolom yang kosong.`;
+Ekstrak hanya nilai yang benar-benar tercetak pada gambar halaman pertama ini tanpa mengarang atau menebak kolom yang kosong.`;
 
-  const isFirstPage = pageNumber <= 1;
-  const prompt = isFirstPage
-    ? `Ini adalah HALAMAN ${pageNumber} dari ${totalPages} dokumen PDF Worksheet "${fileName}".
+  const prompt = `Ini adalah HALAMAN PERTAMA (Halaman 1) dari dokumen PDF Worksheet "${fileName}".
 Ekstrak data berikut secara presisi:
-1. isNonTablePage: false jika terdapat tabel MATERIAL & KONSUMSI atau header Worksheet; true HANYA jika halaman ini murni halaman gambar/Material Card tanpa identitas maupun tabel.
+1. isNonTablePage: false jika terdapat tabel MATERIAL & KONSUMSI atau header Worksheet; true HANYA jika halaman ini tidak memuat tabel maupun identitas Worksheet.
 2. orNumberRaw: teks persis pada label "NO. OR" / "ORDER NO" (contoh: "OR/2026/05/1014"). JANGAN ambil "NO. WORKSHEET". Kosongkan "" jika tidak ada.
 3. worksheetNo: teks pada label "NO. WORKSHEET" (contoh: "WH/MO/22512 · Lot - 1"). Kosongkan "" jika tidak ada.
 4. style: teks persis pada label "STYLE NO" / "STYLE" (contoh: "[KAIS08-2] KAIS TOPI PRMI 05"). JANGAN ambil BUYER atau ITEM. Kosongkan "" jika tidak ada.
 5. totalQtyRaw: angka persis pada label "TOTAL QTY" (contoh: "2.498"). Pertahankan titik/koma aslinya. Kosongkan "" jika tidak ada.
-6. materials: baca tabel "MATERIAL & KONSUMSI" pada halaman ini sesuai urutan asli (jangan gabungkan kode duplikat, abaikan baris ringkasan "X ITEM MATERIAL"):
+6. materials: baca tabel "MATERIAL & KONSUMSI" pada halaman pertama ini sesuai urutan asli (jangan gabungkan kode duplikat, abaikan baris ringkasan "X ITEM MATERIAL"):
    - materialCode: kolom "CODE ACC"
    - materialName: kolom "DESCRIPTION"
    - unit: kolom "UNIT"
-   - totalRaw: kolom "TOTAL" persis seperti tertulis. PENTING: jika sel "TOTAL" kosong, kembalikan "" — JANGAN pernah mengambil angka dari "CONS", "RETURN", atau "BALANCE".`
-    : `Ini adalah HALAMAN ${pageNumber} dari ${totalPages} dokumen PDF Worksheet "${fileName}".
-Periksa apakah halaman ini merupakan lanjutan tabel "MATERIAL & KONSUMSI" atau hanya halaman "Material Card" / foto / pengesahan:
-1. isNonTablePage: isi true jika halaman ini adalah "Material Card", foto material, catatan kosong, atau tanda tangan tanpa baris tabel "MATERIAL & KONSUMSI".
-2. orNumberRaw, worksheetNo, style, totalQtyRaw: ekstrak hanya jika tertulis jelas di halaman ini, selain itu kosongkan "".
-3. materials: jika isNonTablePage true, kembalikan []. Jika ada lanjutan baris tabel "MATERIAL & KONSUMSI", ekstrak sesuai urutan asli tanpa mengulang header dan TANPA mengisi kolom "TOTAL" yang kosong dari "CONS"/"RETURN"/"BALANCE".`;
+   - totalRaw: kolom "TOTAL" persis seperti tertulis. PENTING: jika sel "TOTAL" kosong, kembalikan "" — JANGAN pernah mengambil angka dari "CONS", "RETURN", atau "BALANCE".`;
 
   try {
     const { text } = await invokeGeminiOcrWithRetry({
@@ -366,7 +401,7 @@ Periksa apakah halaman ini merupakan lanjutan tabel "MATERIAL & KONSUMSI" atau h
       perAttemptTimeoutMs: options?.perAttemptTimeoutMs,
       maxAttempts: options?.maxAttempts,
       maxTotalBudgetMs: options?.maxTotalBudgetMs,
-      labelForError: `"${fileName}" halaman ${pageNumber}/${totalPages}`,
+      labelForError: `"${fileName}" halaman 1`,
     });
 
     const jsonMatch = text.match(/\{[\s\S]*\}/);
@@ -376,7 +411,7 @@ Periksa apakah halaman ini merupakan lanjutan tabel "MATERIAL & KONSUMSI" atau h
         body: {
           success: false,
           retryable: true,
-          error: `Respons OCR halaman ${pageNumber}/${totalPages} pada "${fileName}" tidak berformat JSON yang valid.`,
+          error: `Respons OCR halaman pertama pada "${fileName}" tidak berformat JSON yang valid.`,
         },
       };
     }
@@ -403,8 +438,8 @@ Periksa apakah halaman ini merupakan lanjutan tabel "MATERIAL & KONSUMSI" atau h
     const isNonTablePage = Boolean(parsed.isNonTablePage) && materials.length === 0;
 
     const pageExtraction: PageOcrExtraction = {
-      pageNumber,
-      totalPages,
+      pageNumber: 1,
+      totalPages: 1,
       isNonTablePage,
       orNumber: extractOrNumberFromIdentifier(rawOr),
       rawOrNumber: rawOr || undefined,
@@ -417,22 +452,35 @@ Periksa apakah halaman ini merupakan lanjutan tabel "MATERIAL & KONSUMSI" atau h
       materials,
     };
 
+    const built = buildWorksheetFromFirstPageOcr(pageExtraction, fileName);
+    if (!built.isValidatedUsable) {
+      return {
+        status: 422,
+        body: {
+          success: false,
+          retryable: false,
+          error: `Data worksheet tidak ditemukan pada halaman pertama dokumen "${fileName}".`,
+        },
+      };
+    }
+
     return {
       status: 200,
       body: {
         success: true,
         pageExtraction,
+        data: built.worksheet,
       },
     };
   } catch (err: any) {
-    const errMsg = err?.message || 'Layanan OCR/AI gagal memproses halaman.';
+    const errMsg = err?.message || 'Layanan OCR/AI gagal memproses halaman pertama.';
     const isTimeout = /timeout|batas waktu|abort/i.test(errMsg);
     return {
       status: isTimeout ? 504 : 503,
       body: {
         success: false,
         retryable: isRetryableOcrError(isTimeout ? 504 : 503, errMsg),
-        error: `Dokumen "${fileName}" tidak memiliki lapisan teks (hasil scan/gambar) dan ekstraksi OCR/AI halaman ${pageNumber}/${totalPages} gagal: ${errMsg}`,
+        error: `Dokumen "${fileName}" tidak memiliki lapisan teks pada halaman pertama (hasil scan/gambar) dan ekstraksi OCR/AI gagal: ${errMsg}`,
       },
     };
   }
@@ -494,7 +542,7 @@ export async function extractWorksheetFromBuffer(
     };
   }
 
-  let extractedText = '';
+  let firstPageText = '';
   const pages: PdfCoordinatePage[] = [];
   let numPages = 0;
   let pdfParseErrorMessage: string | null = null;
@@ -505,12 +553,12 @@ export async function extractWorksheetFromBuffer(
     const { PDFParse } = await import('pdf-parse');
     parser = new (PDFParse as any)({ data: buffer });
 
-    // Stage 1A: Extract text items with exact coordinates (x, y, width, height) per page
+    // Stage 1: Extract text items strictly from PAGE 1 ONLY (pages 2+ are skipped completely)
     if (typeof parser.load === 'function') {
       const doc = await parser.load();
       numPages = Number(doc?.numPages || 0);
-      for (let pageNum = 1; pageNum <= numPages; pageNum++) {
-        const page = await doc.getPage(pageNum);
+      if (numPages >= 1) {
+        const page = await doc.getPage(1);
         const viewport =
           typeof page.getViewport === 'function' ? page.getViewport({ scale: 1 }) : undefined;
         const textContent = await page.getTextContent();
@@ -526,19 +574,15 @@ export async function extractWorksheetFromBuffer(
               };
             })
           : [];
-        pages.push({
-          pageNum,
+        const firstPageCoord: PdfCoordinatePage = {
+          pageNum: 1,
           width: viewport?.width,
           height: viewport?.height,
           items,
-        });
+        };
+        pages.push(firstPageCoord);
+        firstPageText = reconstructFirstPageText(firstPageCoord);
       }
-    }
-
-    // Stage 1B: Also obtain plain text representation as supplementary text
-    if (typeof parser.getText === 'function') {
-      const textResult = await parser.getText();
-      extractedText = typeof textResult?.text === 'string' ? textResult.text : '';
     }
   } catch (pdfErr: any) {
     pdfParseErrorMessage = pdfErr?.message || 'PDFParse failed';
@@ -553,7 +597,7 @@ export async function extractWorksheetFromBuffer(
     }
   }
 
-  // Run coordinate-based parser first, fallback to partial text parser if needed
+  // Run coordinate-based parser on Page 1 ONLY, fallback to partial text parser on Page 1 text if needed
   let detData: ExtractedPdfWorksheet | null = null;
   if (pages.length > 0) {
     const coordResult = extractWorksheetFromPdfCoordinates(pages, fileName);
@@ -562,8 +606,8 @@ export async function extractWorksheetFromBuffer(
     }
   }
 
-  if ((!detData || detData.materials.length === 0) && extractedText.trim()) {
-    const textFallback = parseWorksheetText(extractedText, fileName, { allowPartial: true });
+  if ((!detData || detData.materials.length === 0) && firstPageText.trim()) {
+    const textFallback = parseWorksheetText(firstPageText, fileName, { allowPartial: true });
     if (textFallback.success && textFallback.data) {
       if (!detData) {
         detData = textFallback.data;
@@ -573,12 +617,33 @@ export async function extractWorksheetFromBuffer(
     }
   }
 
-  const hasTextLayer =
-    extractedText.trim().length > 0 ||
+  const hasFirstPageTextLayer =
+    firstPageText.trim().length > 0 ||
     pages.some((p) => p.items.some((it) => it.str.trim().length > 0));
 
+  const hasAnyWorksheetSignalOnPage1 = Boolean(
+    detData &&
+      (detData.orNumber ||
+        detData.worksheetNo ||
+        detData.style ||
+        (detData.target !== null && detData.target > 0) ||
+        detData.materials.length > 0)
+  );
+
+  // When Page 1 HAS a text layer but contains NO worksheet data, reject immediately without checking Page 2+
+  if (hasFirstPageTextLayer && !hasAnyWorksheetSignalOnPage1) {
+    return {
+      status: 422,
+      body: {
+        success: false,
+        retryable: false,
+        error: `Data worksheet tidak ditemukan pada halaman pertama dokumen "${fileName}".`,
+      },
+    };
+  }
+
   const hasUsableDet = Boolean(
-    hasTextLayer &&
+    hasFirstPageTextLayer &&
       detData &&
       detData.orNumber &&
       detData.style &&
@@ -591,18 +656,15 @@ export async function extractWorksheetFromBuffer(
 
   const { apiKey: resolvedApiKey, isRealKey } = resolveGeminiKey(apiKey);
 
-  // When browser supports page-by-page OCR and the PDF is scanned/unreadable by Stage 1,
-  // instruct the client to render and send one lightweight page image at a time.
-  if (preferPageByPageOcr && !hasUsableDet) {
+  // When Page 1 is scanned/unreadable and client supports Page 1 image rendering, instruct browser to OCR Page 1 ONLY
+  if (preferPageByPageOcr && !hasFirstPageTextLayer) {
     if (!isRealKey && !generateContentFn) {
       return {
         status: 422,
         body: {
           success: false,
           retryable: false,
-          error: !hasTextLayer
-            ? `Dokumen "${fileName}" tidak memiliki lapisan teks (kemungkinan PDF hasil scan/gambar) sehingga memerlukan layanan OCR/AI yang aktif.`
-            : `Gagal mengekstrak data Worksheet dari "${fileName}" dan layanan OCR/AI belum aktif.`,
+          error: `Dokumen "${fileName}" tidak memiliki lapisan teks pada halaman pertama (kemungkinan PDF hasil scan/gambar) sehingga memerlukan layanan OCR/AI yang aktif.`,
         },
       };
     }
@@ -612,12 +674,12 @@ export async function extractWorksheetFromBuffer(
       body: {
         success: false,
         requiresPageOcr: true,
-        numPages: numPages || pages.length || 1,
+        numPages: 1,
       },
     };
   }
 
-  // Stage 2: Gemini Visual / OCR Fallback for direct raw-PDF API calls when text is missing/incomplete
+  // Stage 2: Direct Gemini Visual / OCR Fallback (strictly Page 1 ONLY) when Page 1 lacks text layer
   let aiData: ExtractedPdfWorksheet | null = null;
   let aiErrorMessage: string | null = null;
   let aiWasTimeout = false;
@@ -627,19 +689,19 @@ export async function extractWorksheetFromBuffer(
       const base64ForAi = rawBase64 || buffer.toString('base64');
 
       const systemInstruction = `Anda adalah sistem ekstraksi dokumen PDF Worksheet produksi garmen berpresisi tinggi.
-Tugas Anda hanya mengekstrak data yang benar-benar tertulis pada dokumen PDF tanpa mengarang atau menebak nilai yang kosong.`;
+Tugas Anda hanya mengekstrak data yang benar-benar tertulis pada HALAMAN PERTAMA (Halaman 1) dokumen PDF tanpa mengarang atau menebak nilai yang kosong, dan mengabaikan halaman 2 dan seterusnya sepenuhnya.`;
 
-      const prompt = `Ekstrak informasi dari dokumen PDF Worksheet ini dengan aturan ketat berikut:
-1. orNumberRaw: Ambil teks persis pada label "NO. OR" / "ORDER NO" (contoh: "OR/2026/05/1014"). JANGAN gunakan "NO. WORKSHEET" (contoh "WH/MO/22512"). Kosongkan "" jika tidak ada.
-2. worksheetNo: Ambil teks pada label "NO. WORKSHEET" (contoh: "WH/MO/22512 · Lot - 1"). Kosongkan "" jika tidak ada.
-3. style: Ambil teks persis pada label "STYLE NO" / "STYLE" (contoh: "[KAIS08-2] KAIS TOPI PRMI 05"). JANGAN gunakan nilai BUYER atau ITEM. Kosongkan "" jika tidak ada.
-4. totalQtyRaw: Ambil teks angka persis pada label "TOTAL QTY" (contoh: "2.498"). Jangan hapus titik/koma aslinya. Kosongkan "" jika tidak ada.
-5. materials: Baca HANYA tabel "MATERIAL & KONSUMSI" (biasanya di Halaman 1). Abaikan "Material Card" / halaman gambar di Halaman 2, serta abaikan baris ringkasan seperti "4 ITEM MATERIAL".
-   Untuk setiap baris material sesuai urutan di PDF (jangan gabungkan kode yang duplikat):
+      const prompt = `Ekstrak informasi HANYA dari HALAMAN PERTAMA (Halaman 1) dokumen PDF Worksheet ini. ABAIKAN dan JANGAN ekstrak data, tabel, atau material apa pun dari Halaman 2 dan seterusnya!
+Aturan ketat untuk Halaman 1:
+1. orNumberRaw: Ambil teks persis pada label "NO. OR" / "ORDER NO" (contoh: "OR/2026/05/1014"). JANGAN gunakan "NO. WORKSHEET". Kosongkan "" jika tidak ada di Halaman 1.
+2. worksheetNo: Ambil teks pada label "NO. WORKSHEET" (contoh: "WH/MO/22512 · Lot - 1"). Kosongkan "" jika tidak ada di Halaman 1.
+3. style: Ambil teks persis pada label "STYLE NO" / "STYLE" (contoh: "[KAIS08-2] KAIS TOPI PRMI 05"). JANGAN gunakan nilai BUYER atau ITEM. Kosongkan "" jika tidak ada di Halaman 1.
+4. totalQtyRaw: Ambil teks angka persis pada label "TOTAL QTY" (contoh: "2.498"). Jangan hapus titik/koma aslinya. Kosongkan "" jika tidak ada di Halaman 1.
+5. materials: Baca HANYA tabel "MATERIAL & KONSUMSI" pada HALAMAN PERTAMA (Halaman 1). Abaikan baris ringkasan "X ITEM MATERIAL" dan jangan baca halaman 2+:
    - materialCode: nilai kolom "CODE ACC"
    - materialName: nilai kolom "DESCRIPTION"
    - unit: nilai kolom "UNIT"
-   - totalRaw: nilai kolom "TOTAL" persis seperti tertulis (contoh "104,9160"). PENTING: jika kolom "TOTAL" kosong, kembalikan string kosong "" — JANGAN pernah mengambil angka dari kolom "CONS", "RETURN", atau "BALANCE".`;
+   - totalRaw: nilai kolom "TOTAL" persis seperti tertulis. PENTING: jika kolom "TOTAL" kosong, kembalikan "" — JANGAN pernah mengambil angka dari "CONS", "RETURN", atau "BALANCE".`;
 
       const { text: replyText } = await invokeGeminiOcrWithRetry({
         mimeType: 'application/pdf',
@@ -651,14 +713,14 @@ Tugas Anda hanya mengekstrak data yang benar-benar tertulis pada dokumen PDF tan
         perAttemptTimeoutMs,
         maxAttempts,
         maxTotalBudgetMs,
-        labelForError: `"${fileName}"`,
+        labelForError: `"${fileName}" halaman 1`,
       });
 
       const jsonMatch = replyText.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
         const parsed = JSON.parse(jsonMatch[0]);
         const combinedRawText = [
-          extractedText,
+          firstPageText,
           parsed.totalQtyRaw || '',
           ...(Array.isArray(parsed.materials)
             ? parsed.materials.map((m: any) => String(m?.totalRaw || ''))
@@ -690,7 +752,7 @@ Tugas Anda hanya mengekstrak data yang benar-benar tertulis pada dokumen PDF tan
           isTargetAmbiguous: qtyParsed.isAmbiguous,
           materials: aiMaterials,
           extractionMethod: 'gemini',
-          rawText: extractedText || undefined,
+          rawText: firstPageText || undefined,
         };
       }
     } catch (aiErr: any) {
@@ -701,14 +763,14 @@ Tugas Anda hanya mengekstrak data yang benar-benar tertulis pada dokumen PDF tan
     }
   }
 
-  // Stage 3: Reconcile deterministic vs AI results
+  // Stage 3: Reconcile deterministic vs AI results (Page 1 ONLY)
   if (!detData && !aiData) {
-    let errorMsg = `Gagal mengekstrak data Worksheet dari "${fileName}".`;
-    if (!hasTextLayer) {
+    let errorMsg = `Data worksheet tidak ditemukan pada halaman pertama dokumen "${fileName}".`;
+    if (!hasFirstPageTextLayer) {
       errorMsg =
         isRealKey || generateContentFn
-          ? `Dokumen "${fileName}" tidak memiliki lapisan teks (hasil scan/gambar) dan ekstraksi OCR/AI gagal${aiErrorMessage ? `: ${aiErrorMessage}` : '.'}`
-          : `Dokumen "${fileName}" tidak memiliki lapisan teks (kemungkinan PDF hasil scan/gambar) sehingga memerlukan layanan OCR/AI yang aktif.`;
+          ? `Dokumen "${fileName}" tidak memiliki lapisan teks pada halaman pertama (hasil scan/gambar) dan ekstraksi OCR/AI gagal${aiErrorMessage ? `: ${aiErrorMessage}` : '.'}`
+          : `Dokumen "${fileName}" tidak memiliki lapisan teks pada halaman pertama (kemungkinan PDF hasil scan/gambar) sehingga memerlukan layanan OCR/AI yang aktif.`;
     } else if (pdfParseErrorMessage) {
       errorMsg = `Struktur PDF "${fileName}" tidak dapat dibaca (${pdfParseErrorMessage}).`;
     }
@@ -724,13 +786,15 @@ Tugas Anda hanya mengekstrak data yang benar-benar tertulis pada dokumen PDF tan
 
   const finalWorksheet = reconcileWorksheetExtractions(detData, aiData, fileName);
 
-  const hasUsableContent = Boolean(
-    finalWorksheet.orNumber ||
-      finalWorksheet.worksheetNo ||
-      finalWorksheet.style ||
-      (finalWorksheet.target !== null && finalWorksheet.target > 0) ||
-      finalWorksheet.materials.length > 0
-  );
+  const hasUsableContent = detData
+    ? Boolean(
+        finalWorksheet.orNumber ||
+          finalWorksheet.worksheetNo ||
+          finalWorksheet.style ||
+          (finalWorksheet.target !== null && finalWorksheet.target > 0) ||
+          finalWorksheet.materials.length > 0
+      )
+    : validateUsableOcrWorksheet(finalWorksheet);
 
   if (!hasUsableContent) {
     return {
@@ -738,7 +802,7 @@ Tugas Anda hanya mengekstrak data yang benar-benar tertulis pada dokumen PDF tan
       body: {
         success: false,
         retryable: false,
-        error: `Tidak ditemukan identitas Worksheet atau tabel MATERIAL & KONSUMSI pada "${fileName}".`,
+        error: `Data worksheet tidak ditemukan pada halaman pertama dokumen "${fileName}".`,
       },
     };
   }
@@ -813,38 +877,49 @@ export async function handleExtractWorksheetHttpRequest(
         ? body.fileName.trim()
         : 'Worksheet.pdf';
 
-    // 3A. Single-page rendered JPEG/PNG OCR request (chunked workflow for scanned PDFs)
+    // 3A. Single-page rendered JPEG/PNG OCR request (Page 1 ONLY)
     if (
       typeof body.pageImageBase64 === 'string' &&
       body.pageImageBase64.trim()
     ) {
-      const pageNumber = Math.max(1, Number(body.pageNumber || 1));
-      const totalPages = Math.max(pageNumber, Number(body.totalPages || pageNumber));
+      const pageNumber = Number(body.pageNumber || 1);
       return await extractSinglePageImageOcr(
         {
           pageImageBase64: body.pageImageBase64,
           pageMimeType:
             typeof body.pageMimeType === 'string' ? body.pageMimeType : 'image/jpeg',
           pageNumber,
-          totalPages,
+          totalPages: 1,
           fileName,
         },
         options
       );
     }
 
-    // 3B. Client-extracted coordinate pages (for >3MB text-layer PDFs avoiding Vercel 4.5MB body cap)
+    // 3B. Client-extracted coordinate pages (strictly Page 1 ONLY)
     if (Array.isArray(body.coordinatePages)) {
       const coordPages = body.coordinatePages as PdfCoordinatePage[];
-      const coordResult = extractWorksheetFromPdfCoordinates(coordPages, fileName);
-      if (
-        coordResult.success &&
-        coordResult.data &&
-        coordResult.data.orNumber &&
-        coordResult.data.style &&
-        coordResult.data.target &&
-        coordResult.data.materials.length > 0
-      ) {
+      const firstPage = coordPages.find((p) => p.pageNum === 1) ?? coordPages[0];
+      const hasPage1Text = Boolean(
+        firstPage?.items?.some((it) => it.str && it.str.trim().length > 0)
+      );
+
+      if (!hasPage1Text) {
+        return {
+          status: 200,
+          body: {
+            success: false,
+            requiresPageOcr: true,
+            numPages: 1,
+          },
+        };
+      }
+
+      const coordResult = extractWorksheetFromPdfCoordinates(
+        firstPage ? [firstPage] : [],
+        fileName
+      );
+      if (coordResult.success && coordResult.data) {
         return {
           status: 200,
           body: {
@@ -854,11 +929,13 @@ export async function handleExtractWorksheetHttpRequest(
         };
       }
       return {
-        status: 200,
+        status: 422,
         body: {
           success: false,
-          requiresPageOcr: true,
-          numPages: coordPages.length || 1,
+          retryable: false,
+          error:
+            coordResult.error ||
+            `Data worksheet tidak ditemukan pada halaman pertama dokumen "${fileName}".`,
         },
       };
     }

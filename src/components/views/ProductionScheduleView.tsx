@@ -43,11 +43,11 @@ import {
   WorksheetMaterialMatched,
 } from '../../utils/pdfWorksheetParser';
 import {
-  getPendingOcrPageNumbers,
+  buildWorksheetFromFirstPageOcr,
   isRetryableOcrError,
-  mergePageOcrExtractions,
   PageOcrExtraction,
   PdfOcrProgressState,
+  validateUsableOcrWorksheet,
 } from '../../utils/pdfOcrWorkflow';
 import { openBrowserPdfSession } from '../../utils/pdfClientRenderer';
 import {
@@ -530,157 +530,122 @@ export const ProductionScheduleView: React.FC = () => {
     }
 
     const file = item.file;
-    let latestOcrState: PdfOcrProgressState = item.ocrState
-      ? {
-          ...item.ocrState,
-          completedPages: { ...item.ocrState.completedPages },
-          failedPages: [...item.ocrState.failedPages],
-        }
-      : {
-          mode: 'checking',
-          totalPages: 1,
-          currentPage: 0,
-          completedPages: {},
-          failedPages: [],
-          stageLabel: 'Memeriksa teks PDF...',
-        };
+    let latestOcrState: PdfOcrProgressState = {
+      mode: 'checking',
+      stageLabel: 'Memeriksa teks halaman 1...',
+    };
 
     const pushOcrProgress = (patch: Partial<PdfOcrProgressState>) => {
       latestOcrState = {
         ...latestOcrState,
         ...patch,
-        completedPages: { ...(patch.completedPages ?? latestOcrState.completedPages) },
-        failedPages: [...(patch.failedPages ?? latestOcrState.failedPages)],
       };
       updatePdfOcrState(item.id, latestOcrState);
     };
 
-    const runPageByPageOcr = async (
-      existingSession: Awaited<ReturnType<typeof openBrowserPdfSession>> | null,
-      expectedTotalPages?: number
+    const runFirstPageOcr = async (
+      existingSession: Awaited<ReturnType<typeof openBrowserPdfSession>> | null
     ): Promise<{ extracted: ExtractedPdfWorksheet; finalOcrState: PdfOcrProgressState }> => {
       const session = existingSession || (await openBrowserPdfSession(file));
       const shouldCloseLocally = !existingSession;
       try {
-        const totalPages = session.numPages || expectedTotalPages || 1;
-        const completedPages: Record<number, PageOcrExtraction> = {
-          ...latestOcrState.completedPages,
-        };
-        const pendingPages = getPendingOcrPageNumbers(totalPages, completedPages);
-        const maxPageAttempts = 2;
+        pushOcrProgress({
+          mode: 'page-ocr',
+          stageLabel: 'Menyiapkan gambar halaman 1...',
+          attempt: 1,
+        });
 
-        for (const pageNum of pendingPages) {
+        const rendered = await session.renderFirstPageToJpeg();
+        const maxPageAttempts = 2;
+        let lastPageErr = '';
+
+        for (let attempt = 1; attempt <= maxPageAttempts; attempt++) {
           pushOcrProgress({
             mode: 'page-ocr',
-            totalPages,
-            currentPage: pageNum,
-            completedPages,
-            failedPages: [],
-            stageLabel: `Menyiapkan halaman ${pageNum}/${totalPages}...`,
-            attempt: 1,
+            stageLabel:
+              attempt > 1
+                ? `Mengulang OCR halaman 1 (percobaan ${attempt}/${maxPageAttempts})...`
+                : 'Menjalankan OCR halaman 1...',
+            attempt,
           });
 
-          const rendered = await session.renderPageToJpeg(pageNum);
-          let pageSuccess = false;
-          let lastPageErr = '';
+          try {
+            const { res, parsedResponse } = await postExtractEndpoint(
+              {
+                pageImageBase64: rendered.base64,
+                pageMimeType: rendered.mimeType,
+                pageNumber: 1,
+                totalPages: 1,
+                fileName: item.fileName,
+              },
+              CLIENT_ENDPOINT_TIMEOUT_MS
+            );
 
-          for (let attempt = 1; attempt <= maxPageAttempts; attempt++) {
-            pushOcrProgress({
-              mode: 'page-ocr',
-              totalPages,
-              currentPage: pageNum,
-              completedPages,
-              failedPages: [],
-              stageLabel:
-                attempt > 1
-                  ? `Mengulang OCR halaman ${pageNum}/${totalPages} (percobaan ${attempt}/${maxPageAttempts})...`
-                  : `OCR halaman ${pageNum}/${totalPages}...`,
-              attempt,
-            });
+            if (parsedResponse.success && (parsedResponse.pageExtraction || parsedResponse.data)) {
+              let extracted: ExtractedPdfWorksheet | null = null;
+              let isUsable = false;
 
-            try {
-              const { res, parsedResponse } = await postExtractEndpoint(
-                {
-                  pageImageBase64: rendered.base64,
-                  pageMimeType: rendered.mimeType,
-                  pageNumber: pageNum,
-                  totalPages,
-                  fileName: item.fileName,
-                },
-                CLIENT_ENDPOINT_TIMEOUT_MS
-              );
+              if (parsedResponse.pageExtraction) {
+                const built = buildWorksheetFromFirstPageOcr(
+                  parsedResponse.pageExtraction as PageOcrExtraction,
+                  item.fileName
+                );
+                extracted = built.worksheet;
+                isUsable = built.isValidatedUsable;
+              } else if (parsedResponse.data) {
+                extracted = parsedResponse.data;
+                isUsable = validateUsableOcrWorksheet(extracted);
+              }
 
-              if (parsedResponse.success && parsedResponse.pageExtraction) {
-                completedPages[pageNum] = parsedResponse.pageExtraction as PageOcrExtraction;
+              if (!extracted || !isUsable) {
                 pushOcrProgress({
                   mode: 'page-ocr',
-                  totalPages,
-                  currentPage: pageNum,
-                  completedPages,
-                  failedPages: [],
-                  stageLabel: `Halaman ${pageNum}/${totalPages} selesai`,
+                  stageLabel: 'Data worksheet tidak ditemukan di halaman 1',
                 });
-                pageSuccess = true;
-                break;
+                const err = new Error(
+                  `Data worksheet tidak ditemukan pada halaman pertama dokumen "${item.fileName}".`
+                );
+                (err as any).ocrState = latestOcrState;
+                throw err;
               }
 
-              lastPageErr =
-                parsedResponse.error ||
-                `Gagal OCR halaman ${pageNum}/${totalPages} (HTTP ${res.status}).`;
-              const canRetry =
-                attempt < maxPageAttempts &&
-                (parsedResponse.retryable ?? isRetryableOcrError(res.status, lastPageErr));
-              if (!canRetry) {
-                break;
-              }
-            } catch (reqErr: any) {
-              lastPageErr = reqErr?.message || `Gagal OCR halaman ${pageNum}/${totalPages}.`;
-              if (attempt >= maxPageAttempts || !isRetryableOcrError(undefined, lastPageErr)) {
-                break;
-              }
+              const doneState: PdfOcrProgressState = {
+                mode: 'page-ocr',
+                stageLabel: 'OCR halaman 1 selesai',
+              };
+              updatePdfOcrState(item.id, doneState);
+              return { extracted, finalOcrState: doneState };
             }
 
-            await new Promise((r) => window.setTimeout(r, 700));
+            lastPageErr =
+              parsedResponse.error ||
+              `Gagal OCR halaman pertama dokumen "${item.fileName}" (HTTP ${res.status}).`;
+            const canRetry =
+              attempt < maxPageAttempts &&
+              (parsedResponse.retryable ?? isRetryableOcrError(res.status, lastPageErr));
+            if (!canRetry) {
+              break;
+            }
+          } catch (reqErr: any) {
+            if ((reqErr as any)?.ocrState) {
+              throw reqErr;
+            }
+            lastPageErr = reqErr?.message || `Gagal OCR halaman pertama dokumen "${item.fileName}".`;
+            if (attempt >= maxPageAttempts || !isRetryableOcrError(undefined, lastPageErr)) {
+              break;
+            }
           }
 
-          if (!pageSuccess) {
-            const doneCount = Object.keys(completedPages).length;
-            pushOcrProgress({
-              mode: 'page-ocr',
-              totalPages,
-              currentPage: pageNum,
-              completedPages,
-              failedPages: [pageNum],
-              stageLabel: `Gagal pada halaman ${pageNum}/${totalPages}`,
-            });
-            const err = new Error(
-              doneCount > 0
-                ? `${lastPageErr} (${doneCount}/${totalPages} halaman berhasil tersimpan — klik "Coba Lagi" untuk melanjutkan).`
-                : lastPageErr
-            );
-            (err as any).ocrState = latestOcrState;
-            throw err;
-          }
+          await new Promise((r) => window.setTimeout(r, 700));
         }
 
-        const merged = mergePageOcrExtractions(completedPages, item.fileName);
-        if (!merged.isValidatedUsable) {
-          pushOcrProgress({
-            mode: 'page-ocr',
-            totalPages,
-            currentPage: totalPages,
-            completedPages: {},
-            failedPages: [],
-            stageLabel: 'Hasil OCR belum terbaca/tidak valid',
-          });
-          const err = new Error(
-            `Hasil OCR untuk "${item.fileName}" tidak terbaca atau tidak mengandung data Worksheet yang valid. Klik "Coba Lagi" atau gunakan scan yang lebih jelas.`
-          );
-          (err as any).ocrState = latestOcrState;
-          throw err;
-        }
-
-        return { extracted: merged.worksheet, finalOcrState: latestOcrState };
+        pushOcrProgress({
+          mode: 'page-ocr',
+          stageLabel: 'Gagal OCR halaman 1',
+        });
+        const err = new Error(lastPageErr || `Gagal mengekstrak halaman pertama "${item.fileName}".`);
+        (err as any).ocrState = latestOcrState;
+        throw err;
       } finally {
         if (shouldCloseLocally) {
           await session.close();
@@ -688,18 +653,11 @@ export const ProductionScheduleView: React.FC = () => {
       }
     };
 
-    // Resume directly without re-probing or re-running already-completed pages if prior OCR attempt saved state
-    if (latestOcrState.mode === 'page-ocr' && latestOcrState.totalPages > 0) {
-      return runPageByPageOcr(null, latestOcrState.totalPages);
-    }
-
-    // Fast path for <= 2.8MB PDFs (safe under Vercel 4.5MB limit): try text-layer extraction first
+    // Fast path for <= 2.8MB PDFs (safe under Vercel 4.5MB limit): extract Page 1 text layer first
     if (file.size <= MAX_RAW_PDF_JSON_BYTES) {
       pushOcrProgress({
         mode: 'checking',
-        totalPages: 1,
-        currentPage: 0,
-        stageLabel: 'Mengekstrak teks PDF...',
+        stageLabel: 'Mengekstrak teks halaman 1...',
       });
 
       const base64Data = await new Promise<string>((resolve, reject) => {
@@ -727,37 +685,31 @@ export const ProductionScheduleView: React.FC = () => {
           extracted: parsedResponse.data,
           finalOcrState: {
             mode: 'text',
-            totalPages: 1,
-            currentPage: 1,
-            completedPages: {},
-            failedPages: [],
-            stageLabel: 'Teks PDF selesai',
+            stageLabel: 'Teks halaman 1 selesai',
           },
         };
       }
 
       if (parsedResponse.requiresPageOcr) {
-        return runPageByPageOcr(null, parsedResponse.numPages || 1);
+        return runFirstPageOcr(null);
       }
 
       throw new Error(
-        parsedResponse.error || `Gagal mengekstrak PDF "${item.fileName}" (HTTP ${res.status}).`
+        parsedResponse.error || `Gagal mengekstrak halaman pertama PDF "${item.fileName}" (HTTP ${res.status}).`
       );
     }
 
-    // Large PDF (> 2.8MB): inspect locally via PDF.js to avoid Vercel 4.5MB payload cap
+    // Large PDF (> 2.8MB): inspect ONLY Page 1 locally via PDF.js to avoid Vercel 4.5MB payload cap
     pushOcrProgress({
       mode: 'checking',
-      totalPages: 1,
-      currentPage: 0,
-      stageLabel: 'Memeriksa lapisan teks PDF...',
+      stageLabel: 'Memeriksa teks halaman 1...',
     });
 
     const session = await openBrowserPdfSession(file);
     try {
-      const inspection = await session.inspectCoordinatePages();
+      const inspection = await session.inspectFirstPageCoordinates();
       if (inspection.hasTextLayer && inspection.coordinatePages.length > 0) {
-        const { parsedResponse } = await postExtractEndpoint(
+        const { res, parsedResponse } = await postExtractEndpoint(
           {
             coordinatePages: inspection.coordinatePages,
             fileName: item.fileName,
@@ -769,17 +721,17 @@ export const ProductionScheduleView: React.FC = () => {
             extracted: parsedResponse.data,
             finalOcrState: {
               mode: 'text',
-              totalPages: inspection.numPages,
-              currentPage: inspection.numPages,
-              completedPages: {},
-              failedPages: [],
-              stageLabel: 'Teks PDF selesai',
+              stageLabel: 'Teks halaman 1 selesai',
             },
           };
         }
+        throw new Error(
+          parsedResponse.error ||
+            `Data worksheet tidak ditemukan pada halaman pertama dokumen "${item.fileName}" (HTTP ${res.status}).`
+        );
       }
 
-      return await runPageByPageOcr(session, inspection.numPages);
+      return await runFirstPageOcr(session);
     } finally {
       await session.close();
     }
@@ -960,11 +912,7 @@ export const ProductionScheduleView: React.FC = () => {
       status: 'parsing',
       ocrState: {
         mode: 'checking',
-        totalPages: 1,
-        currentPage: 0,
-        completedPages: {},
-        failedPages: [],
-        stageLabel: 'Menunggu antrean ekstraksi...',
+        stageLabel: 'Menunggu antrean ekstraksi halaman 1...',
       },
     }));
 
@@ -2447,77 +2395,47 @@ export const ProductionScheduleView: React.FC = () => {
                                 </span>
                               </div>
 
-                              {pdf.status === 'parsing' && (() => {
-                                const ocr = pdf.ocrState;
-                                const doneCount = ocr ? Object.keys(ocr.completedPages || {}).length : 0;
-                                const totalPages = ocr?.totalPages || 1;
-                                const pct =
-                                  ocr?.mode === 'page-ocr' && totalPages > 0
-                                    ? Math.min(100, Math.round((doneCount / totalPages) * 100))
-                                    : null;
-                                return (
-                                  <div className="space-y-1 mt-1.5">
-                                    <div className="flex items-center justify-between gap-2 text-[11px] text-blue-700">
-                                      <div className="flex items-center gap-1.5 min-w-0">
-                                        <Loader2 className="w-3 h-3 animate-spin shrink-0" />
-                                        <span className="truncate font-medium">
-                                          {ocr?.stageLabel || 'Mengekstrak data...'}
-                                        </span>
-                                      </div>
-                                      {ocr?.mode === 'page-ocr' && totalPages > 0 && (
-                                        <span className="font-mono text-[10px] font-semibold bg-blue-50 text-blue-700 px-1.5 py-0.2 rounded border border-blue-200 shrink-0">
-                                          {doneCount}/{totalPages} hal
-                                        </span>
-                                      )}
+                              {pdf.status === 'parsing' && (
+                                <div className="space-y-1 mt-1.5">
+                                  <div className="flex items-center justify-between gap-2 text-[11px] text-blue-700">
+                                    <div className="flex items-center gap-1.5 min-w-0">
+                                      <Loader2 className="w-3 h-3 animate-spin shrink-0" />
+                                      <span className="truncate font-medium">
+                                        {pdf.ocrState?.stageLabel || 'Mengekstrak halaman 1...'}
+                                      </span>
                                     </div>
-                                    {pct !== null && (
-                                      <div className="w-full h-1.5 bg-blue-100 rounded-full overflow-hidden">
-                                        <div
-                                          className="h-full bg-blue-600 transition-all duration-300"
-                                          style={{ width: `${Math.max(8, pct)}%` }}
-                                        />
-                                      </div>
-                                    )}
+                                    <span className="font-mono text-[10px] font-semibold bg-blue-50 text-blue-700 px-1.5 py-0.2 rounded border border-blue-200 shrink-0">
+                                      Hal. 1
+                                    </span>
                                   </div>
-                                );
-                              })()}
+                                </div>
+                              )}
 
-                              {pdf.status === 'error' && (() => {
-                                const ocr = pdf.ocrState;
-                                const doneCount = ocr ? Object.keys(ocr.completedPages || {}).length : 0;
-                                const totalPages = ocr?.totalPages || 0;
-                                return (
-                                  <div className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded px-2 py-1.5 mt-1.5 space-y-1.5">
-                                    <div className="flex items-start gap-1.5">
-                                      <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-red-600" />
-                                      <span className="leading-snug">{pdf.error}</span>
-                                    </div>
-                                    <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
-                                      {doneCount > 0 && totalPages > 0 ? (
-                                        <span className="text-[10px] text-red-600 font-medium">
-                                          {doneCount}/{totalPages} halaman berhasil tersimpan
-                                        </span>
-                                      ) : (
-                                        <span className="text-[10px] text-red-500">
-                                          PDF lain yang sudah berhasil tetap aman
-                                        </span>
-                                      )}
-                                      <button
-                                        type="button"
-                                        onClick={(e) => {
-                                          e.stopPropagation();
-                                          handleRetryPdf(pdf.id);
-                                        }}
-                                        disabled={isProcessingPdfs}
-                                        className="px-2 py-0.5 text-[10px] font-bold bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded flex items-center gap-1 cursor-pointer transition-colors"
-                                      >
-                                        <RefreshCw className="w-2.5 h-2.5" />
-                                        <span>Coba Lagi</span>
-                                      </button>
-                                    </div>
+                              {pdf.status === 'error' && (
+                                <div className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded px-2 py-1.5 mt-1.5 space-y-1.5">
+                                  <div className="flex items-start gap-1.5">
+                                    <AlertTriangle className="w-3.5 h-3.5 shrink-0 mt-0.5 text-red-600" />
+                                    <span className="leading-snug">{pdf.error}</span>
                                   </div>
-                                );
-                              })()}
+                                  <div className="flex flex-wrap items-center justify-between gap-2 pt-0.5">
+                                    <span className="text-[10px] text-red-500">
+                                      PDF lain yang sudah berhasil tetap aman
+                                    </span>
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleRetryPdf(pdf.id);
+                                      }}
+                                      disabled={isProcessingPdfs}
+                                      className="px-2 py-0.5 text-[10px] font-bold bg-red-600 hover:bg-red-700 disabled:opacity-50 text-white rounded flex items-center gap-1 cursor-pointer transition-colors"
+                                    >
+                                      <RefreshCw className="w-2.5 h-2.5" />
+                                      <span>Coba Lagi</span>
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
 
                               {pdf.status === 'success' && (
                                 <div className="space-y-1 mt-1 text-[11px]">

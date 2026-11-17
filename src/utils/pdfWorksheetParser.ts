@@ -1360,16 +1360,15 @@ export function extractWorksheetFromPdfCoordinates(
     };
   }
 
-  const allPageLines: ReconstructedLine[] = [];
-  for (const page of pages) {
-    allPageLines.push(...groupPageItemsIntoLines(page));
-  }
+  // Enforce First-Page-Only extraction: skip page 2 and beyond completely
+  const firstPage = pages.find((p) => p.pageNum === 1) ?? pages[0];
+  const allPageLines: ReconstructedLine[] = groupPageItemsIntoLines(firstPage);
 
   const fullText = allPageLines.map((l) => l.text).join('\n');
   if (!fullText.trim()) {
     return {
       success: false,
-      error: `Dokumen ${fileName} tidak berisi lapisan teks (kemungkinan PDF hasil scan/gambar).`,
+      error: `Dokumen ${fileName} tidak berisi lapisan teks pada halaman pertama (kemungkinan PDF hasil scan/gambar).`,
     };
   }
 
@@ -1567,6 +1566,21 @@ export function extractWorksheetFromPdfCoordinates(
       textRes.data.fieldWarnings = review.fieldWarnings;
       return textRes;
     }
+  }
+
+  const hasAnyWorksheetSignal = Boolean(
+    textIdentity.orNumber ||
+      textIdentity.worksheetNo ||
+      textIdentity.style ||
+      (textIdentity.target !== null && textIdentity.target > 0) ||
+      materials.length > 0
+  );
+
+  if (!hasAnyWorksheetSignal) {
+    return {
+      success: false,
+      error: `Data worksheet tidak ditemukan pada halaman pertama dokumen "${fileName}".`,
+    };
   }
 
   const ws: ExtractedPdfWorksheet = {
