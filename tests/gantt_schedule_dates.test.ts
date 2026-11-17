@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   calculateGanttBarSpan,
   compareCalendarDates,
+  DEFAULT_PRODUCTION_LINES,
   doDateRangesOverlap,
   doesScheduleOverlapMonth,
   getDaysInCalendarMonth,
@@ -534,10 +535,10 @@ test('Line Grouping: groupSchedulesForGanttBoard groups per Line Produksi, sorts
     daysInMonth: 30,
   });
 
-  // Natural sort: Line 1, Line 3, Line 10, then Belum Ditentukan
+  // Always includes all 5 fixed lines in canonical order, plus any custom lines, then Belum Ditentukan
   assert.deepEqual(
     groups.map((g) => g.lineLabel),
-    ['Line 1', 'Line 3', 'Line 10', UNASSIGNED_PRODUCTION_LINE_LABEL]
+    ['Line 1', 'Line 3', 'Line 4', 'Line 5', 'Line 7', 'Line 10', UNASSIGNED_PRODUCTION_LINE_LABEL]
   );
 
   // Line 1 has 2 lanes (L1A+L1C share lane 0, L1B on lane 1)
@@ -551,19 +552,129 @@ test('Line Grouping: groupSchedulesForGanttBoard groups per Line Produksi, sorts
     ]
   );
 
-  // Line 3 & Line 10 each have 1 lane
+  // Line 3 has 1 lane, empty fixed lines (Line 4, 5, 7) have 0 lanes, Line 10 has 1 lane
   assert.equal(groups[1].layout.laneCount, 1);
-  assert.equal(groups[2].layout.laneCount, 1);
+  assert.equal(groups[2].layout.laneCount, 0);
+  assert.equal(groups[3].layout.laneCount, 0);
+  assert.equal(groups[4].layout.laneCount, 0);
+  assert.equal(groups[5].layout.laneCount, 1);
 
   // Unassigned schedules share lane 0 because Nov 1-10 and Nov 11-20 do not overlap
-  assert.equal(groups[3].isUnassigned, true);
-  assert.equal(groups[3].layout.laneCount, 1);
-  assert.equal(groups[3].layout.items.length, 2);
+  const unassignedGroup = groups[6];
+  assert.equal(unassignedGroup.isUnassigned, true);
+  assert.equal(unassignedGroup.layout.laneCount, 1);
+  assert.equal(unassignedGroup.layout.items.length, 2);
 
-  // When all schedules have real lines, Belum Ditentukan row is omitted
+  // When all schedules have real lines, Belum Ditentukan row is omitted while all 5 fixed lines stay
   const onlyAssigned = groupSchedulesForGanttBoard(
     schedules.filter((s) => s.id.startsWith('l')),
     { year: 2026, month0: 10, daysInMonth: 30 }
   );
   assert.equal(onlyAssigned.some((g) => g.isUnassigned), false);
+  assert.deepEqual(
+    onlyAssigned.map((g) => g.lineLabel),
+    ['Line 1', 'Line 3', 'Line 4', 'Line 5', 'Line 7', 'Line 10']
+  );
+});
+
+test('Fixed 5 Production Lines: always displays Line 1, Line 3, Line 4, Line 5, Line 7 regardless of empty/single-line/month-switch states', () => {
+  const expectedFixed = ['Line 1', 'Line 3', 'Line 4', 'Line 5', 'Line 7'];
+  assert.deepEqual([...DEFAULT_PRODUCTION_LINES], expectedFixed);
+
+  const novParams = { year: 2026, month0: 10, daysInMonth: 30 };
+  const decParams = { year: 2026, month0: 11, daysInMonth: 31 };
+
+  // 1. Only Line 1 has a schedule -> all 5 lines still appear
+  const onlyLine1 = groupSchedulesForGanttBoard(
+    [
+      {
+        id: 's1',
+        orNumber: 'OR-1',
+        style: 'Jacket',
+        productionLine: 'Line 1',
+        productionDate: '2026-11-02',
+        finishDate: '2026-11-06',
+        target: 500,
+      },
+    ],
+    novParams
+  );
+  assert.deepEqual(onlyLine1.map((g) => g.lineLabel), expectedFixed);
+  assert.equal(onlyLine1[0].layout.items.length, 1);
+  assert.equal(onlyLine1[1].layout.items.length, 0);
+  assert.equal(onlyLine1[2].layout.items.length, 0);
+  assert.equal(onlyLine1[3].layout.items.length, 0);
+  assert.equal(onlyLine1[4].layout.items.length, 0);
+
+  // 2. Only Line 3 has a schedule -> all 5 lines still appear
+  const onlyLine3 = groupSchedulesForGanttBoard(
+    [
+      {
+        id: 's3',
+        orNumber: 'OR-3',
+        style: 'Hoodie',
+        productionLine: 'Line 3',
+        productionDate: '2026-11-10',
+        finishDate: '2026-11-14',
+        target: 700,
+      },
+    ],
+    novParams
+  );
+  assert.deepEqual(onlyLine3.map((g) => g.lineLabel), expectedFixed);
+  assert.equal(onlyLine3[0].layout.items.length, 0);
+  assert.equal(onlyLine3[1].layout.items.length, 1);
+
+  // 3. No schedules at all -> all 5 lines still appear with 64px minimum row height
+  const noSchedules = groupSchedulesForGanttBoard([], novParams);
+  assert.deepEqual(noSchedules.map((g) => g.lineLabel), expectedFixed);
+  for (const g of noSchedules) {
+    assert.equal(g.layout.items.length, 0);
+    assert.equal(g.layout.laneCount, 0);
+    assert.equal(g.layout.rowHeightPx, 64);
+  }
+
+  // 4. All 5 lines populated (including lowercase 'line 4') -> each enters its exact fixed line
+  const allFive = groupSchedulesForGanttBoard(
+    [
+      { id: 'f7', orNumber: 'OR-7', style: 'S7', productionLine: 'Line 7', productionDate: '2026-11-20', finishDate: '2026-11-24', target: 100 },
+      { id: 'f4', orNumber: 'OR-4', style: 'S4', productionLine: 'line 4', productionDate: '2026-11-15', finishDate: '2026-11-18', target: 100 },
+      { id: 'f1', orNumber: 'OR-1', style: 'S1', productionLine: 'Line 1', productionDate: '2026-11-01', finishDate: '2026-11-05', target: 100 },
+      { id: 'f5', orNumber: 'OR-5', style: 'S5', productionLine: 'Line 5', productionDate: '2026-11-06', finishDate: '2026-11-10', target: 100 },
+      { id: 'f3', orNumber: 'OR-3', style: 'S3', productionLine: 'Line 3', productionDate: '2026-11-11', finishDate: '2026-11-14', target: 100 },
+    ],
+    novParams
+  );
+  assert.deepEqual(allFive.map((g) => g.lineLabel), expectedFixed);
+  assert.deepEqual(
+    allFive.map((g) => g.layout.items[0]?.schedule.orNumber),
+    ['OR-1', 'OR-3', 'OR-4', 'OR-5', 'OR-7']
+  );
+
+  // 5. Unassigned schedule goes to 'Belum Ditentukan' after Line 7, never auto-placed into 5 lines
+  const withUnassigned = groupSchedulesForGanttBoard(
+    [
+      { id: 'u1', orNumber: 'OR-U1', style: 'Unassigned', productionLine: '', productionDate: '2026-11-05', finishDate: '2026-11-08', target: 300 },
+      { id: 'u2', orNumber: 'OR-U2', style: 'Legacy', productionLine: 'Produksi', productionDate: '2026-11-12', finishDate: '2026-11-15', target: 400 },
+    ],
+    novParams
+  );
+  assert.deepEqual(withUnassigned.map((g) => g.lineLabel), [...expectedFixed, UNASSIGNED_PRODUCTION_LINE_LABEL]);
+  for (let i = 0; i < 5; i++) {
+    assert.equal(withUnassigned[i].layout.items.length, 0);
+  }
+  assert.equal(withUnassigned[5].isUnassigned, true);
+  assert.equal(withUnassigned[5].layout.items.length, 2);
+
+  // 6. Switching to December 2026 (where Nov schedules don't overlap) -> all 5 fixed lines remain visible
+  const switchedMonth = groupSchedulesForGanttBoard(
+    [
+      { id: 'm1', orNumber: 'OR-NOV', style: 'Nov Only', productionLine: 'Line 1', productionDate: '2026-11-01', finishDate: '2026-11-10', target: 500 },
+    ],
+    decParams
+  );
+  assert.deepEqual(switchedMonth.map((g) => g.lineLabel), expectedFixed);
+  for (const g of switchedMonth) {
+    assert.equal(g.layout.items.length, 0);
+  }
 });

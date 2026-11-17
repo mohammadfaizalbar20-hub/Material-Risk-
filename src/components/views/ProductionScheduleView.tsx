@@ -44,6 +44,7 @@ import {
 } from '../../lib/supabase';
 import { generateUuid } from '../../utils/uuid';
 import {
+  DEFAULT_PRODUCTION_LINES,
   GANTT_LANE_GAP_PX,
   GANTT_LANE_HEIGHT_PX,
   GANTT_ROW_PADDING_Y_PX,
@@ -171,9 +172,12 @@ export const ProductionScheduleView: React.FC = () => {
 
   const availableOrList = registeredOrNumbers;
 
-  // Dynamic suggestions ONLY from previously saved schedules (never fabricate fake line names)
+  // Fixed 5 Production Lines + any additional assigned Line names from saved schedules (for optional datalist suggestions)
   const existingProductionLines = useMemo(() => {
     const unique = new Map<string, string>();
+    for (const fixedLine of DEFAULT_PRODUCTION_LINES) {
+      unique.set(fixedLine.toLowerCase(), fixedLine);
+    }
     for (const s of productionSchedules) {
       const assigned = normalizeAssignedProductionLine(s.productionLine);
       if (assigned && !unique.has(assigned.toLowerCase())) {

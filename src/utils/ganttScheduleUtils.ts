@@ -298,6 +298,18 @@ export function layoutGanttLineSchedules<
   };
 }
 
+export const DEFAULT_PRODUCTION_LINES = [
+  'Line 1',
+  'Line 3',
+  'Line 4',
+  'Line 5',
+  'Line 7',
+] as const;
+
+const DEFAULT_PRODUCTION_LINE_ORDER = new Map<string, number>(
+  DEFAULT_PRODUCTION_LINES.map((line, index) => [line.toLowerCase(), index])
+);
+
 export const UNASSIGNED_PRODUCTION_LINE_LABEL = 'Belum Ditentukan';
 const LEGACY_PLACEHOLDER_LINES = new Set(['produksi', '-', 'belum ditentukan']);
 
@@ -337,6 +349,8 @@ export interface GanttLineGroup<
 /**
  * Groups schedules by their assigned Production Line and computes non-overlapping lane layouts
  * independently per Line row for the viewed calendar month.
+ * Always includes the 5 fixed Production Lines (Line 1, Line 3, Line 4, Line 5, Line 7)
+ * even when they have no schedules in the active month.
  * Unassigned schedules (blank or legacy 'Produksi') are placed in a final 'Belum Ditentukan' row.
  */
 export function groupSchedulesForGanttBoard<
@@ -353,6 +367,15 @@ export function groupSchedulesForGanttBoard<
     string,
     { lineLabel: string; isUnassigned: boolean; schedules: T[] }
   >();
+
+  // Always seed the 5 fixed Production Lines so empty lines remain visible on the board
+  for (const fixedLine of DEFAULT_PRODUCTION_LINES) {
+    buckets.set(fixedLine.toLowerCase(), {
+      lineLabel: fixedLine,
+      isUnassigned: false,
+      schedules: [],
+    });
+  }
 
   for (const sch of schedules) {
     const assigned = normalizeAssignedProductionLine(sch.productionLine);
@@ -384,6 +407,13 @@ export function groupSchedulesForGanttBoard<
     if (a.isUnassigned !== b.isUnassigned) {
       return a.isUnassigned ? 1 : -1;
     }
+    const fixedIdxA = DEFAULT_PRODUCTION_LINE_ORDER.get(a.lineKey);
+    const fixedIdxB = DEFAULT_PRODUCTION_LINE_ORDER.get(b.lineKey);
+    if (fixedIdxA !== undefined && fixedIdxB !== undefined) {
+      return fixedIdxA - fixedIdxB;
+    }
+    if (fixedIdxA !== undefined) return -1;
+    if (fixedIdxB !== undefined) return 1;
     return a.lineLabel.localeCompare(b.lineLabel, 'id', { numeric: true, sensitivity: 'base' });
   });
 
