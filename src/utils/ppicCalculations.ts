@@ -92,8 +92,9 @@ export function getDaysDifference(targetDateStr: string, referenceDate: Date = n
 }
 
 /**
- * Deteksi bentrok jadwal pada lini yang sama
- * Jadwal bertabrakan jika: line sama, id berbeda, dan periode tanggal overlap
+ * Deteksi bentrok jadwal pada lini yang sama.
+ * Jadwal bertabrakan jika: line sama, No. OR berbeda (atau Style identik), dan periode tanggal overlap.
+ * Jadwal dengan No. OR sama tetapi Style berbeda pada Line yang sama TIDAK ditandai sebagai bentrok.
  * Overlap: startA <= finishB && finishA >= startB
  */
 export function detectScheduleConflicts(schedules: ProductionSchedule[]): Map<string, ScheduleConflict> {
@@ -107,6 +108,8 @@ export function detectScheduleConflicts(schedules: ProductionSchedule[]): Map<st
       continue;
     }
 
+    const or1 = String(s1.orNumber || '').trim().toUpperCase();
+    const style1 = String(s1.style || '').trim().toLowerCase();
     const conflictingWith: ScheduleConflict['conflictingWith'] = [];
 
     for (let j = 0; j < schedules.length; j++) {
@@ -114,6 +117,13 @@ export function detectScheduleConflicts(schedules: ProductionSchedule[]): Map<st
       const s2 = schedules[j];
       const line2 = normalizeAssignedProductionLine(s2.productionLine);
       if (!line2 || line1.toLowerCase() !== line2.toLowerCase()) continue;
+
+      const or2 = String(s2.orNumber || '').trim().toUpperCase();
+      const style2 = String(s2.style || '').trim().toLowerCase();
+      if (or1 && or2 && or1 === or2 && style1 !== style2) {
+        // Same OR with different Styles on the same Line is NOT a schedule conflict
+        continue;
+      }
 
       if (doDateRangesOverlap(s1.productionDate, s1.finishDate, s2.productionDate, s2.finishDate)) {
         conflictingWith.push({

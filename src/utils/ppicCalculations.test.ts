@@ -10,6 +10,7 @@ import {
   calculateParetoAnalysis,
   assessAllMaterialRisks,
 } from './ppicCalculations';
+import { layoutGanttLineSchedules } from './ganttScheduleUtils';
 import { MaterialItemRequirement, ProductionSchedule } from '../types/ppic';
 
 test('Formula A: Rasio Kekurangan dihitung dengan benar', () => {
@@ -237,5 +238,101 @@ test('Jadwal tanpa Line Produksi (kosong) atau placeholder lama "Produksi" TIDAK
   const summary102 = orSummaries.find((s) => s.orNumber === 'OR-102');
   assert.ok(summary102);
   assert.equal(summary102.productionLine, '');
+});
+
+test('Aturan Bentrok Jadwal: No. OR sama dengan Style berbeda tidak bentrok (tetap pisah lane), No. OR berbeda bertumpuk tetap bentrok, tidak bertumpuk tidak bentrok', () => {
+  // 1. OR 1023, Style A & Style B, Line 1, tanggal bertumpuk -> TIDAK ada peringatan Bentrok Jadwal
+  const sameOrDiffStyle: ProductionSchedule[] = [
+    {
+      id: 'or1023-a',
+      orNumber: '1023',
+      style: 'Style A',
+      productionLine: 'Line 1',
+      productionDate: '2026-11-02',
+      finishDate: '2026-11-08',
+      target: 500,
+    },
+    {
+      id: 'or1023-b',
+      orNumber: '1023',
+      style: 'Style B',
+      productionLine: 'Line 1',
+      productionDate: '2026-11-04',
+      finishDate: '2026-11-10',
+      target: 600,
+    },
+  ];
+  const sameOrConflicts = detectScheduleConflicts(sameOrDiffStyle);
+  assert.equal(sameOrConflicts.size, 0);
+  assert.equal(sameOrConflicts.has('or1023-a'), false);
+  assert.equal(sameOrConflicts.has('or1023-b'), false);
+
+  // Gantt lanes must still separate overlapping bars for OR 1023 Style A and Style B
+  const laneLayout = layoutGanttLineSchedules(sameOrDiffStyle, {
+    year: 2026,
+    month0: 10,
+    daysInMonth: 30,
+  });
+  assert.equal(laneLayout.laneCount, 2);
+  assert.deepEqual(
+    laneLayout.items.map((item) => ({ id: item.schedule.id, lane: item.laneIndex })),
+    [
+      { id: 'or1023-a', lane: 0 },
+      { id: 'or1023-b', lane: 1 },
+    ]
+  );
+
+  // 2. OR 1023 dan OR 1024, Line 1, tanggal bertumpuk -> TETAP ada peringatan Bentrok Jadwal
+  const diffOrOverlap: ProductionSchedule[] = [
+    {
+      id: 'or1023-x',
+      orNumber: '1023',
+      style: 'Style A',
+      productionLine: 'Line 1',
+      productionDate: '2026-11-02',
+      finishDate: '2026-11-08',
+      target: 500,
+    },
+    {
+      id: 'or1024-y',
+      orNumber: '1024',
+      style: 'Style C',
+      productionLine: 'Line 1',
+      productionDate: '2026-11-05',
+      finishDate: '2026-11-12',
+      target: 700,
+    },
+  ];
+  const diffOrConflicts = detectScheduleConflicts(diffOrOverlap);
+  assert.equal(diffOrConflicts.has('or1023-x'), true);
+  assert.equal(diffOrConflicts.has('or1024-y'), true);
+  assert.deepEqual(
+    diffOrConflicts.get('or1023-x')?.conflictingWith.map((c) => c.orNumber),
+    ['1024']
+  );
+
+  // 3. OR berbeda dengan tanggal TIDAK bertumpuk -> TIDAK ada peringatan Bentrok Jadwal
+  const diffOrNonOverlap: ProductionSchedule[] = [
+    {
+      id: 'or1023-seq',
+      orNumber: '1023',
+      style: 'Style A',
+      productionLine: 'Line 1',
+      productionDate: '2026-11-02',
+      finishDate: '2026-11-06',
+      target: 500,
+    },
+    {
+      id: 'or1024-seq',
+      orNumber: '1024',
+      style: 'Style B',
+      productionLine: 'Line 1',
+      productionDate: '2026-11-07',
+      finishDate: '2026-11-12',
+      target: 700,
+    },
+  ];
+  const nonOverlapConflicts = detectScheduleConflicts(diffOrNonOverlap);
+  assert.equal(nonOverlapConflicts.size, 0);
 });
 
