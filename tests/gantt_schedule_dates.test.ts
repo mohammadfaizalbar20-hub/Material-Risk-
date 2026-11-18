@@ -3,11 +3,18 @@ import assert from 'node:assert/strict';
 import {
   calculateGanttBarSpan,
   compareCalendarDates,
+  computeZoomPreservedScrollLeft,
+  DEFAULT_GANTT_ZOOM,
   DEFAULT_PRODUCTION_LINES,
   doDateRangesOverlap,
   doesScheduleOverlapMonth,
+  GANTT_STICKY_LINE_COL_WIDTH_PX,
+  GANTT_ZOOM_LEVELS,
   getDaysInCalendarMonth,
+  getGanttBoardWidthPx,
+  getGanttDayColumnWidthPx,
   getGanttRowHeightPx,
+  getNextGanttZoomLevel,
   groupSchedulesForGanttBoard,
   isFinishBeforeStart,
   layoutGanttLineSchedules,
@@ -677,4 +684,68 @@ test('Fixed 5 Production Lines: always displays Line 1, Line 3, Line 4, Line 5, 
   for (const g of switchedMonth) {
     assert.equal(g.layout.items.length, 0);
   }
+});
+
+test('Gantt Zoom: levels 50/75/100/125/150, proportional day width, stepping bounds, and scroll anchor preservation', () => {
+  assert.deepEqual([...GANTT_ZOOM_LEVELS], [50, 75, 100, 125, 150]);
+  assert.equal(DEFAULT_GANTT_ZOOM, 100);
+
+  // Proportional day column widths & total board widths (sticky 180px left col stays constant)
+  const colWidths = GANTT_ZOOM_LEVELS.map((z) => getGanttDayColumnWidthPx(z));
+  assert.deepEqual(colWidths, [24, 36, 48, 60, 72]);
+
+  const boardWidths = GANTT_ZOOM_LEVELS.map((z) => getGanttBoardWidthPx(z));
+  assert.deepEqual(boardWidths, [
+    GANTT_STICKY_LINE_COL_WIDTH_PX + 31 * 24,
+    GANTT_STICKY_LINE_COL_WIDTH_PX + 31 * 36,
+    GANTT_STICKY_LINE_COL_WIDTH_PX + 31 * 48,
+    GANTT_STICKY_LINE_COL_WIDTH_PX + 31 * 60,
+    GANTT_STICKY_LINE_COL_WIDTH_PX + 31 * 72,
+  ]);
+
+  // Step bounds
+  assert.equal(getNextGanttZoomLevel(100, 'in'), 125);
+  assert.equal(getNextGanttZoomLevel(125, 'in'), 150);
+  assert.equal(getNextGanttZoomLevel(150, 'in'), 150);
+  assert.equal(getNextGanttZoomLevel(100, 'out'), 75);
+  assert.equal(getNextGanttZoomLevel(75, 'out'), 50);
+  assert.equal(getNextGanttZoomLevel(50, 'out'), 50);
+
+  // Percentage bar math scales identically with board date-grid width across all 5 zoom levels
+  const span = calculateGanttBarSpan({
+    productionDate: '2026-11-05',
+    finishDate: '2026-11-14',
+    year: 2026,
+    month0: 10,
+    daysInMonth: 30,
+  })!;
+  for (const zoom of GANTT_ZOOM_LEVELS) {
+    const dayPx = getGanttDayColumnWidthPx(zoom);
+    const gridPx = 31 * dayPx;
+    const barLeftPx = (span.leftPct / 100) * gridPx;
+    const barWidthPx = (span.widthPct / 100) * gridPx;
+    approxEqual(barLeftPx, 4 * dayPx);
+    approxEqual(barWidthPx, 10 * dayPx);
+  }
+
+  // Scroll anchor preservation: keeps centered date position steady when zooming in/out
+  assert.equal(
+    computeZoomPreservedScrollLeft({
+      currentScrollLeft: 0,
+      clientWidth: 1000,
+      prevZoom: 100,
+      nextZoom: 150,
+    }),
+    0
+  );
+
+  // Client 1000px -> visible date width = 820px; at 100% (48px/day), scrollLeft=300 centers at (300+410)/48 = day 14.7916
+  // At 150% (72px/day), day 14.7916 * 72 - 410 = 655px
+  const zoomedInScroll = computeZoomPreservedScrollLeft({
+    currentScrollLeft: 300,
+    clientWidth: 1000,
+    prevZoom: 100,
+    nextZoom: 150,
+  });
+  assert.equal(zoomedInScroll, 655);
 });

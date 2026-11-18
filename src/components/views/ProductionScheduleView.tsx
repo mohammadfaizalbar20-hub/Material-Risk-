@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef } from 'react';
+import React, { useState, useMemo, useRef, useLayoutEffect } from 'react';
 import { usePpic } from '../../context/PpicContext';
 import { ProductionSchedule, WorksheetPdfItem, WorksheetMaterialItem } from '../../types/ppic';
 import {
@@ -24,6 +24,9 @@ import {
   CheckCircle2,
   FileWarning,
   RefreshCw,
+  ZoomIn,
+  ZoomOut,
+  RotateCcw,
 } from 'lucide-react';
 import { getIndonesianHolidayInfo, DayHolidayInfo } from '../../utils/indonesianHolidays';
 import {
@@ -44,11 +47,19 @@ import {
 } from '../../lib/supabase';
 import { generateUuid } from '../../utils/uuid';
 import {
+  computeZoomPreservedScrollLeft,
+  DEFAULT_GANTT_ZOOM,
   DEFAULT_PRODUCTION_LINES,
   GANTT_LANE_GAP_PX,
   GANTT_LANE_HEIGHT_PX,
   GANTT_ROW_PADDING_Y_PX,
+  GANTT_STICKY_LINE_COL_WIDTH_PX,
+  GANTT_ZOOM_LEVELS,
+  GanttZoomLevel,
   getDisplayProductionLineLabel,
+  getGanttBoardWidthPx,
+  getGanttDayColumnWidthPx,
+  getNextGanttZoomLevel,
   groupSchedulesForGanttBoard,
   isFinishBeforeStart,
   normalizeAssignedProductionLine,
@@ -130,6 +141,34 @@ export const ProductionScheduleView: React.FC = () => {
   const [currentYear, setCurrentYear] = useState<number>(2026);
   const [currentMonth, setCurrentMonth] = useState<number>(10); // 0-indexed: 10 = November
   const [orSearchInput, setOrSearchInput] = useState<string>('');
+  const [ganttZoom, setGanttZoom] = useState<GanttZoomLevel>(DEFAULT_GANTT_ZOOM);
+  const ganttScrollRef = useRef<HTMLDivElement | null>(null);
+  const pendingZoomScrollRef = useRef<number | null>(null);
+
+  const dayColWidthPx = getGanttDayColumnWidthPx(ganttZoom);
+  const ganttBoardWidthPx = getGanttBoardWidthPx(ganttZoom);
+  const ganttGridTemplateColumns = `${GANTT_STICKY_LINE_COL_WIDTH_PX}px repeat(31, ${dayColWidthPx}px)`;
+
+  const handleSetGanttZoom = (nextZoom: GanttZoomLevel) => {
+    if (nextZoom === ganttZoom) return;
+    const scroller = ganttScrollRef.current;
+    if (scroller) {
+      pendingZoomScrollRef.current = computeZoomPreservedScrollLeft({
+        currentScrollLeft: scroller.scrollLeft,
+        clientWidth: scroller.clientWidth,
+        prevZoom: ganttZoom,
+        nextZoom,
+      });
+    }
+    setGanttZoom(nextZoom);
+  };
+
+  useLayoutEffect(() => {
+    if (pendingZoomScrollRef.current !== null && ganttScrollRef.current) {
+      ganttScrollRef.current.scrollLeft = pendingZoomScrollRef.current;
+      pendingZoomScrollRef.current = null;
+    }
+  }, [ganttZoom]);
 
   // Modal states
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -1373,10 +1412,69 @@ export const ProductionScheduleView: React.FC = () => {
 
       {/* Production Planning Board (Horizontal Gantt Calendar with Non-Overlapping Lane Packing & Holiday Markings) */}
       <div className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
-        <div className="overflow-x-auto relative">
-          <div className="min-w-[1224px]">
+        {/* Gantt Top Header Bar with Zoom Controls at Top Right */}
+        <div className="px-3.5 py-2 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2">
+          <div className="text-[11px] font-medium text-slate-600 flex items-center gap-2">
+            <span className="font-semibold text-slate-800">Timeline Jadwal Produksi</span>
+            <span className="text-slate-400">·</span>
+            <span className="font-mono text-slate-500">{dayColWidthPx}px/hari</span>
+          </div>
+
+          <div
+            className="flex items-center gap-1.5 ml-auto"
+            role="group"
+            aria-label="Kontrol Zoom Gantt Chart"
+          >
+            <button
+              type="button"
+              onClick={() => handleSetGanttZoom(getNextGanttZoomLevel(ganttZoom, 'out'))}
+              disabled={ganttZoom === GANTT_ZOOM_LEVELS[0]}
+              aria-label="Zoom Out"
+              title="Zoom Out (-)"
+              className="inline-flex items-center justify-center w-7 h-7 rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
+            >
+              <ZoomOut className="w-3.5 h-3.5" />
+            </button>
+
+            <span
+              data-testid="gantt-zoom-level"
+              className="min-w-12 px-2 py-1 text-center text-xs font-mono font-bold text-slate-800 bg-white border border-slate-300 rounded select-none"
+              title="Persentase Zoom Saat Ini"
+            >
+              {ganttZoom}%
+            </span>
+
+            <button
+              type="button"
+              onClick={() => handleSetGanttZoom(getNextGanttZoomLevel(ganttZoom, 'in'))}
+              disabled={ganttZoom === GANTT_ZOOM_LEVELS[GANTT_ZOOM_LEVELS.length - 1]}
+              aria-label="Zoom In"
+              title="Zoom In (+)"
+              className="inline-flex items-center justify-center w-7 h-7 rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
+            >
+              <ZoomIn className="w-3.5 h-3.5" />
+            </button>
+
+            <button
+              type="button"
+              onClick={() => handleSetGanttZoom(DEFAULT_GANTT_ZOOM)}
+              aria-label="Reset Zoom"
+              title="Reset zoom ke 100%"
+              className="inline-flex items-center gap-1 px-2.5 h-7 rounded border border-slate-300 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer ml-1"
+            >
+              <RotateCcw className="w-3 h-3" />
+              <span>Reset</span>
+            </button>
+          </div>
+        </div>
+
+        <div ref={ganttScrollRef} className="overflow-x-auto relative" data-gantt-scroll-container>
+          <div style={{ width: `${ganttBoardWidthPx}px` }} data-gantt-board-canvas>
             {/* Header: Dates Row */}
-            <div className="grid grid-cols-[180px_repeat(31,minmax(34px,1fr))] bg-slate-900 text-white text-xs border-b border-slate-700 font-semibold sticky top-0 z-30">
+            <div
+              style={{ gridTemplateColumns: ganttGridTemplateColumns }}
+              className="grid bg-slate-900 text-white text-xs border-b border-slate-700 font-semibold sticky top-0 z-30"
+            >
               {/* Sticky Line Produksi Header Column */}
               <div className="sticky left-0 z-40 bg-slate-900 p-3 border-r border-slate-700 flex items-center justify-between shadow-[3px_0_6px_-1px_rgba(0,0,0,0.5)]">
                 <span className="font-bold text-white tracking-wide">Line Produksi</span>
@@ -1403,22 +1501,28 @@ export const ProductionScheduleView: React.FC = () => {
                   headerBg = 'bg-slate-800/50 text-slate-300';
                 }
 
+                const isCompactZoom = ganttZoom <= 50;
+
                 return (
                   <div
                     key={d.day}
                     data-gantt-day={d.day}
-                    className={`p-1 text-center border-r border-slate-800/80 flex flex-col justify-center items-center transition-colors relative group select-none ${headerBg}`}
+                    className={`${isCompactZoom ? 'px-0.5 py-1' : 'p-1'} text-center border-r border-slate-800/80 flex flex-col justify-center items-center transition-colors relative group select-none overflow-hidden ${headerBg}`}
                     title={d.holidayInfo.isHoliday ? `${d.dateStr}: ${d.holidayInfo.name}` : `${d.dayName}, ${d.dateStr}`}
                   >
-                    <span className="text-[10px] font-mono opacity-80 leading-tight">{d.dayName}</span>
-                    <span className={`text-xs font-mono ${dateColor}`}>{d.day}</span>
+                    <span className={`${isCompactZoom ? 'text-[9px]' : 'text-[10px]'} font-mono opacity-80 leading-tight`}>
+                      {d.dayName}
+                    </span>
+                    <span className={`${isCompactZoom ? 'text-[11px]' : 'text-xs'} font-mono leading-tight ${dateColor}`}>
+                      {d.day}
+                    </span>
                     {isNational && (
-                      <span className="text-[8px] font-extrabold uppercase px-1 py-0.2 bg-rose-600 text-white rounded-xs leading-none mt-0.5">
+                      <span className={`${isCompactZoom ? 'text-[6px] px-0.5' : 'text-[8px] px-1'} font-extrabold uppercase py-0.2 bg-rose-600 text-white rounded-xs leading-none mt-0.5`}>
                         Libur
                       </span>
                     )}
                     {isCuti && (
-                      <span className="text-[8px] font-extrabold uppercase px-1 py-0.2 bg-amber-600 text-white rounded-xs leading-none mt-0.5">
+                      <span className={`${isCompactZoom ? 'text-[6px] px-0.5' : 'text-[8px] px-1'} font-extrabold uppercase py-0.2 bg-amber-600 text-white rounded-xs leading-none mt-0.5`}>
                         Cuti
                       </span>
                     )}
@@ -1448,8 +1552,11 @@ export const ProductionScheduleView: React.FC = () => {
                       data-board-row={group.lineLabel}
                       data-line-key={group.lineKey}
                       data-lane-count={group.layout.laneCount}
-                      style={{ minHeight: `${Math.max(group.layout.rowHeightPx, 64)}px` }}
-                      className="grid grid-cols-[180px_repeat(31,minmax(34px,1fr))] relative hover:bg-slate-50/30 transition-colors"
+                      style={{
+                        minHeight: `${Math.max(group.layout.rowHeightPx, 64)}px`,
+                        gridTemplateColumns: ganttGridTemplateColumns,
+                      }}
+                      className="grid relative hover:bg-slate-50/30 transition-colors"
                     >
                       {/* Fixed Sticky Left Line Produksi Column */}
                       <div className="sticky left-0 z-20 p-3 border-r border-slate-200 bg-white/95 backdrop-blur-xs flex flex-col justify-center shadow-[3px_0_6px_-1px_rgba(0,0,0,0.06)]">
@@ -1485,25 +1592,26 @@ export const ProductionScheduleView: React.FC = () => {
 
                           let cellBg = 'border-slate-100 hover:bg-slate-50/50';
                           let holidayTag = null;
+                          const tagSizeClass = ganttZoom <= 50 ? 'text-[6px]' : 'text-[8px]';
 
                           if (isNational) {
                             cellBg = 'bg-rose-100/75 border-rose-200/90';
                             holidayTag = (
-                              <span className="text-[8px] font-bold text-rose-700/80 uppercase font-mono tracking-tighter select-none leading-none">
+                              <span className={`${tagSizeClass} font-bold text-rose-700/80 uppercase font-mono tracking-tighter select-none leading-none`}>
                                 LIBUR
                               </span>
                             );
                           } else if (isCuti) {
                             cellBg = 'bg-amber-100/70 border-amber-200/90';
                             holidayTag = (
-                              <span className="text-[8px] font-bold text-amber-800/80 uppercase font-mono tracking-tighter select-none leading-none">
+                              <span className={`${tagSizeClass} font-bold text-amber-800/80 uppercase font-mono tracking-tighter select-none leading-none`}>
                                 CUTI
                               </span>
                             );
                           } else if (isSunday) {
                             cellBg = 'bg-rose-50/70 border-rose-100/80';
                             holidayTag = (
-                              <span className="text-[8px] font-bold text-rose-500/70 uppercase font-mono tracking-tighter select-none leading-none">
+                              <span className={`${tagSizeClass} font-bold text-rose-500/70 uppercase font-mono tracking-tighter select-none leading-none`}>
                                 MIN
                               </span>
                             );
@@ -1514,7 +1622,7 @@ export const ProductionScheduleView: React.FC = () => {
                           return (
                             <div
                               key={d.day}
-                              className={`border-r h-full relative flex flex-col justify-between items-center py-1 transition-colors ${cellBg}`}
+                              className={`border-r h-full relative flex flex-col justify-between items-center py-1 transition-colors overflow-hidden ${cellBg}`}
                               title={d.holidayInfo.isHoliday ? `${d.dateStr} - ${d.holidayInfo.name} (Hari Libur Produksi)` : undefined}
                             >
                               {holidayTag}

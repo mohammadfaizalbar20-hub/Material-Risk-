@@ -16,6 +16,55 @@ export interface GanttBarSpan {
 
 const TOTAL_GRID_COLUMNS = 31;
 
+export const GANTT_ZOOM_LEVELS = [50, 75, 100, 125, 150] as const;
+export type GanttZoomLevel = (typeof GANTT_ZOOM_LEVELS)[number];
+export const DEFAULT_GANTT_ZOOM: GanttZoomLevel = 100;
+export const GANTT_STICKY_LINE_COL_WIDTH_PX = 180;
+export const GANTT_BASE_DAY_COL_WIDTH_PX = 48;
+
+export function getGanttDayColumnWidthPx(zoomPercent: GanttZoomLevel): number {
+  return Math.round((GANTT_BASE_DAY_COL_WIDTH_PX * zoomPercent) / 100);
+}
+
+export function getGanttBoardWidthPx(zoomPercent: GanttZoomLevel): number {
+  return GANTT_STICKY_LINE_COL_WIDTH_PX + TOTAL_GRID_COLUMNS * getGanttDayColumnWidthPx(zoomPercent);
+}
+
+export function getNextGanttZoomLevel(
+  current: GanttZoomLevel,
+  direction: 'in' | 'out'
+): GanttZoomLevel {
+  const idx = GANTT_ZOOM_LEVELS.indexOf(current);
+  const safeIdx = idx === -1 ? GANTT_ZOOM_LEVELS.indexOf(DEFAULT_GANTT_ZOOM) : idx;
+  if (direction === 'in') {
+    return GANTT_ZOOM_LEVELS[Math.min(GANTT_ZOOM_LEVELS.length - 1, safeIdx + 1)];
+  }
+  return GANTT_ZOOM_LEVELS[Math.max(0, safeIdx - 1)];
+}
+
+/**
+ * Computes the horizontal scrollLeft after changing zoom so the date currently
+ * centered in the visible date viewport stays anchored in view.
+ */
+export function computeZoomPreservedScrollLeft(params: {
+  currentScrollLeft: number;
+  clientWidth: number;
+  prevZoom: GanttZoomLevel;
+  nextZoom: GanttZoomLevel;
+}): number {
+  const { currentScrollLeft, clientWidth, prevZoom, nextZoom } = params;
+  if (currentScrollLeft <= 0 || prevZoom === nextZoom) {
+    return 0;
+  }
+  const prevColWidth = getGanttDayColumnWidthPx(prevZoom);
+  const nextColWidth = getGanttDayColumnWidthPx(nextZoom);
+  const visibleDateWidth = Math.max(0, clientWidth - GANTT_STICKY_LINE_COL_WIDTH_PX);
+  const centerDatePos = (currentScrollLeft + visibleDateWidth / 2) / prevColWidth;
+  const maxNextScroll = Math.max(0, getGanttBoardWidthPx(nextZoom) - clientWidth);
+  const targetScroll = Math.round(centerDatePos * nextColWidth - visibleDateWidth / 2);
+  return Math.max(0, Math.min(maxNextScroll, targetScroll));
+}
+
 /**
  * Parse a calendar date string without timezone shifts.
  * Supports:
