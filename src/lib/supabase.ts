@@ -841,6 +841,7 @@ export async function syncBatchExcelToSupabaseWithProgress(
 ): Promise<{
   success: boolean;
   uploadId?: string;
+  createdAt?: string;
   totalInserted: number;
   failedBatch?: number;
   failedRowIndex?: number;
@@ -856,6 +857,7 @@ export async function syncBatchExcelToSupabaseWithProgress(
   try {
     const isResuming = Boolean(params.resumeCheckpoint?.uploadId);
     let generatedUploadId = params.resumeCheckpoint?.uploadId || '';
+    let generatedCreatedAt: string | undefined = params.uploadHistoryItem.createdAt;
 
     // 1. Upsert OR & Style relation (Parent)
     const dbRel = mapModelToDbRelation(params.relation);
@@ -874,11 +876,12 @@ export async function syncBatchExcelToSupabaseWithProgress(
       const { data: histData, error: histErr } = await supabase
         .from('upload_history')
         .insert(dbHist)
-        .select('id')
+        .select('id, created_at')
         .single();
 
       if (histErr) throw new Error(`[Gagal Simpan Riwayat Upload] ${histErr.message}`);
       generatedUploadId = histData.id;
+      generatedCreatedAt = histData.created_at || generatedCreatedAt;
     } else {
       // Update existing upload_history status to resuming
       await supabase
@@ -1015,7 +1018,12 @@ export async function syncBatchExcelToSupabaseWithProgress(
       });
     }
 
-    return { success: true, uploadId: generatedUploadId, totalInserted };
+    return {
+      success: true,
+      uploadId: generatedUploadId,
+      createdAt: generatedCreatedAt,
+      totalInserted,
+    };
   } catch (err: any) {
     console.error('Failed to sync Excel upload to Supabase:', err);
     return { success: false, totalInserted: 0, error: err.message || String(err) };
@@ -1720,6 +1728,78 @@ export async function syncScheduleSnapshotsAtomically(
     },
     safeDbDate
   );
+}
+
+/**
+ * Fetches all Production Schedules from Supabase so automatic Master Data sync
+ * discovers every schedule sharing the uploaded OR across the whole database.
+ */
+export async function fetchSchedulesFromSupabase(): Promise<{
+  connected: boolean;
+  schedules: ProductionSchedule[];
+  error?: string;
+}> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    return {
+      connected: false,
+      schedules: [],
+      error: 'Koneksi Supabase belum terkonfigurasi.',
+    };
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('production_schedules')
+      .select('*')
+      .order('production_date', { ascending: true });
+
+    if (error) {
+      return {
+        connected: false,
+        schedules: [],
+        error: error.message || 'Gagal membaca daftar jadwal produksi dari Supabase.',
+      };
+    }
+
+    return {
+      connected: true,
+      schedules: (data || []).map(mapDbScheduleToModel),
+    };
+  } catch (err: any) {
+    return {
+      connected: false,
+      schedules: [],
+      error: err?.message || 'Gagal membaca daftar jadwal produksi dari Supabase.',
+    };
+  }
+}
+
+/**
+ * Updates ONLY the 4-layer material snapshot for a schedule in Supabase via the existing
+ * atomic RPC `sync_production_schedule_snapshots`. Never modifies schedule metadata
+ * (`or_number`, `style`, `production_line`, `production_date`, `finish_date`, `target`, `status`).
+ */
+export async function syncScheduleSnapshotOnlyInSupabase(
+  schedule: ProductionSchedule
+): Promise<{ success: boolean; error?: string }> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    return { success: false, error: 'Koneksi Supabase belum terkonfigurasi.' };
+  }
+
+  if (!isValidUuid(schedule.id)) {
+    return {
+      success: false,
+      error: `ID jadwal "${schedule.id}" bukan UUID Supabase yang valid. Sinkronisasi dibatalkan untuk mencegah duplikasi baris.`,
+    };
+  }
+
+  const cleanId = schedule.id.trim();
+  return syncScheduleSnapshotsAtomically(supabase, cleanId, {
+    ...schedule,
+    id: cleanId,
+  });
 }
 
 /**

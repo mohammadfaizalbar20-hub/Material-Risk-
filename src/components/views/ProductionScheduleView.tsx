@@ -126,6 +126,10 @@ export const ProductionScheduleView: React.FC = () => {
     registeredOrNumbers,
     materialRequirements,
     uploadHistory,
+    pendingScheduleSyncs,
+    retryingScheduleSyncOr,
+    retryPendingScheduleSync,
+    dismissPendingScheduleSync,
   } = usePpic();
 
   const [uploadedExcels, setUploadedExcels] = useState<FormExcelScheduleItem[]>([]);
@@ -1294,6 +1298,74 @@ export const ProductionScheduleView: React.FC = () => {
           </button>
         </div>
       </div>
+
+      {/* Pending Schedule Snapshot Sync Recovery Banner (No Master Data Re-upload Required) */}
+      {pendingScheduleSyncs.length > 0 && (
+        <div
+          role="alert"
+          data-testid="pending-schedule-sync-banner"
+          className="p-3.5 rounded-lg border border-amber-300 bg-amber-50 text-amber-950 text-xs space-y-2"
+        >
+          <div className="flex items-center gap-2 font-bold text-amber-900">
+            <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+            <span>
+              Terdapat jadwal produksi yang belum tersinkronkan dengan upload Master Data terbaru:
+            </span>
+          </div>
+          <div className="space-y-1.5">
+            {pendingScheduleSyncs.map((rec) => {
+              const isRetrying = retryingScheduleSyncOr === rec.targetOr;
+              return (
+                <div
+                  key={rec.targetOr}
+                  className="p-2.5 bg-white border border-amber-200 rounded-md flex flex-col sm:flex-row sm:items-center justify-between gap-2"
+                >
+                  <div>
+                    <div className="font-semibold text-slate-900">
+                      OR {rec.targetOr} ({rec.syncedCount}/{rec.totalTargetSchedules} jadwal tersinkronkan, {rec.failedDetails.length || 'sebagian'} gagal)
+                    </div>
+                    <div className="text-[11px] text-rose-700">{rec.lastError}</div>
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      disabled={isRetrying}
+                      onClick={async () => {
+                        const retryRes = await retryPendingScheduleSync(rec.targetOr);
+                        if (retryRes.status === 'success' || retryRes.status === 'no_schedules') {
+                          setCrudFeedback({
+                            type: 'success',
+                            message: `Pemulihan sinkronisasi selesai: ${retryRes.syncedScheduleIds.length} jadwal OR ${rec.targetOr} diperbarui dengan Master Data terbaru.`,
+                          });
+                        } else {
+                          setCrudFeedback({
+                            type: 'error',
+                            message:
+                              retryRes.error ||
+                              `Sinkronisasi ulang jadwal OR ${rec.targetOr} belum berhasil.`,
+                          });
+                        }
+                      }}
+                      className="px-3 py-1.5 text-[11px] font-bold bg-amber-600 hover:bg-amber-700 disabled:opacity-60 text-white rounded flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <RefreshCw className={`w-3 h-3 ${isRetrying ? 'animate-spin' : ''}`} />
+                      {isRetrying ? 'Menyinkronkan...' : 'Sinkronkan Ulang (Tanpa Upload Ulang)'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => dismissPendingScheduleSync(rec.targetOr)}
+                      className="p-1 text-slate-400 hover:text-slate-600 cursor-pointer"
+                      aria-label={`Abaikan pemulihan ${rec.targetOr}`}
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* CRUD Feedback Banner */}
       {crudFeedback && (

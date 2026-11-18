@@ -46,6 +46,9 @@ import {
   updateScheduleInSupabase,
   deleteScheduleFromSupabase,
   seedLocalDataToSupabase,
+  fetchLatestUploadMaterialsForOrs,
+  fetchSchedulesFromSupabase,
+  syncScheduleSnapshotOnlyInSupabase,
 } from '../lib/supabase';
 import {
   ScheduleCrudResult,
@@ -53,6 +56,16 @@ import {
   updateScheduleWithPersistence,
   deleteScheduleWithPersistence,
 } from '../utils/scheduleCrudLogic';
+import {
+  PendingScheduleSyncRecord,
+  ScheduleAutoSyncSummary,
+  applySyncedSchedulesToList,
+  loadPendingScheduleSyncsFromStorage,
+  savePendingScheduleSyncsToStorage,
+  syncSchedulesForMasterDataOr,
+  upsertPendingScheduleSyncRecord,
+} from '../utils/masterDataScheduleSync';
+import { areOrNumbersMatching } from '../utils/pdfWorksheetParser';
 
 export type AppMenu =
   | 'Dashboard'
@@ -177,8 +190,13 @@ interface PpicContextType {
     failedRowIndex?: number;
     totalInserted?: number;
     preparedRequirements?: any[];
+    scheduleSyncResult?: ScheduleAutoSyncSummary;
     error?: string;
   }>;
+  pendingScheduleSyncs: PendingScheduleSyncRecord[];
+  retryingScheduleSyncOr: string | null;
+  retryPendingScheduleSync: (targetOr: string) => Promise<ScheduleAutoSyncSummary>;
+  dismissPendingScheduleSync: (targetOr: string) => void;
 
   // Master Data Deletion Feature
   deletionHistory: DeletionHistoryItem[];
@@ -323,6 +341,14 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   });
   const productionSchedulesRef = useRef<ProductionSchedule[]>(productionSchedules);
+  const [pendingScheduleSyncs, setPendingScheduleSyncs] = useState<PendingScheduleSyncRecord[]>(() =>
+    loadPendingScheduleSyncsFromStorage()
+  );
+  const [retryingScheduleSyncOr, setRetryingScheduleSyncOr] = useState<string | null>(null);
+
+  useEffect(() => {
+    savePendingScheduleSyncsToStorage(pendingScheduleSyncs);
+  }, [pendingScheduleSyncs]);
 
   // Master Materials & Warehouses
   const [materials, setMaterials] = useState<Material[]>(() => {
@@ -1526,6 +1552,7 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     failedRowIndex?: number;
     totalInserted?: number;
     preparedRequirements?: any[];
+    scheduleSyncResult?: ScheduleAutoSyncSummary;
     error?: string;
   }> => {
     if (newRequirements.length === 0) {
@@ -1553,22 +1580,24 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     const uploadId = resumeCheckpoint?.uploadId || `upload-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
     const primaryOr = (newRequirements[0]?.orNumber || '').trim().toUpperCase();
     const primaryStyle = (newRequirements[0]?.style || '').trim();
+    const importIso = new Date().toISOString();
+
+    const taggedNewReqs: MaterialItemRequirement[] = newRequirements.map((r, idx) => ({
+      ...r,
+      id: r.id && !r.id.startsWith('temp-') ? r.id : `req-${Date.now()}-${idx}-${Math.floor(Math.random() * 1000)}`,
+      uploadId,
+      orNumber: primaryOr,
+      style: primaryStyle,
+      updateDate: effectiveUpdateDate,
+      isRecentlyImported: true,
+      importedAt: r.importedAt || importIso,
+    }));
 
     if (!isResuming) {
-      setMaterialRequirements((prev) => {
-        const taggedNewReqs = newRequirements.map((r, idx) => ({
-          ...r,
-          id: r.id && !r.id.startsWith('temp-') ? r.id : `req-${Date.now()}-${idx}-${Math.floor(Math.random() * 1000)}`,
-          uploadId,
-          orNumber: primaryOr,
-          style: primaryStyle,
-          updateDate: effectiveUpdateDate,
-          isRecentlyImported: true,
-          importedAt: r.importedAt || new Date().toISOString(),
-        }));
-
-        return [...taggedNewReqs, ...prev.map((r) => ({ ...r, isRecentlyImported: false }))];
-      });
+      setMaterialRequirements((prev) => [
+        ...taggedNewReqs,
+        ...prev.map((r) => ({ ...r, isRecentlyImported: false })),
+      ]);
     }
 
     // 3. Save OR <-> Style relations
@@ -1608,6 +1637,7 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       fileName: fileName,
       rowCount: newRequirements.length,
       status: isResuming ? 'Melanjutkan Upload...' : 'Sukses',
+      createdAt: importIso,
       notes: isResuming
         ? `Melanjutkan penyimpanan dari baris ${(resumeCheckpoint?.startRowIndex || 0) + 1}...`
         : `Berhasil diproses & disimpan (${newRequirements.length} baris material)`,
@@ -1649,6 +1679,175 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       ]);
     }
 
+    // Helper: Execute automatic snapshot sync across ALL Production Schedules with matching No. OR
+    const runAutomaticScheduleSync = async (
+      finalUploadId: string,
+      finalCreatedAt?: string
+    ): Promise<ScheduleAutoSyncSummary> => {
+      const syncTs = new Date().toISOString();
+
+      if (getSupabaseCredentials().isConfigured) {
+        if (onProgress) {
+          onProgress({
+            currentBatch: 1,
+            totalBatches: 1,
+            rowsInserted: newRequirements.length,
+            totalRows: newRequirements.length,
+            percent: 100,
+            currentChunkRows: 0,
+            statusText: `Menyinkronkan pemeriksaan material ke seluruh Production Schedule (${primaryOr})...`,
+          });
+        }
+
+        const [remoteLatest, remoteSchedules] = await Promise.all([
+          fetchLatestUploadMaterialsForOrs([primaryOr]),
+          fetchSchedulesFromSupabase(),
+        ]);
+
+        if (!remoteLatest || !remoteLatest.connected) {
+          const errMsg =
+            'Master Data tersimpan, namun gagal mengambil Master Data terbaru dari Supabase untuk sinkronisasi otomatis Production Schedule.';
+          const failSummary: ScheduleAutoSyncSummary = {
+            status: 'failed',
+            targetOr: primaryOr,
+            uploadId: finalUploadId,
+            updateDate: effectiveUpdateDate,
+            matchedScheduleCount: 0,
+            syncedScheduleIds: [],
+            failedSchedules: [],
+            updatedSchedulesById: {},
+            error: errMsg,
+            syncedAt: syncTs,
+          };
+          setPendingScheduleSyncs((prev) => upsertPendingScheduleSyncRecord(prev, failSummary));
+          return failSummary;
+        }
+
+        if (!remoteSchedules.connected) {
+          const errMsg =
+            remoteSchedules.error ||
+            'Master Data tersimpan, namun gagal membaca daftar Production Schedule dari Supabase untuk sinkronisasi otomatis.';
+          const failSummary: ScheduleAutoSyncSummary = {
+            status: 'failed',
+            targetOr: primaryOr,
+            uploadId: finalUploadId,
+            updateDate: effectiveUpdateDate,
+            matchedScheduleCount: 0,
+            syncedScheduleIds: [],
+            failedSchedules: [],
+            updatedSchedulesById: {},
+            error: errMsg,
+            syncedAt: syncTs,
+          };
+          setPendingScheduleSyncs((prev) => upsertPendingScheduleSyncRecord(prev, failSummary));
+          return failSummary;
+        }
+
+        const summary = await syncSchedulesForMasterDataOr({
+          targetOr: primaryOr,
+          uploadId: finalUploadId,
+          updateDate: effectiveUpdateDate,
+          schedules: remoteSchedules.schedules,
+          masterRequirements: remoteLatest.materialRequirements,
+          uploadHistory: remoteLatest.uploadHistory,
+          persistScheduleSnapshot: syncScheduleSnapshotOnlyInSupabase,
+          syncTimestampIso: syncTs,
+        });
+
+        if (Object.keys(summary.updatedSchedulesById).length > 0) {
+          commitProductionSchedules((prev) =>
+            applySyncedSchedulesToList(prev, summary.updatedSchedulesById)
+          );
+        }
+
+        setPendingScheduleSyncs((prev) => upsertPendingScheduleSyncRecord(prev, summary));
+
+        if (summary.status === 'success' && summary.syncedScheduleIds.length > 0) {
+          setNotifications((prev) => [
+            {
+              id: `notif-sync-${Date.now()}`,
+              type: 'info',
+              title: 'Sinkronisasi Jadwal Produksi Selesai',
+              message: `${summary.syncedScheduleIds.length} jadwal produksi (${primaryOr}) otomatis diperbarui dengan Master Data terbaru.`,
+              timestamp: 'Baru saja',
+              read: false,
+            },
+            ...prev,
+          ]);
+        } else if (summary.status === 'partial_failure' || summary.status === 'failed') {
+          setNotifications((prev) => [
+            {
+              id: `notif-sync-err-${Date.now()}`,
+              type: 'warning',
+              title: 'Sinkronisasi Otomatis Jadwal Belum Lengkap',
+              message: summary.error || `Gagal menyinkronkan jadwal untuk OR ${primaryOr}. Gunakan tombol Coba Lagi tanpa perlu upload ulang.`,
+              timestamp: 'Baru saja',
+              read: false,
+            },
+            ...prev,
+          ]);
+        }
+
+        return summary;
+      }
+
+      // Offline / LocalStorage persistence path
+      const offlineHistItem: UploadHistoryItem = {
+        ...newHistItem,
+        id: finalUploadId,
+        status: 'Sukses',
+        createdAt: finalCreatedAt || newHistItem.createdAt,
+      };
+      const offlineNewReqs = taggedNewReqs.map((r) => ({
+        ...r,
+        uploadId: finalUploadId,
+        createdAt: finalCreatedAt || r.importedAt,
+      }));
+      const offlineReqsSource = [
+        ...offlineNewReqs,
+        ...materialRequirements.map((r) => ({ ...r, isRecentlyImported: false })),
+      ];
+      const offlineHistSource = [
+        offlineHistItem,
+        ...uploadHistory.filter((h) => h.id !== uploadId && h.id !== finalUploadId),
+      ];
+
+      const summary = await syncSchedulesForMasterDataOr({
+        targetOr: primaryOr,
+        uploadId: finalUploadId,
+        updateDate: effectiveUpdateDate,
+        schedules: productionSchedulesRef.current,
+        masterRequirements: offlineReqsSource,
+        uploadHistory: offlineHistSource,
+        persistScheduleSnapshot: async () => ({ success: true }),
+        syncTimestampIso: syncTs,
+      });
+
+      if (Object.keys(summary.updatedSchedulesById).length > 0) {
+        commitProductionSchedules((prev) =>
+          applySyncedSchedulesToList(prev, summary.updatedSchedulesById)
+        );
+      }
+
+      setPendingScheduleSyncs((prev) => upsertPendingScheduleSyncRecord(prev, summary));
+
+      if (summary.status === 'success' && summary.syncedScheduleIds.length > 0) {
+        setNotifications((prev) => [
+          {
+            id: `notif-sync-${Date.now()}`,
+            type: 'info',
+            title: 'Sinkronisasi Jadwal Produksi Selesai',
+            message: `${summary.syncedScheduleIds.length} jadwal produksi (${primaryOr}) otomatis diperbarui dengan Master Data terbaru.`,
+            timestamp: 'Baru saja',
+            read: false,
+          },
+          ...prev,
+        ]);
+      }
+
+      return summary;
+    };
+
     // 7. Sync to Centralized Supabase Database if configured (High-Volume 500-row batching with 3x retry & resume support)
     if (getSupabaseCredentials().isConfigured) {
       try {
@@ -1675,14 +1874,17 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
         );
 
         if (syncRes.success) {
+          const finalUploadId = syncRes.uploadId || uploadId;
           setLastSyncTimestamp(Date.now());
           setSupabaseConnected(true);
-          // Mark status as 'Sukses' in local upload history with verified count
+          // Reconcile local uploadHistory & materialRequirements IDs with authoritative Supabase UUID
           setUploadHistory((prev) =>
             prev.map((h) =>
-              h.id === (syncRes.uploadId || uploadId)
+              h.id === uploadId || h.id === finalUploadId
                 ? {
                     ...h,
+                    id: finalUploadId,
+                    createdAt: syncRes.createdAt || h.createdAt,
                     status: 'Sukses',
                     rowCount: syncRes.totalInserted || newRequirements.length,
                     notes: `Berhasil tersimpan ${syncRes.totalInserted || newRequirements.length} baris material di Supabase.`,
@@ -1690,22 +1892,44 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
                 : h
             )
           );
-          if (!skipMenuRedirect) {
+          if (!isResuming && finalUploadId !== uploadId) {
+            setMaterialRequirements((prev) =>
+              prev.map((r) =>
+                r.uploadId === uploadId
+                  ? { ...r, uploadId: finalUploadId, createdAt: syncRes.createdAt || r.createdAt }
+                  : r
+              )
+            );
+          }
+
+          // Run automatic sync ONLY AFTER Master Data storage succeeds!
+          const scheduleSyncResult = await runAutomaticScheduleSync(
+            finalUploadId,
+            syncRes.createdAt
+          );
+
+          if (
+            !skipMenuRedirect &&
+            (scheduleSyncResult.status === 'success' || scheduleSyncResult.status === 'no_schedules')
+          ) {
             setActiveMenu('Rekap Material');
           }
           return {
             success: true,
-            uploadId: syncRes.uploadId || uploadId,
+            uploadId: finalUploadId,
             totalInserted: syncRes.totalInserted,
+            scheduleSyncResult,
           };
         } else {
+          // Master Data save failed -> DO NOT run schedule snapshot sync!
           console.warn('Batch Supabase sync notice:', syncRes.error);
           // Mark status as 'Gagal Sebagian' in local upload history
           setUploadHistory((prev) =>
             prev.map((h) =>
-              h.id === (syncRes.uploadId || uploadId)
+              h.id === uploadId || h.id === syncRes.uploadId
                 ? {
                     ...h,
+                    id: syncRes.uploadId || h.id,
                     status: 'Gagal Sebagian',
                     notes: `Gagal pada batch ${syncRes.failedBatch || '?'}. ${syncRes.error || ''}`,
                   }
@@ -1723,10 +1947,12 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
           };
         }
       } catch (err: any) {
+        // Master Data save failed -> DO NOT run schedule snapshot sync!
         console.error('Error during Supabase batch sync:', err);
         return { success: false, uploadId, error: err.message || String(err) };
       }
     } else {
+      const scheduleSyncResult = await runAutomaticScheduleSync(uploadId, importIso);
       if (onProgress) {
         onProgress({
           currentBatch: 1,
@@ -1734,15 +1960,165 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
           rowsInserted: newRequirements.length,
           totalRows: newRequirements.length,
           percent: 100,
-          currentChunkRows: newRequirements.length,
-          statusText: 'Data tersimpan di penyimpanan lokal offline.',
+          currentChunkRows: 0,
+          statusText:
+            scheduleSyncResult.matchedScheduleCount > 0
+              ? `Data tersimpan lokal & ${scheduleSyncResult.syncedScheduleIds.length} jadwal produksi disinkronkan.`
+              : 'Data tersimpan di penyimpanan lokal offline.',
         });
       }
       if (!skipMenuRedirect) {
         setActiveMenu('Rekap Material');
       }
-      return { success: true, uploadId, totalInserted: newRequirements.length };
+      return {
+        success: true,
+        uploadId,
+        totalInserted: newRequirements.length,
+        scheduleSyncResult,
+      };
     }
+  };
+
+  const retryPendingScheduleSync = async (targetOr: string): Promise<ScheduleAutoSyncSummary> => {
+    const cleanTargetOr = (targetOr || '').trim();
+    const pendingRecord = pendingScheduleSyncs.find((p) =>
+      areOrNumbersMatching(p.targetOr, cleanTargetOr)
+    );
+    const syncTs = new Date().toISOString();
+
+    if (!cleanTargetOr) {
+      return {
+        status: 'failed',
+        targetOr: cleanTargetOr,
+        matchedScheduleCount: 0,
+        syncedScheduleIds: [],
+        failedSchedules: [],
+        updatedSchedulesById: {},
+        error: 'Nomor OR target sinkronisasi tidak valid.',
+        syncedAt: syncTs,
+      };
+    }
+
+    setRetryingScheduleSyncOr(cleanTargetOr);
+    try {
+      if (getSupabaseCredentials().isConfigured) {
+        const [remoteLatest, remoteSchedules] = await Promise.all([
+          fetchLatestUploadMaterialsForOrs([cleanTargetOr]),
+          fetchSchedulesFromSupabase(),
+        ]);
+
+        if (!remoteLatest || !remoteLatest.connected) {
+          const failSummary: ScheduleAutoSyncSummary = {
+            status: 'failed',
+            targetOr: cleanTargetOr,
+            uploadId: pendingRecord?.uploadId,
+            updateDate: pendingRecord?.updateDate,
+            matchedScheduleCount: pendingRecord?.totalTargetSchedules || 0,
+            syncedScheduleIds: [],
+            failedSchedules: pendingRecord?.failedDetails || [],
+            updatedSchedulesById: {},
+            error: 'Gagal mengambil Master Data terbaru dari Supabase. Coba lagi saat koneksi stabil.',
+            syncedAt: syncTs,
+          };
+          setPendingScheduleSyncs((prev) => upsertPendingScheduleSyncRecord(prev, failSummary));
+          return failSummary;
+        }
+
+        if (!remoteSchedules.connected) {
+          const failSummary: ScheduleAutoSyncSummary = {
+            status: 'failed',
+            targetOr: cleanTargetOr,
+            uploadId: pendingRecord?.uploadId,
+            updateDate: pendingRecord?.updateDate,
+            matchedScheduleCount: pendingRecord?.totalTargetSchedules || 0,
+            syncedScheduleIds: [],
+            failedSchedules: pendingRecord?.failedDetails || [],
+            updatedSchedulesById: {},
+            error:
+              remoteSchedules.error ||
+              'Gagal membaca daftar Production Schedule dari Supabase. Coba lagi saat koneksi stabil.',
+            syncedAt: syncTs,
+          };
+          setPendingScheduleSyncs((prev) => upsertPendingScheduleSyncRecord(prev, failSummary));
+          return failSummary;
+        }
+
+        const summary = await syncSchedulesForMasterDataOr({
+          targetOr: cleanTargetOr,
+          uploadId: pendingRecord?.uploadId,
+          updateDate: pendingRecord?.updateDate,
+          schedules: remoteSchedules.schedules,
+          masterRequirements: remoteLatest.materialRequirements,
+          uploadHistory: remoteLatest.uploadHistory,
+          persistScheduleSnapshot: syncScheduleSnapshotOnlyInSupabase,
+          targetScheduleIds:
+            pendingRecord?.failedScheduleIds && pendingRecord.failedScheduleIds.length > 0
+              ? pendingRecord.failedScheduleIds
+              : undefined,
+          syncTimestampIso: syncTs,
+        });
+
+        if (Object.keys(summary.updatedSchedulesById).length > 0) {
+          commitProductionSchedules((prev) =>
+            applySyncedSchedulesToList(prev, summary.updatedSchedulesById)
+          );
+        }
+
+        setPendingScheduleSyncs((prev) => upsertPendingScheduleSyncRecord(prev, summary));
+        return summary;
+      }
+
+      // Offline / local fallback retry
+      const summary = await syncSchedulesForMasterDataOr({
+        targetOr: cleanTargetOr,
+        uploadId: pendingRecord?.uploadId,
+        updateDate: pendingRecord?.updateDate,
+        schedules: productionSchedulesRef.current,
+        masterRequirements: materialRequirements,
+        uploadHistory,
+        persistScheduleSnapshot: async () => ({ success: true }),
+        targetScheduleIds:
+          pendingRecord?.failedScheduleIds && pendingRecord.failedScheduleIds.length > 0
+            ? pendingRecord.failedScheduleIds
+            : undefined,
+        syncTimestampIso: syncTs,
+      });
+
+      if (Object.keys(summary.updatedSchedulesById).length > 0) {
+        commitProductionSchedules((prev) =>
+          applySyncedSchedulesToList(prev, summary.updatedSchedulesById)
+        );
+      }
+
+      setPendingScheduleSyncs((prev) => upsertPendingScheduleSyncRecord(prev, summary));
+      return summary;
+    } catch (err: any) {
+      const failSummary: ScheduleAutoSyncSummary = {
+        status: 'failed',
+        targetOr: cleanTargetOr,
+        uploadId: pendingRecord?.uploadId,
+        updateDate: pendingRecord?.updateDate,
+        matchedScheduleCount: pendingRecord?.totalTargetSchedules || 0,
+        syncedScheduleIds: [],
+        failedSchedules: pendingRecord?.failedDetails || [],
+        updatedSchedulesById: {},
+        error:
+          err?.message ||
+          String(err) ||
+          'Terjadi kesalahan tak terduga saat menyinkronkan ulang jadwal.',
+        syncedAt: syncTs,
+      };
+      setPendingScheduleSyncs((prev) => upsertPendingScheduleSyncRecord(prev, failSummary));
+      return failSummary;
+    } finally {
+      setRetryingScheduleSyncOr(null);
+    }
+  };
+
+  const dismissPendingScheduleSync = (targetOr: string) => {
+    setPendingScheduleSyncs((prev) =>
+      prev.filter((rec) => !areOrNumbersMatching(rec.targetOr, targetOr))
+    );
   };
 
   const resetToInitialData = () => {
@@ -1754,6 +2130,8 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setUploadHistory(INITIAL_UPLOAD_HISTORY);
     setDeletionHistory([]);
     setLastImportedInfo(null);
+    setPendingScheduleSyncs([]);
+    savePendingScheduleSyncsToStorage([]);
     localStorage.removeItem(`${LOCAL_STORAGE_KEY}_or_style`);
     localStorage.removeItem(`${LOCAL_STORAGE_KEY}_requirements`);
     localStorage.removeItem(`${LOCAL_STORAGE_KEY}_schedules`);
@@ -1840,6 +2218,10 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
         lastImportedInfo,
         setLastImportedInfo,
         autoSaveExcelMaterials,
+        pendingScheduleSyncs,
+        retryingScheduleSyncOr,
+        retryPendingScheduleSync,
+        dismissPendingScheduleSync,
 
         selectedScheduleId,
         setSelectedScheduleId,

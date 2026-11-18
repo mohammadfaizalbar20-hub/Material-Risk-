@@ -252,6 +252,36 @@ export function extractOrNumberFromIdentifier(rawOr: string): string {
   return cleanMatch ? cleanMatch[0] : lastPart;
 }
 
+function normalizeOrForMatching(rawOr?: string | null): string {
+  const cleaned = String(rawOr || '')
+    .replace(/[\u200B-\u200D\uFEFF\u00AD]/g, '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/[\u2010-\u2015\u2212]/g, '-')
+    .trim()
+    .toUpperCase();
+
+  if (!cleaned || cleaned === '-') return '';
+
+  let segment = cleaned;
+  if (segment.includes('/')) {
+    const parts = segment
+      .split('/')
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0);
+    segment = parts.length > 0 ? parts[parts.length - 1] : '';
+  }
+
+  segment = segment.replace(/^(?:NOMOR|NO)(?:[.\s\-_:#]+|(?=\d|OR\b))/i, '').trim();
+  segment = segment.replace(/^OR(?:[.\s\-_:#]+|(?=\d))/i, '');
+  segment = segment.replace(/\s+/g, '');
+
+  if (/^\d+$/.test(segment)) {
+    segment = segment.replace(/^0+(?=\d)/, '');
+  }
+
+  return segment;
+}
+
 /**
  * Matches two OR Numbers flexibly (e.g. '1117' with 'OR/2026/09/1117' or 'OR-1117')
  */
@@ -261,6 +291,10 @@ export function areOrNumbersMatching(orA?: string | null, orB?: string | null): 
   const cleanB = orB.trim().toUpperCase();
 
   if (cleanA === cleanB) return true;
+
+  const normA = normalizeOrForMatching(cleanA);
+  const normB = normalizeOrForMatching(cleanB);
+  if (normA && normB && normA === normB) return true;
 
   const tailA = extractOrNumberFromIdentifier(cleanA);
   const tailB = extractOrNumberFromIdentifier(cleanB);
