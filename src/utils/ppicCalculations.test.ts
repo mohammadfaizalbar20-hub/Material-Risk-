@@ -7,6 +7,7 @@ import {
   calculateRiskScore,
   getRiskCategory,
   detectScheduleConflicts,
+  normalizeOrNumberForConflict,
   calculateParetoAnalysis,
   assessAllMaterialRisks,
 } from './ppicCalculations';
@@ -335,4 +336,135 @@ test('Aturan Bentrok Jadwal: No. OR sama dengan Style berbeda tidak bentrok (tet
   const nonOverlapConflicts = detectScheduleConflicts(diffOrNonOverlap);
   assert.equal(nonOverlapConflicts.size, 0);
 });
+
+test('Kasus Lanjutan Bentrok Jadwal: OR 1097 & OR 1036 multi-style, normalisasi No. OR, dan bentrok lintas OR', () => {
+  // Normalisasi No. OR menangani spasi, NBSP, prefix OR, dan format slash
+  assert.equal(normalizeOrNumberForConflict('1097'), '1097');
+  assert.equal(normalizeOrNumberForConflict(' 1097\u00A0'), '1097');
+  assert.equal(normalizeOrNumberForConflict('OR 1097'), '1097');
+  assert.equal(normalizeOrNumberForConflict('or-1097'), '1097');
+  assert.equal(normalizeOrNumberForConflict('OR/2026/06/1097'), '1097');
+  assert.equal(normalizeOrNumberForConflict('10 97'), '1097');
+  assert.equal(normalizeOrNumberForConflict('ORDER-1097'), 'ORDER-1097');
+  assert.notEqual(normalizeOrNumberForConflict('1097'), normalizeOrNumberForConflict('1036'));
+
+  // Case 1: OR 1097, dua Style berbeda (target 1018 & 1062) + variasi format OR, Line 1, tanggal bertumpuk -> TIDAK bentrok
+  const or1097Schedules: ProductionSchedule[] = [
+    {
+      id: '1097-1',
+      orNumber: '1097',
+      style: 'Style Polo Knit',
+      productionLine: 'Line 1',
+      productionDate: '2026-11-02',
+      finishDate: '2026-11-09',
+      target: 1018,
+    },
+    {
+      id: '1097-2',
+      orNumber: ' OR 1097\u00A0',
+      style: 'Style Chino Short',
+      productionLine: 'Line  1',
+      productionDate: '2026-11-04',
+      finishDate: '2026-11-11',
+      target: 1062,
+    },
+    {
+      id: '1097-same-style',
+      orNumber: 'OR/2026/06/1097',
+      style: 'Style Polo Knit', // Even if style text matches on the same OR, same OR is never a conflict!
+      productionLine: 'Line 1',
+      productionDate: '2026-11-05',
+      finishDate: '2026-11-08',
+      target: 500,
+    },
+  ];
+  assert.equal(detectScheduleConflicts(or1097Schedules).size, 0);
+
+  const or1097Layout = layoutGanttLineSchedules(or1097Schedules, {
+    year: 2026,
+    month0: 10,
+    daysInMonth: 30,
+  });
+  assert.equal(or1097Layout.laneCount, 3);
+  assert.equal(or1097Layout.items.length, 3);
+
+  // Case 2: OR 1036, dua Style berbeda, Line 1, tanggal bertumpuk -> TIDAK bentrok
+  const or1036Schedules: ProductionSchedule[] = [
+    {
+      id: '1036-1',
+      orNumber: '1036',
+      style: 'Style Jacket A',
+      productionLine: 'Line 1',
+      productionDate: '2026-11-12',
+      finishDate: '2026-11-18',
+      target: 800,
+    },
+    {
+      id: '1036-2',
+      orNumber: 'OR-1036',
+      style: 'Style Jacket B',
+      productionLine: 'Line 1',
+      productionDate: '2026-11-14',
+      finishDate: '2026-11-20',
+      target: 900,
+    },
+  ];
+  assert.equal(detectScheduleConflicts(or1036Schedules).size, 0);
+
+  // Gabungan OR 1097 (tgl 2-11) dan OR 1036 (tgl 12-20) di Line 1 tanpa irisan lintas OR -> tetap TIDAK bentrok
+  assert.equal(detectScheduleConflicts([...or1097Schedules, ...or1036Schedules]).size, 0);
+
+  // Case 3: OR 1097 dan OR 1036 pada Line 1 dengan tanggal bertumpuk -> TETAP bentrok
+  const overlappingCrossOr: ProductionSchedule[] = [
+    {
+      id: 'x-1097',
+      orNumber: '1097',
+      style: 'Style A',
+      productionLine: 'Line 1',
+      productionDate: '2026-11-02',
+      finishDate: '2026-11-10',
+      target: 1018,
+    },
+    {
+      id: 'x-1036',
+      orNumber: '1036',
+      style: 'Style B',
+      productionLine: 'Line 1',
+      productionDate: '2026-11-08',
+      finishDate: '2026-11-15',
+      target: 950,
+    },
+  ];
+  const crossConflicts = detectScheduleConflicts(overlappingCrossOr);
+  assert.equal(crossConflicts.has('x-1097'), true);
+  assert.equal(crossConflicts.has('x-1036'), true);
+  assert.deepEqual(
+    crossConflicts.get('x-1097')?.conflictingWith.map((c) => c.orNumber),
+    ['1036']
+  );
+
+  // Case 4: Dua OR berbeda dengan tanggal TIDAK bertumpuk -> TIDAK bentrok
+  const nonOverlappingCrossOr: ProductionSchedule[] = [
+    {
+      id: 'n-1097',
+      orNumber: '1097',
+      style: 'Style A',
+      productionLine: 'Line 1',
+      productionDate: '2026-11-02',
+      finishDate: '2026-11-10',
+      target: 1018,
+    },
+    {
+      id: 'n-1036',
+      orNumber: '1036',
+      style: 'Style B',
+      productionLine: 'Line 1',
+      productionDate: '2026-11-11',
+      finishDate: '2026-11-18',
+      target: 950,
+    },
+  ];
+  assert.equal(detectScheduleConflicts(nonOverlappingCrossOr).size, 0);
+});
+
 

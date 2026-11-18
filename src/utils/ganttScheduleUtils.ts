@@ -375,7 +375,10 @@ export function isUnassignedProductionLine(line: string | null | undefined): boo
  * Returns the trimmed real Production Line (e.g. 'Line 1'), or '' if unassigned / legacy 'Produksi'.
  */
 export function normalizeAssignedProductionLine(line: string | null | undefined): string {
-  const trimmed = String(line || '').trim();
+  const trimmed = String(line || '')
+    .replace(/\u00A0/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
   if (!trimmed) return '';
   if (LEGACY_PLACEHOLDER_LINES.has(trimmed.toLowerCase())) return '';
   return trimmed;

@@ -92,9 +92,41 @@ export function getDaysDifference(targetDateStr: string, referenceDate: Date = n
 }
 
 /**
+ * Normalisasi No. OR untuk perbandingan konflik jadwal agar variasi format penyimpanan
+ * (spasi berlebih, NBSP/zero-width, prefix "OR ", "OR-", atau path "OR/YYYY/MM/1097")
+ * tidak membuat No. OR yang sama dianggap berbeda.
+ */
+export function normalizeOrNumberForConflict(rawOr: string | null | undefined): string {
+  const cleaned = String(rawOr || '')
+    .replace(/[\u200B-\u200D\uFEFF\u00AD]/g, '')
+    .replace(/\u00A0/g, ' ')
+    .trim()
+    .toUpperCase();
+
+  if (!cleaned) return '';
+
+  let segment = cleaned;
+  if (segment.includes('/')) {
+    const parts = segment
+      .split('/')
+      .map((part) => part.trim())
+      .filter((part) => part.length > 0);
+    segment = parts.length > 0 ? parts[parts.length - 1] : '';
+  }
+
+  // Hapus prefix opsional "OR" apabila diikuti pemisah atau langsung angka (mis. "OR 1097", "OR-1097", "OR1097")
+  segment = segment.replace(/^OR(?:[\s\-_:#]+|(?=\d))/i, '');
+
+  // Hilangkan seluruh spasi internal yang tidak diperlukan
+  return segment.replace(/\s+/g, '');
+}
+
+/**
  * Deteksi bentrok jadwal pada lini yang sama.
- * Jadwal bertabrakan jika: line sama, No. OR berbeda (atau Style identik), dan periode tanggal overlap.
- * Jadwal dengan No. OR sama tetapi Style berbeda pada Line yang sama TIDAK ditandai sebagai bentrok.
+ * Aturan:
+ * - Bandingkan dua jadwal pada Line Produksi yang sama dengan rentang tanggal tumpang tindih.
+ * - Jika No. OR (hasil normalisasi) sama -> JANGAN dianggap bentrok, meskipun Style berbeda/sama.
+ * - Jika No. OR berbeda -> tandai sebagai bentrok jadwal.
  * Overlap: startA <= finishB && finishA >= startB
  */
 export function detectScheduleConflicts(schedules: ProductionSchedule[]): Map<string, ScheduleConflict> {
@@ -108,8 +140,7 @@ export function detectScheduleConflicts(schedules: ProductionSchedule[]): Map<st
       continue;
     }
 
-    const or1 = String(s1.orNumber || '').trim().toUpperCase();
-    const style1 = String(s1.style || '').trim().toLowerCase();
+    const or1 = normalizeOrNumberForConflict(s1.orNumber);
     const conflictingWith: ScheduleConflict['conflictingWith'] = [];
 
     for (let j = 0; j < schedules.length; j++) {
@@ -118,10 +149,9 @@ export function detectScheduleConflicts(schedules: ProductionSchedule[]): Map<st
       const line2 = normalizeAssignedProductionLine(s2.productionLine);
       if (!line2 || line1.toLowerCase() !== line2.toLowerCase()) continue;
 
-      const or2 = String(s2.orNumber || '').trim().toUpperCase();
-      const style2 = String(s2.style || '').trim().toLowerCase();
-      if (or1 && or2 && or1 === or2 && style1 !== style2) {
-        // Same OR with different Styles on the same Line is NOT a schedule conflict
+      const or2 = normalizeOrNumberForConflict(s2.orNumber);
+      if (or1 && or2 && or1 === or2) {
+        // Same normalized No. OR on the same Production Line is NEVER a schedule conflict
         continue;
       }
 

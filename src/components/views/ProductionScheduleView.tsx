@@ -1552,6 +1552,7 @@ export const ProductionScheduleView: React.FC = () => {
                       data-board-row={group.lineLabel}
                       data-line-key={group.lineKey}
                       data-lane-count={group.layout.laneCount}
+                      data-has-conflict={hasRealLineConflict ? 'true' : 'false'}
                       style={{
                         minHeight: `${Math.max(group.layout.rowHeightPx, 64)}px`,
                         gridTemplateColumns: ganttGridTemplateColumns,
@@ -1656,6 +1657,7 @@ export const ProductionScheduleView: React.FC = () => {
                                 data-lane-index={laneIndex}
                                 data-production-date={sch.productionDate}
                                 data-finish-date={sch.finishDate}
+                                data-has-conflict={conflictInfo ? 'true' : 'false'}
                                 aria-label={`Detail jadwal ${sch.orNumber} ${sch.style}`}
                                 onClick={(e) => {
                                   e.stopPropagation();
