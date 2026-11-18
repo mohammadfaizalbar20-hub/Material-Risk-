@@ -64,6 +64,11 @@ import {
   isFinishBeforeStart,
   normalizeAssignedProductionLine,
 } from '../../utils/ganttScheduleUtils';
+import {
+  LineConflictSummary,
+  resolveScheduleOrForConflict,
+  summarizeLineConflicts,
+} from '../../utils/ppicCalculations';
 
 interface FormExcelMaterial {
   id: string;
@@ -176,6 +181,11 @@ export const ProductionScheduleView: React.FC = () => {
   const [editingScheduleId, setEditingScheduleId] = useState<string | null>(null);
   const [editingOriginalLine, setEditingOriginalLine] = useState<string>('');
   const [activeDetailSchedule, setActiveDetailSchedule] = useState<ProductionSchedule | null>(null);
+  const [activeLineConflictAudit, setActiveLineConflictAudit] = useState<{
+    lineLabel: string;
+    schedules: ProductionSchedule[];
+    summary: LineConflictSummary;
+  } | null>(null);
 
   // Manual Form State (used when creating/editing manually without uploaded Excel files)
   const [formData, setFormData] = useState<{
@@ -1542,9 +1552,16 @@ export const ProductionScheduleView: React.FC = () => {
                 </div>
               ) : (
                 ganttLineGroups.map((group) => {
-                  const hasRealLineConflict =
-                    !group.isUnassigned &&
-                    group.layout.items.some(({ schedule }) => scheduleConflicts.has(schedule.id));
+                  const lineVisibleSchedules = group.layout.items.map((item) => item.schedule);
+                  const lineConflictSummary = group.isUnassigned
+                    ? {
+                        hasConflict: false,
+                        conflictingScheduleCount: 0,
+                        conflictingScheduleIds: new Set<string>(),
+                        conflictPairs: [],
+                      }
+                    : summarizeLineConflicts(lineVisibleSchedules, scheduleConflicts);
+                  const hasRealLineConflict = lineConflictSummary.hasConflict;
 
                   return (
                     <div
@@ -1553,6 +1570,7 @@ export const ProductionScheduleView: React.FC = () => {
                       data-line-key={group.lineKey}
                       data-lane-count={group.layout.laneCount}
                       data-has-conflict={hasRealLineConflict ? 'true' : 'false'}
+                      data-conflict-count={lineConflictSummary.conflictingScheduleCount}
                       style={{
                         minHeight: `${Math.max(group.layout.rowHeightPx, 64)}px`,
                         gridTemplateColumns: ganttGridTemplateColumns,
@@ -1577,10 +1595,21 @@ export const ProductionScheduleView: React.FC = () => {
                             : `0 Jadwal di ${monthNames[currentMonth].slice(0, 3)} ${currentYear}`}
                         </div>
                         {hasRealLineConflict && (
-                          <div className="mt-1 inline-flex items-center gap-1 text-[10px] font-semibold text-amber-700 bg-amber-50 border border-amber-200 px-1.5 py-0.5 rounded w-fit">
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setActiveLineConflictAudit({
+                                lineLabel: group.lineLabel,
+                                schedules: lineVisibleSchedules,
+                                summary: lineConflictSummary,
+                              })
+                            }
+                            title={`Klik untuk melihat rincian ${lineConflictSummary.conflictingScheduleCount} jadwal bentrok pada ${group.lineLabel}`}
+                            className="mt-1 inline-flex items-center gap-1 text-[10px] font-semibold text-amber-700 bg-amber-50 hover:bg-amber-100 border border-amber-200 px-1.5 py-0.5 rounded w-fit cursor-pointer transition-colors"
+                          >
                             <AlertTriangle className="w-3 h-3 shrink-0 text-amber-600" />
-                            <span>Bentrok Jadwal</span>
-                          </div>
+                            <span>Bentrok Jadwal ({lineConflictSummary.conflictingScheduleCount})</span>
+                          </button>
                         )}
                       </div>
 
@@ -1750,6 +1779,109 @@ export const ProductionScheduleView: React.FC = () => {
         </div>
       </div>
 
+      {/* Line Conflict Diagnostic Modal */}
+      {activeLineConflictAudit && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
+          <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-4xl max-h-[90vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-150">
+            <div className="p-4 bg-slate-900 text-white flex items-center justify-between sticky top-0 z-20">
+              <div className="flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-amber-400" />
+                <h3 className="text-sm font-bold">
+                  Rincian Bentrok Jadwal — {activeLineConflictAudit.lineLabel}
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setActiveLineConflictAudit(null)}
+                className="text-slate-400 hover:text-white cursor-pointer"
+                aria-label="Tutup rincian bentrok"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-5 space-y-4 text-xs">
+              <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-900">
+                Ditemukan <strong>{activeLineConflictAudit.summary.conflictingScheduleCount} jadwal</strong> yang benar-benar bentrok ({activeLineConflictAudit.summary.conflictPairs.length} pasangan dengan No. OR berbeda dan tanggal tumpang tindih pada {activeLineConflictAudit.lineLabel}). Jadwal dengan No. OR yang sama tidak ditandai sebagai bentrok.
+              </div>
+
+              <div className="space-y-2">
+                <h4 className="font-bold text-slate-800">Pasangan Jadwal yang Bertabrakan</h4>
+                <div className="space-y-2">
+                  {activeLineConflictAudit.summary.conflictPairs.map((pair) => (
+                    <div
+                      key={pair.key}
+                      className="p-3 bg-slate-50 border border-slate-200 rounded-lg space-y-1"
+                    >
+                      <div className="font-semibold text-slate-900">
+                        OR {pair.scheduleA.orNumber}
+                        {pair.scheduleA.worksheetNo ? ` [${pair.scheduleA.worksheetNo}]` : ''} ({pair.scheduleA.productionDate} s/d {pair.scheduleA.finishDate}) ↔ OR {pair.scheduleB.orNumber}
+                        {pair.scheduleB.worksheetNo ? ` [${pair.scheduleB.worksheetNo}]` : ''} ({pair.scheduleB.productionDate} s/d {pair.scheduleB.finishDate})
+                      </div>
+                      <div className="text-[11px] text-slate-600">{pair.reason}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="space-y-2">
+                <h4 className="font-bold text-slate-800">
+                  Seluruh Jadwal pada {activeLineConflictAudit.lineLabel} ({activeLineConflictAudit.schedules.length} Jadwal)
+                </h4>
+                <div className="border border-slate-200 rounded-lg overflow-x-auto">
+                  <table className="w-full text-left border-collapse text-[11px]">
+                    <thead className="bg-slate-100 text-slate-700 font-semibold border-b border-slate-200">
+                      <tr>
+                        <th className="py-2 px-2.5">ID Jadwal</th>
+                        <th className="py-2 px-2.5">No. OR</th>
+                        <th className="py-2 px-2.5">No. Produksi</th>
+                        <th className="py-2 px-2.5">Style</th>
+                        <th className="py-2 px-2.5">Tanggal</th>
+                        <th className="py-2 px-2.5">Status Konflik</th>
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-slate-100">
+                      {activeLineConflictAudit.schedules.map((sch) => {
+                        const isConf = activeLineConflictAudit.summary.conflictingScheduleIds.has(sch.id);
+                        return (
+                          <tr key={sch.id} className={isConf ? 'bg-amber-50/50' : ''}>
+                            <td className="py-1.5 px-2.5 font-mono text-[10px] text-slate-500">{sch.id}</td>
+                            <td className="py-1.5 px-2.5 font-mono font-bold text-slate-900">
+                              {sch.orNumber}
+                              <span className="ml-1 text-[10px] font-normal text-slate-400">
+                                ({resolveScheduleOrForConflict(sch) || '-'})
+                              </span>
+                            </td>
+                            <td className="py-1.5 px-2.5 font-mono text-slate-700">
+                              {sch.worksheets?.[0]?.worksheetNo || '-'}
+                            </td>
+                            <td className="py-1.5 px-2.5 text-slate-700">{sch.style}</td>
+                            <td className="py-1.5 px-2.5 font-mono text-slate-700 whitespace-nowrap">
+                              {sch.productionDate} s/d {sch.finishDate}
+                            </td>
+                            <td className="py-1.5 px-2.5">
+                              {isConf ? (
+                                <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 font-semibold">
+                                  Bentrok
+                                </span>
+                              ) : (
+                                <span className="px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-700 font-semibold">
+                                  Aman
+                                </span>
+                              )}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* Schedule Detail Modal */}
       {activeDetailSchedule && (
         <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
@@ -1809,7 +1941,10 @@ export const ProductionScheduleView: React.FC = () => {
                       <span className="font-bold">Bentrok Jadwal pada {detailConflict.line}:</span>{' '}
                       Tanggal pelaksanaan bertabrakan dengan{' '}
                       {detailConflict.conflictingWith
-                        .map((c) => `OR ${c.orNumber} (${c.productionDate} s/d ${c.finishDate})`)
+                        .map(
+                          (c) =>
+                            `OR ${c.orNumber}${c.worksheetNo ? ` [${c.worksheetNo}]` : ''} - ${c.style} (${c.productionDate} s/d ${c.finishDate})`
+                        )
                         .join(', ')}.
                     </div>
                   </div>

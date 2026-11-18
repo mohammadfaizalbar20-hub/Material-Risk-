@@ -93,17 +93,18 @@ export function getDaysDifference(targetDateStr: string, referenceDate: Date = n
 
 /**
  * Normalisasi No. OR untuk perbandingan konflik jadwal agar variasi format penyimpanan
- * (spasi berlebih, NBSP/zero-width, prefix "OR ", "OR-", atau path "OR/YYYY/MM/1097")
- * tidak membuat No. OR yang sama dianggap berbeda.
+ * (spasi berlebih, NBSP/zero-width, Unicode dash, prefix "OR ", "OR.", "OR-", "NO. OR",
+ * leading zero numerik, atau path "OR/YYYY/MM/1097") tidak membuat No. OR yang sama dianggap berbeda.
  */
 export function normalizeOrNumberForConflict(rawOr: string | null | undefined): string {
   const cleaned = String(rawOr || '')
     .replace(/[\u200B-\u200D\uFEFF\u00AD]/g, '')
     .replace(/\u00A0/g, ' ')
+    .replace(/[\u2010-\u2015\u2212]/g, '-')
     .trim()
     .toUpperCase();
 
-  if (!cleaned) return '';
+  if (!cleaned || cleaned === '-') return '';
 
   let segment = cleaned;
   if (segment.includes('/')) {
@@ -114,19 +115,48 @@ export function normalizeOrNumberForConflict(rawOr: string | null | undefined): 
     segment = parts.length > 0 ? parts[parts.length - 1] : '';
   }
 
-  // Hapus prefix opsional "OR" apabila diikuti pemisah atau langsung angka (mis. "OR 1097", "OR-1097", "OR1097")
-  segment = segment.replace(/^OR(?:[\s\-_:#]+|(?=\d))/i, '');
+  // Hapus prefix opsional "NO" / "NO." / "NOMOR" di depan OR/angka
+  segment = segment.replace(/^(?:NOMOR|NO)(?:[.\s\-_:#]+|(?=\d|OR\b))/i, '').trim();
+
+  // Hapus prefix opsional "OR" apabila diikuti pemisah/titik atau langsung angka (mis. "OR 1097", "OR.1097", "OR-1097", "OR1097")
+  segment = segment.replace(/^OR(?:[.\s\-_:#]+|(?=\d))/i, '');
 
   // Hilangkan seluruh spasi internal yang tidak diperlukan
-  return segment.replace(/\s+/g, '');
+  segment = segment.replace(/\s+/g, '');
+
+  // Normalisasi angka murni berawalan nol (mis. "01036" -> "1036")
+  if (/^\d+$/.test(segment)) {
+    segment = segment.replace(/^0+(?=\d)/, '');
+  }
+
+  return segment;
+}
+
+/**
+ * Mengambil No. OR ter-normalisasi dari jadwal tersimpan;
+ * jika kolom orNumber kosong/"-", fallback ke snapshot worksheets agar jadwal lama tetap konsisten.
+ */
+export function resolveScheduleOrForConflict(
+  schedule: Pick<ProductionSchedule, 'orNumber' | 'worksheets'>
+): string {
+  const primary = normalizeOrNumberForConflict(schedule.orNumber);
+  if (primary) return primary;
+
+  if (Array.isArray(schedule.worksheets)) {
+    for (const ws of schedule.worksheets) {
+      const fromWs = normalizeOrNumberForConflict(ws?.orNumber || ws?.rawOrNumber);
+      if (fromWs) return fromWs;
+    }
+  }
+  return '';
 }
 
 /**
  * Deteksi bentrok jadwal pada lini yang sama.
  * Aturan:
- * - Bandingkan dua jadwal pada Line Produksi yang sama dengan rentang tanggal tumpang tindih.
- * - Jika No. OR (hasil normalisasi) sama -> JANGAN dianggap bentrok, meskipun Style berbeda/sama.
- * - Jika No. OR berbeda -> tandai sebagai bentrok jadwal.
+ * 1. No. OR sama + Line sama + tanggal bertumpuk = BUKAN BENTROK.
+ * 2. No. OR berbeda + Line sama + tanggal bertumpuk = BENTROK.
+ * 3. No. OR berbeda + tanggal tidak bertumpuk = BUKAN BENTROK.
  * Overlap: startA <= finishB && finishA >= startB
  */
 export function detectScheduleConflicts(schedules: ProductionSchedule[]): Map<string, ScheduleConflict> {
@@ -140,7 +170,7 @@ export function detectScheduleConflicts(schedules: ProductionSchedule[]): Map<st
       continue;
     }
 
-    const or1 = normalizeOrNumberForConflict(s1.orNumber);
+    const or1 = resolveScheduleOrForConflict(s1);
     const conflictingWith: ScheduleConflict['conflictingWith'] = [];
 
     for (let j = 0; j < schedules.length; j++) {
@@ -149,7 +179,7 @@ export function detectScheduleConflicts(schedules: ProductionSchedule[]): Map<st
       const line2 = normalizeAssignedProductionLine(s2.productionLine);
       if (!line2 || line1.toLowerCase() !== line2.toLowerCase()) continue;
 
-      const or2 = normalizeOrNumberForConflict(s2.orNumber);
+      const or2 = resolveScheduleOrForConflict(s2);
       if (or1 && or2 && or1 === or2) {
         // Same normalized No. OR on the same Production Line is NEVER a schedule conflict
         continue;
@@ -159,6 +189,7 @@ export function detectScheduleConflicts(schedules: ProductionSchedule[]): Map<st
         conflictingWith.push({
           id: s2.id,
           orNumber: s2.orNumber,
+          worksheetNo: s2.worksheets?.[0]?.worksheetNo || undefined,
           style: s2.style,
           productionDate: s2.productionDate,
           finishDate: s2.finishDate,
@@ -179,6 +210,102 @@ export function detectScheduleConflicts(schedules: ProductionSchedule[]): Map<st
   }
 
   return conflictMap;
+}
+
+export interface LineConflictPair {
+  key: string;
+  scheduleA: {
+    id: string;
+    orNumber: string;
+    normalizedOr: string;
+    worksheetNo?: string;
+    style: string;
+    productionDate: string;
+    finishDate: string;
+  };
+  scheduleB: {
+    id: string;
+    orNumber: string;
+    normalizedOr: string;
+    worksheetNo?: string;
+    style: string;
+    productionDate: string;
+    finishDate: string;
+  };
+  reason: string;
+}
+
+export interface LineConflictSummary {
+  hasConflict: boolean;
+  conflictingScheduleCount: number;
+  conflictingScheduleIds: Set<string>;
+  conflictPairs: LineConflictPair[];
+}
+
+/**
+ * Menghitung ringkasan konflik aktual pada satu baris Line Produksi berdasarkan hasil detectScheduleConflicts.
+ * Digunakan bersama oleh badge Bentrok Jadwal, garis kuning bar Gantt, dan perhitungan jumlah jadwal konflik.
+ */
+export function summarizeLineConflicts(
+  lineSchedules: ProductionSchedule[],
+  conflictMap: Map<string, ScheduleConflict>
+): LineConflictSummary {
+  const conflictingScheduleIds = new Set<string>();
+  const pairMap = new Map<string, LineConflictPair>();
+
+  for (const sch of lineSchedules) {
+    const conflict = conflictMap.get(sch.id);
+    if (!conflict) continue;
+    conflictingScheduleIds.add(sch.id);
+
+    const normA = resolveScheduleOrForConflict(sch);
+    const prodA = sch.worksheets?.[0]?.worksheetNo || undefined;
+
+    for (const other of conflict.conflictingWith) {
+      const sortedIds = [sch.id, other.id].sort();
+      const pairKey = `${sortedIds[0]}__${sortedIds[1]}`;
+      if (pairMap.has(pairKey)) continue;
+
+      const normB = normalizeOrNumberForConflict(other.orNumber);
+      const isFirstA = sch.id <= other.id;
+
+      const itemA = {
+        id: sch.id,
+        orNumber: sch.orNumber,
+        normalizedOr: normA,
+        worksheetNo: prodA,
+        style: sch.style,
+        productionDate: sch.productionDate,
+        finishDate: sch.finishDate,
+      };
+      const itemB = {
+        id: other.id,
+        orNumber: other.orNumber,
+        normalizedOr: normB,
+        worksheetNo: other.worksheetNo,
+        style: other.style,
+        productionDate: other.productionDate,
+        finishDate: other.finishDate,
+      };
+
+      const first = isFirstA ? itemA : itemB;
+      const second = isFirstA ? itemB : itemA;
+
+      pairMap.set(pairKey, {
+        key: pairKey,
+        scheduleA: first,
+        scheduleB: second,
+        reason: `Line sama (${conflict.line}), No. OR berbeda (${first.normalizedOr || first.orNumber || '-'} vs ${second.normalizedOr || second.orNumber || '-'}), dan tanggal tumpang tindih (${first.productionDate} s/d ${first.finishDate} vs ${second.productionDate} s/d ${second.finishDate}).`,
+      });
+    }
+  }
+
+  return {
+    hasConflict: conflictingScheduleIds.size > 0,
+    conflictingScheduleCount: conflictingScheduleIds.size,
+    conflictingScheduleIds,
+    conflictPairs: Array.from(pairMap.values()),
+  };
 }
 
 /**

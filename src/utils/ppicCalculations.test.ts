@@ -8,6 +8,8 @@ import {
   getRiskCategory,
   detectScheduleConflicts,
   normalizeOrNumberForConflict,
+  resolveScheduleOrForConflict,
+  summarizeLineConflicts,
   calculateParetoAnalysis,
   assessAllMaterialRisks,
 } from './ppicCalculations';
@@ -466,5 +468,77 @@ test('Kasus Lanjutan Bentrok Jadwal: OR 1097 & OR 1036 multi-style, normalisasi 
   ];
   assert.equal(detectScheduleConflicts(nonOverlappingCrossOr).size, 0);
 });
+
+test('Normalisasi No. OR lanjutan, fallback worksheets, dan summarizeLineConflicts pada 6 jadwal Line 1', () => {
+  assert.equal(normalizeOrNumberForConflict('OR.1036'), '1036');
+  assert.equal(normalizeOrNumberForConflict('OR. 1036'), '1036');
+  assert.equal(normalizeOrNumberForConflict('NO. OR 1036'), '1036');
+  assert.equal(normalizeOrNumberForConflict('NO OR-1036'), '1036');
+  assert.equal(normalizeOrNumberForConflict('01036'), '1036');
+  assert.equal(normalizeOrNumberForConflict('OR\u20131036'), '1036');
+
+  // Fallback ke worksheets snapshot bila kolom orNumber pada baris tersimpan kosong/"-"
+  assert.equal(
+    resolveScheduleOrForConflict({
+      orNumber: '',
+      worksheets: [
+        {
+          id: 'ws-1',
+          fileName: 'mrp.xls',
+          orNumber: '1036',
+          rawOrNumber: 'OR/2026/06/1036',
+          worksheetNo: 'WH/MO/22744',
+          style: 'Style A',
+          target: 500,
+          materials: [],
+          uploadedAt: '2026-11-01T00:00:00Z',
+        },
+      ],
+    }),
+    '1036'
+  );
+
+  // Simulasi 6 jadwal pada Line 1 dengan 2 baris lane:
+  // - 3 jadwal OR 1036 (nomor produksi berbeda & format OR berbeda) bertumpuk tgl 2-8 -> BUKAN bentrok
+  // - 2 jadwal OR 1097 bertumpuk tgl 10-16 -> BUKAN bentrok
+  // - 1 jadwal OR 1050 tidak bertumpuk tgl 18-22 -> BUKAN bentrok
+  const sixNoConflict: ProductionSchedule[] = [
+    { id: 's1', orNumber: '1036', style: 'Style 1', productionLine: 'Line 1', productionDate: '2026-11-02', finishDate: '2026-11-06', target: 500 },
+    { id: 's2', orNumber: 'OR. 1036', style: 'Style 2', productionLine: 'Line 1', productionDate: '2026-11-03', finishDate: '2026-11-08', target: 600 },
+    { id: 's3', orNumber: 'NO. OR 1036', style: 'Style 3', productionLine: 'Line 1', productionDate: '2026-11-07', finishDate: '2026-11-09', target: 400 },
+    { id: 's4', orNumber: '1097', style: 'Style 4', productionLine: 'Line 1', productionDate: '2026-11-10', finishDate: '2026-11-15', target: 1018 },
+    { id: 's5', orNumber: 'OR/2026/06/1097', style: 'Style 5', productionLine: 'Line 1', productionDate: '2026-11-12', finishDate: '2026-11-16', target: 1062 },
+    { id: 's6', orNumber: '1050', style: 'Style 6', productionLine: 'Line 1', productionDate: '2026-11-18', finishDate: '2026-11-22', target: 700 },
+  ];
+
+  const conflictsNone = detectScheduleConflicts(sixNoConflict);
+  const summaryNone = summarizeLineConflicts(sixNoConflict, conflictsNone);
+  assert.equal(summaryNone.hasConflict, false);
+  assert.equal(summaryNone.conflictingScheduleCount, 0);
+  assert.equal(summaryNone.conflictPairs.length, 0);
+
+  // Jika s4 (OR 1097) digeser mulai tgl 9 -> hanya bertumpuk dengan s3 (tgl 7-9), bukan s2 (tgl 3-8)
+  const withOnePairCrossOr = sixNoConflict.map((s) =>
+    s.id === 's4' ? { ...s, productionDate: '2026-11-09' } : s
+  );
+  const conflictsOnePair = detectScheduleConflicts(withOnePairCrossOr);
+  const summaryOnePair = summarizeLineConflicts(withOnePairCrossOr, conflictsOnePair);
+  assert.equal(summaryOnePair.hasConflict, true);
+  assert.equal(summaryOnePair.conflictingScheduleCount, 2);
+  assert.equal(summaryOnePair.conflictPairs.length, 1);
+  assert.equal(summaryOnePair.conflictPairs[0].scheduleA.id, 's3');
+  assert.equal(summaryOnePair.conflictPairs[0].scheduleB.id, 's4');
+
+  // Jika s4 (OR 1097) digeser mulai tgl 8 -> bertumpuk dengan s2 (s/d tgl 8) DAN s3 (tgl 7-9) -> 3 jadwal & 2 pasangan
+  const withTwoPairsCrossOr = sixNoConflict.map((s) =>
+    s.id === 's4' ? { ...s, productionDate: '2026-11-08' } : s
+  );
+  const conflictsTwoPairs = detectScheduleConflicts(withTwoPairsCrossOr);
+  const summaryTwoPairs = summarizeLineConflicts(withTwoPairsCrossOr, conflictsTwoPairs);
+  assert.equal(summaryTwoPairs.hasConflict, true);
+  assert.equal(summaryTwoPairs.conflictingScheduleCount, 3);
+  assert.equal(summaryTwoPairs.conflictPairs.length, 2);
+});
+
 
 

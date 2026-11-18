@@ -128,6 +128,7 @@ export interface ScheduleConflict {
   conflictingWith: Array<{
     id: string;
     orNumber: string;
+    worksheetNo?: string;
     style: string;
     productionDate: string;
     finishDate: string;
