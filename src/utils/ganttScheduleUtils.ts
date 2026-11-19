@@ -66,6 +66,55 @@ export function computeZoomPreservedScrollLeft(params: {
 }
 
 /**
+ * Computes horizontal scrollLeft so a target day (1..31) is centered within
+ * the visible date viewport (to the right of the sticky Line Produksi column).
+ */
+export function computeScrollLeftForDay(params: {
+  day: number;
+  clientWidth: number;
+  zoomPercent: GanttZoomLevel;
+}): number {
+  const { day, clientWidth, zoomPercent } = params;
+  const clampedDay = Math.max(1, Math.min(TOTAL_GRID_COLUMNS, Math.floor(day)));
+  const colWidth = getGanttDayColumnWidthPx(zoomPercent);
+  const visibleDateWidth = Math.max(0, clientWidth - GANTT_STICKY_LINE_COL_WIDTH_PX);
+  const dayCenterOffset = (clampedDay - 0.5) * colWidth;
+  const maxScroll = Math.max(0, getGanttBoardWidthPx(zoomPercent) - clientWidth);
+  const targetScroll = Math.round(dayCenterOffset - visibleDateWidth / 2);
+  return Math.max(0, Math.min(maxScroll, targetScroll));
+}
+
+export interface GanttEscState {
+  isGanttFullscreen: boolean;
+  hasConfirmDelete: boolean;
+  hasEditModal: boolean;
+  hasDetailModal: boolean;
+  hasConflictModal: boolean;
+}
+
+export type GanttEscAction =
+  | 'close_confirm_delete'
+  | 'close_edit_modal'
+  | 'close_detail_modal'
+  | 'close_conflict_modal'
+  | 'exit_fullscreen'
+  | 'noop';
+
+/**
+ * Resolves the highest-priority Escape key action so open modals/dialogs
+ * always close before exiting Gantt Full Screen mode.
+ */
+export function resolveGanttEscAction(state: GanttEscState): GanttEscAction {
+  if (state.hasConfirmDelete) return 'close_confirm_delete';
+  if (state.hasEditModal) return 'close_edit_modal';
+  if (state.hasDetailModal) return 'close_detail_modal';
+  if (state.hasConflictModal) return 'close_conflict_modal';
+  if (state.isGanttFullscreen) return 'exit_fullscreen';
+  return 'noop';
+}
+
+
+/**
  * Parse a calendar date string without timezone shifts.
  * Supports:
  * - "YYYY-MM-DD"

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   calculateGanttBarSpan,
   compareCalendarDates,
+  computeScrollLeftForDay,
   computeZoomPreservedScrollLeft,
   DEFAULT_GANTT_ZOOM,
   DEFAULT_PRODUCTION_LINES,
@@ -19,6 +20,7 @@ import {
   isFinishBeforeStart,
   layoutGanttLineSchedules,
   parseCalendarDateParts,
+  resolveGanttEscAction,
   UNASSIGNED_PRODUCTION_LINE_LABEL,
 } from '../src/utils/ganttScheduleUtils';
 import { getIndonesianHolidayInfo } from '../src/utils/indonesianHolidays';
@@ -749,3 +751,89 @@ test('Gantt Zoom: levels 50/75/100/125/150, proportional day width, stepping bou
   });
   assert.equal(zoomedInScroll, 655);
 });
+
+test('Today Scroll & Esc Priority: computeScrollLeftForDay centers target day within bounds and resolveGanttEscAction closes modals before exiting fullscreen', () => {
+  // Board width at 100% = 180 + 31*48 = 1668px; clientWidth = 1000px -> visibleDateWidth = 820px, maxScroll = 668px
+  assert.equal(
+    computeScrollLeftForDay({ day: 1, clientWidth: 1000, zoomPercent: 100 }),
+    0
+  );
+  // Day 18 center = 17.5 * 48 = 840px; 840 - 410 = 430px
+  assert.equal(
+    computeScrollLeftForDay({ day: 18, clientWidth: 1000, zoomPercent: 100 }),
+    430
+  );
+  // Day 31 clamps cleanly to maxScroll = 668px
+  assert.equal(
+    computeScrollLeftForDay({ day: 31, clientWidth: 1000, zoomPercent: 100 }),
+    668
+  );
+  // Scales with zoom 150% (72px/day): day 18 center = 17.5 * 72 = 1260px; 1260 - 410 = 850px
+  assert.equal(
+    computeScrollLeftForDay({ day: 18, clientWidth: 1000, zoomPercent: 150 }),
+    850
+  );
+
+  // Esc priority: confirm delete > edit modal > detail modal > conflict audit modal > fullscreen > noop
+  assert.equal(
+    resolveGanttEscAction({
+      isGanttFullscreen: true,
+      hasConfirmDelete: true,
+      hasEditModal: false,
+      hasDetailModal: true,
+      hasConflictModal: false,
+    }),
+    'close_confirm_delete'
+  );
+  assert.equal(
+    resolveGanttEscAction({
+      isGanttFullscreen: true,
+      hasConfirmDelete: false,
+      hasEditModal: true,
+      hasDetailModal: false,
+      hasConflictModal: false,
+    }),
+    'close_edit_modal'
+  );
+  assert.equal(
+    resolveGanttEscAction({
+      isGanttFullscreen: true,
+      hasConfirmDelete: false,
+      hasEditModal: false,
+      hasDetailModal: true,
+      hasConflictModal: false,
+    }),
+    'close_detail_modal'
+  );
+  assert.equal(
+    resolveGanttEscAction({
+      isGanttFullscreen: true,
+      hasConfirmDelete: false,
+      hasEditModal: false,
+      hasDetailModal: false,
+      hasConflictModal: true,
+    }),
+    'close_conflict_modal'
+  );
+  assert.equal(
+    resolveGanttEscAction({
+      isGanttFullscreen: true,
+      hasConfirmDelete: false,
+      hasEditModal: false,
+      hasDetailModal: false,
+      hasConflictModal: false,
+    }),
+    'exit_fullscreen'
+  );
+  assert.equal(
+    resolveGanttEscAction({
+      isGanttFullscreen: false,
+      hasConfirmDelete: false,
+      hasEditModal: false,
+      hasDetailModal: false,
+      hasConflictModal: false,
+    }),
+    'noop'
+  );
+});
+

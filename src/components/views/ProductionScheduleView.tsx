@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useRef, useLayoutEffect } from 'react';
+import React, { useState, useMemo, useRef, useLayoutEffect, useEffect } from 'react';
 import { usePpic } from '../../context/PpicContext';
 import { ProductionSchedule, WorksheetPdfItem, WorksheetMaterialItem } from '../../types/ppic';
 import {
@@ -27,6 +27,8 @@ import {
   ZoomIn,
   ZoomOut,
   RotateCcw,
+  Maximize2,
+  Minimize2,
 } from 'lucide-react';
 import { getIndonesianHolidayInfo, DayHolidayInfo } from '../../utils/indonesianHolidays';
 import {
@@ -47,6 +49,7 @@ import {
 } from '../../lib/supabase';
 import { generateUuid } from '../../utils/uuid';
 import {
+  computeScrollLeftForDay,
   computeZoomPreservedScrollLeft,
   DEFAULT_GANTT_ZOOM,
   DEFAULT_PRODUCTION_LINES,
@@ -63,6 +66,7 @@ import {
   groupSchedulesForGanttBoard,
   isFinishBeforeStart,
   normalizeAssignedProductionLine,
+  resolveGanttEscAction,
 } from '../../utils/ganttScheduleUtils';
 import {
   LineConflictSummary,
@@ -151,8 +155,17 @@ export const ProductionScheduleView: React.FC = () => {
   const [currentMonth, setCurrentMonth] = useState<number>(10); // 0-indexed: 10 = November
   const [orSearchInput, setOrSearchInput] = useState<string>('');
   const [ganttZoom, setGanttZoom] = useState<GanttZoomLevel>(DEFAULT_GANTT_ZOOM);
+  const [isGanttFullscreen, setIsGanttFullscreen] = useState<boolean>(false);
   const ganttScrollRef = useRef<HTMLDivElement | null>(null);
+  const ganttFullscreenRef = useRef<HTMLDivElement | null>(null);
   const pendingZoomScrollRef = useRef<number | null>(null);
+  const pendingScrollToDayRef = useRef<number | null>(null);
+  const pendingFullscreenScrollRef = useRef<{ scrollLeft: number; scrollTop: number } | null>(null);
+  const lastKnownGanttScrollRef = useRef<{ scrollLeft: number; scrollTop: number }>({
+    scrollLeft: 0,
+    scrollTop: 0,
+  });
+  const lastEscClosedModalAtRef = useRef<number>(0);
 
   const dayColWidthPx = getGanttDayColumnWidthPx(ganttZoom);
   const ganttBoardWidthPx = getGanttBoardWidthPx(ganttZoom);
@@ -172,12 +185,90 @@ export const ProductionScheduleView: React.FC = () => {
     setGanttZoom(nextZoom);
   };
 
-  useLayoutEffect(() => {
-    if (pendingZoomScrollRef.current !== null && ganttScrollRef.current) {
-      ganttScrollRef.current.scrollLeft = pendingZoomScrollRef.current;
-      pendingZoomScrollRef.current = null;
+  const enterGanttFullscreen = () => {
+    if (isGanttFullscreen) return;
+    const scroller = ganttScrollRef.current;
+    if (scroller) {
+      const pos = { scrollLeft: scroller.scrollLeft, scrollTop: scroller.scrollTop };
+      lastKnownGanttScrollRef.current = pos;
+      pendingFullscreenScrollRef.current = pos;
     }
-  }, [ganttZoom]);
+    setIsGanttFullscreen(true);
+    const el = ganttFullscreenRef.current;
+    if (el && typeof el.requestFullscreen === 'function' && !document.fullscreenElement) {
+      Promise.resolve(el.requestFullscreen()).catch(() => {
+        // Fallback viewport fullscreen remains active via isGanttFullscreen
+      });
+    }
+  };
+
+  const exitGanttFullscreen = () => {
+    if (!isGanttFullscreen && !document.fullscreenElement) return;
+    const scroller = ganttScrollRef.current;
+    const pos = scroller
+      ? { scrollLeft: scroller.scrollLeft, scrollTop: scroller.scrollTop }
+      : lastKnownGanttScrollRef.current;
+    lastKnownGanttScrollRef.current = pos;
+    pendingFullscreenScrollRef.current = pos;
+    setIsGanttFullscreen(false);
+    if (document.fullscreenElement && typeof document.exitFullscreen === 'function') {
+      Promise.resolve(document.exitFullscreen()).catch(() => {});
+    }
+  };
+
+  const toggleGanttFullscreen = () => {
+    if (isGanttFullscreen) {
+      exitGanttFullscreen();
+    } else {
+      enterGanttFullscreen();
+    }
+  };
+
+  const handleGoToToday = () => {
+    const now = new Date();
+    const targetYear = now.getFullYear();
+    const targetMonth = now.getMonth();
+    const targetDay = now.getDate();
+    pendingScrollToDayRef.current = targetDay;
+    if (currentYear === targetYear && currentMonth === targetMonth) {
+      const scroller = ganttScrollRef.current;
+      if (scroller) {
+        scroller.scrollLeft = computeScrollLeftForDay({
+          day: targetDay,
+          clientWidth: scroller.clientWidth,
+          zoomPercent: ganttZoom,
+        });
+        pendingScrollToDayRef.current = null;
+      }
+    } else {
+      setCurrentYear(targetYear);
+      setCurrentMonth(targetMonth);
+    }
+  };
+
+  useLayoutEffect(() => {
+    const scroller = ganttScrollRef.current;
+    if (!scroller) return;
+    if (pendingZoomScrollRef.current !== null) {
+      scroller.scrollLeft = pendingZoomScrollRef.current;
+      pendingZoomScrollRef.current = null;
+      return;
+    }
+    if (pendingScrollToDayRef.current !== null) {
+      scroller.scrollLeft = computeScrollLeftForDay({
+        day: pendingScrollToDayRef.current,
+        clientWidth: scroller.clientWidth,
+        zoomPercent: ganttZoom,
+      });
+      pendingScrollToDayRef.current = null;
+      return;
+    }
+    if (pendingFullscreenScrollRef.current !== null) {
+      scroller.scrollLeft = pendingFullscreenScrollRef.current.scrollLeft;
+      scroller.scrollTop = pendingFullscreenScrollRef.current.scrollTop;
+      pendingFullscreenScrollRef.current = null;
+    }
+  }, [ganttZoom, currentYear, currentMonth, isGanttFullscreen]);
 
   // Modal states
   const [isModalOpen, setIsModalOpen] = useState(false);
@@ -222,6 +313,90 @@ export const ProductionScheduleView: React.FC = () => {
     type: 'success' | 'error';
     message: string;
   } | null>(null);
+
+  // Sync browser native Fullscreen API exit (e.g. Esc key when supported)
+  useEffect(() => {
+    const handleFullscreenChange = () => {
+      const isNativeActive =
+        Boolean(document.fullscreenElement) &&
+        document.fullscreenElement === ganttFullscreenRef.current;
+      if (!isNativeActive && isGanttFullscreen) {
+        if (Date.now() - lastEscClosedModalAtRef.current < 300) {
+          return;
+        }
+        pendingFullscreenScrollRef.current = { ...lastKnownGanttScrollRef.current };
+        setIsGanttFullscreen(false);
+      }
+    };
+    document.addEventListener('fullscreenchange', handleFullscreenChange);
+    return () => document.removeEventListener('fullscreenchange', handleFullscreenChange);
+  }, [isGanttFullscreen]);
+
+  // Prevent background page scroll while Gantt Full Screen is active
+  useEffect(() => {
+    if (!isGanttFullscreen) return;
+    const prevOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+    return () => {
+      document.body.style.overflow = prevOverflow;
+    };
+  }, [isGanttFullscreen]);
+
+  // Escape key closes open modals first, and only exits Full Screen when no modal is open
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      const action = resolveGanttEscAction({
+        isGanttFullscreen,
+        hasConfirmDelete: Boolean(confirmDeleteId),
+        hasEditModal: isModalOpen,
+        hasDetailModal: Boolean(activeDetailSchedule),
+        hasConflictModal: Boolean(activeLineConflictAudit),
+      });
+      if (action === 'noop') return;
+
+      e.preventDefault();
+      if (action === 'close_confirm_delete') {
+        if (!isDeletingSchedule) {
+          lastEscClosedModalAtRef.current = Date.now();
+          setConfirmDeleteId(null);
+        }
+        return;
+      }
+      if (action === 'close_edit_modal') {
+        if (!isSubmittingForm) {
+          lastEscClosedModalAtRef.current = Date.now();
+          setIsModalOpen(false);
+        }
+        return;
+      }
+      if (action === 'close_detail_modal') {
+        if (!isDeletingSchedule) {
+          lastEscClosedModalAtRef.current = Date.now();
+          setActiveDetailSchedule(null);
+        }
+        return;
+      }
+      if (action === 'close_conflict_modal') {
+        lastEscClosedModalAtRef.current = Date.now();
+        setActiveLineConflictAudit(null);
+        return;
+      }
+      if (action === 'exit_fullscreen') {
+        exitGanttFullscreen();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [
+    isGanttFullscreen,
+    confirmDeleteId,
+    isModalOpen,
+    activeDetailSchedule,
+    activeLineConflictAudit,
+    isDeletingSchedule,
+    isSubmittingForm,
+  ]);
 
   const availableOrList = registeredOrNumbers;
 
@@ -277,6 +452,15 @@ export const ProductionScheduleView: React.FC = () => {
   const daysInMonth = useMemo(() => {
     return new Date(currentYear, currentMonth + 1, 0).getDate();
   }, [currentYear, currentMonth]);
+
+  const todayDateParts = useMemo(() => {
+    const now = new Date();
+    return {
+      year: now.getFullYear(),
+      month0: now.getMonth(),
+      day: now.getDate(),
+    };
+  }, []);
 
   const daysArray = useMemo(() => {
     const days: Array<{
@@ -1424,11 +1608,22 @@ export const ProductionScheduleView: React.FC = () => {
           </button>
 
           <button
+            type="button"
+            onClick={handleGoToToday}
+            data-testid="gantt-today-button"
+            className="text-[11px] font-semibold px-2 py-0.5 rounded bg-blue-50 text-blue-700 hover:bg-blue-100 border border-blue-200 ml-1 cursor-pointer transition-colors"
+            title="Kembali ke tanggal hari ini"
+          >
+            Today
+          </button>
+
+          <button
+            type="button"
             onClick={() => {
               setCurrentYear(2026);
               setCurrentMonth(10);
             }}
-            className="text-[11px] font-medium text-blue-600 hover:text-blue-800 ml-2"
+            className="text-[11px] font-medium text-blue-600 hover:text-blue-800 ml-1 cursor-pointer"
             title="Reset ke Nov 2026"
           >
             Reset
@@ -1492,125 +1687,240 @@ export const ProductionScheduleView: React.FC = () => {
         </div>
       )}
 
-      {/* Production Planning Board (Horizontal Gantt Calendar with Non-Overlapping Lane Packing & Holiday Markings) */}
-      <div className="bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden">
-        {/* Gantt Top Header Bar with Zoom Controls at Top Right */}
-        <div className="px-3.5 py-2 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2">
-          <div className="text-[11px] font-medium text-slate-600 flex items-center gap-2">
-            <span className="font-semibold text-slate-800">Timeline Jadwal Produksi</span>
-            <span className="text-slate-400">·</span>
-            <span className="font-mono text-slate-500">{dayColWidthPx}px/hari</span>
+      {/* Production Planning Board + Gantt Modals inside Full Screen container */}
+      <div
+        ref={ganttFullscreenRef}
+        data-gantt-fullscreen={isGanttFullscreen ? 'true' : 'false'}
+        className={isGanttFullscreen ? 'bg-white' : ''}
+      >
+        <div
+          data-testid="gantt-board-container"
+          className={
+            isGanttFullscreen
+              ? 'fixed inset-0 z-[70] bg-white flex flex-col w-screen h-screen overflow-hidden'
+              : 'bg-white rounded-xl border border-slate-200 shadow-xs overflow-hidden'
+          }
+        >
+          {/* Gantt Top Header Bar with Month/Today Controls (in Full Screen) & Zoom + Full Screen Controls at Top Right */}
+          <div className="px-3.5 py-2 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2 shrink-0">
+            <div className="flex flex-wrap items-center gap-2.5">
+              <div className="text-[11px] font-medium text-slate-600 flex items-center gap-2">
+                <span className="font-semibold text-slate-800">Timeline Jadwal Produksi</span>
+                <span className="text-slate-400">·</span>
+                <span className="font-mono text-slate-500">{dayColWidthPx}px/hari</span>
+              </div>
+
+              {isGanttFullscreen && (
+                <div className="flex items-center gap-1.5 pl-2.5 border-l border-slate-300">
+                  <button
+                    type="button"
+                    onClick={handlePrevMonth}
+                    aria-label="Bulan Sebelumnya"
+                    title="Bulan Sebelumnya"
+                    className="inline-flex items-center justify-center w-7 h-7 rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
+                  >
+                    <ChevronLeft className="w-3.5 h-3.5" />
+                  </button>
+                  <div className="flex items-center gap-1.5 px-2.5 h-7 bg-white border border-slate-300 rounded text-xs font-bold text-slate-900 min-w-32 justify-center">
+                    <Calendar className="w-3.5 h-3.5 text-blue-600" />
+                    <span>
+                      {monthNames[currentMonth]} {currentYear}
+                    </span>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={handleNextMonth}
+                    aria-label="Bulan Berikutnya"
+                    title="Bulan Berikutnya"
+                    className="inline-flex items-center justify-center w-7 h-7 rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer"
+                  >
+                    <ChevronRight className="w-3.5 h-3.5" />
+                  </button>
+                  <button
+                    type="button"
+                    onClick={handleGoToToday}
+                    data-testid="gantt-fullscreen-today-button"
+                    className="px-2.5 h-7 rounded border border-blue-200 bg-blue-50 hover:bg-blue-100 text-xs font-semibold text-blue-700 transition-colors cursor-pointer"
+                    title="Kembali ke tanggal hari ini"
+                  >
+                    Today
+                  </button>
+                </div>
+              )}
+            </div>
+
+            <div className="flex flex-wrap items-center gap-2 ml-auto">
+              <div
+                className="flex items-center gap-1.5"
+                role="group"
+                aria-label="Kontrol Zoom Gantt Chart"
+              >
+                <button
+                  type="button"
+                  onClick={() => handleSetGanttZoom(getNextGanttZoomLevel(ganttZoom, 'out'))}
+                  disabled={ganttZoom === GANTT_ZOOM_LEVELS[0]}
+                  aria-label="Zoom Out"
+                  title="Zoom Out (-)"
+                  className="inline-flex items-center justify-center w-7 h-7 rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
+                >
+                  <ZoomOut className="w-3.5 h-3.5" />
+                </button>
+
+                <span
+                  data-testid="gantt-zoom-level"
+                  className="min-w-12 px-2 py-1 text-center text-xs font-mono font-bold text-slate-800 bg-white border border-slate-300 rounded select-none"
+                  title="Persentase Zoom Saat Ini"
+                >
+                  {ganttZoom}%
+                </span>
+
+                <button
+                  type="button"
+                  onClick={() => handleSetGanttZoom(getNextGanttZoomLevel(ganttZoom, 'in'))}
+                  disabled={ganttZoom === GANTT_ZOOM_LEVELS[GANTT_ZOOM_LEVELS.length - 1]}
+                  aria-label="Zoom In"
+                  title="Zoom In (+)"
+                  className="inline-flex items-center justify-center w-7 h-7 rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
+                >
+                  <ZoomIn className="w-3.5 h-3.5" />
+                </button>
+
+                <button
+                  type="button"
+                  onClick={() => handleSetGanttZoom(DEFAULT_GANTT_ZOOM)}
+                  aria-label="Reset Zoom"
+                  title="Reset zoom ke 100%"
+                  className="inline-flex items-center gap-1 px-2.5 h-7 rounded border border-slate-300 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer ml-1"
+                >
+                  <RotateCcw className="w-3 h-3" />
+                  <span>Reset</span>
+                </button>
+              </div>
+
+              <button
+                type="button"
+                onClick={toggleGanttFullscreen}
+                data-testid="gantt-fullscreen-toggle"
+                aria-label={isGanttFullscreen ? 'Keluar Full Screen' : 'Full Screen Gantt Chart'}
+                aria-pressed={isGanttFullscreen}
+                title={isGanttFullscreen ? 'Keluar Full Screen (Esc)' : 'Full Screen Gantt Chart'}
+                className={`inline-flex items-center gap-1.5 px-2.5 h-7 rounded border text-xs font-semibold transition-colors cursor-pointer ${
+                  isGanttFullscreen
+                    ? 'border-slate-700 bg-slate-900 text-white hover:bg-slate-800'
+                    : 'border-slate-300 bg-white text-slate-700 hover:bg-slate-100'
+                }`}
+              >
+                {isGanttFullscreen ? (
+                  <>
+                    <Minimize2 className="w-3.5 h-3.5" />
+                    <span>Keluar Full Screen</span>
+                  </>
+                ) : (
+                  <>
+                    <Maximize2 className="w-3.5 h-3.5" />
+                    <span className="hidden sm:inline">Full Screen</span>
+                  </>
+                )}
+              </button>
+            </div>
           </div>
 
           <div
-            className="flex items-center gap-1.5 ml-auto"
-            role="group"
-            aria-label="Kontrol Zoom Gantt Chart"
+            ref={ganttScrollRef}
+            onScroll={(e) => {
+              lastKnownGanttScrollRef.current = {
+                scrollLeft: e.currentTarget.scrollLeft,
+                scrollTop: e.currentTarget.scrollTop,
+              };
+            }}
+            className={isGanttFullscreen ? 'flex-1 min-h-0 overflow-auto relative' : 'overflow-x-auto relative'}
+            data-gantt-scroll-container
           >
-            <button
-              type="button"
-              onClick={() => handleSetGanttZoom(getNextGanttZoomLevel(ganttZoom, 'out'))}
-              disabled={ganttZoom === GANTT_ZOOM_LEVELS[0]}
-              aria-label="Zoom Out"
-              title="Zoom Out (-)"
-              className="inline-flex items-center justify-center w-7 h-7 rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
-            >
-              <ZoomOut className="w-3.5 h-3.5" />
-            </button>
+            <div style={{ width: `${ganttBoardWidthPx}px` }} data-gantt-board-canvas>
+              {/* Header: Dates Row */}
+              <div
+                style={{ gridTemplateColumns: ganttGridTemplateColumns }}
+                data-gantt-date-header
+                className="grid bg-slate-900 text-white text-xs border-b border-slate-700 font-semibold sticky top-0 z-30"
+              >
+                {/* Sticky Line Produksi Header Column */}
+                <div
+                  data-gantt-sticky-corner
+                  className="sticky left-0 z-40 bg-slate-900 p-3 border-r border-slate-700 flex items-center justify-between shadow-[3px_0_6px_-1px_rgba(0,0,0,0.5)]"
+                >
+                  <span className="font-bold text-white tracking-wide">Line Produksi</span>
+                  <span className="text-[10px] text-slate-400 font-mono">Tgl</span>
+                </div>
+                {daysArray.map((d) => {
+                  const isNational = d.holidayInfo.type === 'NATIONAL_HOLIDAY';
+                  const isCuti = d.holidayInfo.type === 'CUTI_BERSAMA';
+                  const isSunday = d.holidayInfo.type === 'SUNDAY';
+                  const isToday =
+                    currentYear === todayDateParts.year &&
+                    currentMonth === todayDateParts.month0 &&
+                    d.day === todayDateParts.day;
 
-            <span
-              data-testid="gantt-zoom-level"
-              className="min-w-12 px-2 py-1 text-center text-xs font-mono font-bold text-slate-800 bg-white border border-slate-300 rounded select-none"
-              title="Persentase Zoom Saat Ini"
-            >
-              {ganttZoom}%
-            </span>
+                  let headerBg = 'text-slate-200 hover:bg-slate-800/60';
+                  let dateColor = 'text-slate-200';
 
-            <button
-              type="button"
-              onClick={() => handleSetGanttZoom(getNextGanttZoomLevel(ganttZoom, 'in'))}
-              disabled={ganttZoom === GANTT_ZOOM_LEVELS[GANTT_ZOOM_LEVELS.length - 1]}
-              aria-label="Zoom In"
-              title="Zoom In (+)"
-              className="inline-flex items-center justify-center w-7 h-7 rounded border border-slate-300 bg-white text-slate-700 hover:bg-slate-100 disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
-            >
-              <ZoomIn className="w-3.5 h-3.5" />
-            </button>
+                  if (isNational) {
+                    headerBg = 'bg-rose-950/90 text-rose-300 border-rose-800/80 font-bold';
+                    dateColor = 'text-rose-400 font-black';
+                  } else if (isCuti) {
+                    headerBg = 'bg-amber-950/90 text-amber-200 border-amber-800/80 font-bold';
+                    dateColor = 'text-amber-300 font-black';
+                  } else if (isSunday) {
+                    headerBg = 'bg-slate-800 text-rose-400 font-bold';
+                    dateColor = 'text-rose-400 font-bold';
+                  } else if (d.isSaturday) {
+                    headerBg = 'bg-slate-800/50 text-slate-300';
+                  }
 
-            <button
-              type="button"
-              onClick={() => handleSetGanttZoom(DEFAULT_GANTT_ZOOM)}
-              aria-label="Reset Zoom"
-              title="Reset zoom ke 100%"
-              className="inline-flex items-center gap-1 px-2.5 h-7 rounded border border-slate-300 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-100 transition-colors cursor-pointer ml-1"
-            >
-              <RotateCcw className="w-3 h-3" />
-              <span>Reset</span>
-            </button>
-          </div>
-        </div>
+                  if (isToday) {
+                    headerBg = `${headerBg} ring-2 ring-inset ring-blue-400 bg-blue-950/80`;
+                    dateColor = 'text-blue-300 font-black';
+                  }
 
-        <div ref={ganttScrollRef} className="overflow-x-auto relative" data-gantt-scroll-container>
-          <div style={{ width: `${ganttBoardWidthPx}px` }} data-gantt-board-canvas>
-            {/* Header: Dates Row */}
-            <div
-              style={{ gridTemplateColumns: ganttGridTemplateColumns }}
-              className="grid bg-slate-900 text-white text-xs border-b border-slate-700 font-semibold sticky top-0 z-30"
-            >
-              {/* Sticky Line Produksi Header Column */}
-              <div className="sticky left-0 z-40 bg-slate-900 p-3 border-r border-slate-700 flex items-center justify-between shadow-[3px_0_6px_-1px_rgba(0,0,0,0.5)]">
-                <span className="font-bold text-white tracking-wide">Line Produksi</span>
-                <span className="text-[10px] text-slate-400 font-mono">Tgl</span>
-              </div>
-              {daysArray.map((d) => {
-                const isNational = d.holidayInfo.type === 'NATIONAL_HOLIDAY';
-                const isCuti = d.holidayInfo.type === 'CUTI_BERSAMA';
-                const isSunday = d.holidayInfo.type === 'SUNDAY';
+                  const isCompactZoom = ganttZoom <= 50;
 
-                let headerBg = 'text-slate-200 hover:bg-slate-800/60';
-                let dateColor = 'text-slate-200';
-
-                if (isNational) {
-                  headerBg = 'bg-rose-950/90 text-rose-300 border-rose-800/80 font-bold';
-                  dateColor = 'text-rose-400 font-black';
-                } else if (isCuti) {
-                  headerBg = 'bg-amber-950/90 text-amber-200 border-amber-800/80 font-bold';
-                  dateColor = 'text-amber-300 font-black';
-                } else if (isSunday) {
-                  headerBg = 'bg-slate-800 text-rose-400 font-bold';
-                  dateColor = 'text-rose-400 font-bold';
-                } else if (d.isSaturday) {
-                  headerBg = 'bg-slate-800/50 text-slate-300';
-                }
-
-                const isCompactZoom = ganttZoom <= 50;
-
-                return (
-                  <div
-                    key={d.day}
-                    data-gantt-day={d.day}
-                    className={`${isCompactZoom ? 'px-0.5 py-1' : 'p-1'} text-center border-r border-slate-800/80 flex flex-col justify-center items-center transition-colors relative group select-none overflow-hidden ${headerBg}`}
-                    title={d.holidayInfo.isHoliday ? `${d.dateStr}: ${d.holidayInfo.name}` : `${d.dayName}, ${d.dateStr}`}
-                  >
-                    <span className={`${isCompactZoom ? 'text-[9px]' : 'text-[10px]'} font-mono opacity-80 leading-tight`}>
-                      {d.dayName}
-                    </span>
-                    <span className={`${isCompactZoom ? 'text-[11px]' : 'text-xs'} font-mono leading-tight ${dateColor}`}>
-                      {d.day}
-                    </span>
-                    {isNational && (
-                      <span className={`${isCompactZoom ? 'text-[6px] px-0.5' : 'text-[8px] px-1'} font-extrabold uppercase py-0.2 bg-rose-600 text-white rounded-xs leading-none mt-0.5`}>
-                        Libur
+                  return (
+                    <div
+                      key={d.day}
+                      data-gantt-day={d.day}
+                      data-gantt-today={isToday ? 'true' : undefined}
+                      className={`${isCompactZoom ? 'px-0.5 py-1' : 'p-1'} text-center border-r border-slate-800/80 flex flex-col justify-center items-center transition-colors relative group select-none overflow-hidden ${headerBg}`}
+                      title={
+                        isToday
+                          ? `Hari Ini (${d.dateStr})${d.holidayInfo.isHoliday ? ` - ${d.holidayInfo.name}` : ''}`
+                          : d.holidayInfo.isHoliday
+                            ? `${d.dateStr}: ${d.holidayInfo.name}`
+                            : `${d.dayName}, ${d.dateStr}`
+                      }
+                    >
+                      <span className={`${isCompactZoom ? 'text-[9px]' : 'text-[10px]'} font-mono opacity-80 leading-tight`}>
+                        {d.dayName}
                       </span>
-                    )}
-                    {isCuti && (
-                      <span className={`${isCompactZoom ? 'text-[6px] px-0.5' : 'text-[8px] px-1'} font-extrabold uppercase py-0.2 bg-amber-600 text-white rounded-xs leading-none mt-0.5`}>
-                        Cuti
+                      <span className={`${isCompactZoom ? 'text-[11px]' : 'text-xs'} font-mono leading-tight ${dateColor}`}>
+                        {d.day}
                       </span>
-                    )}
-                  </div>
-                );
-              })}
+                      {isToday && (
+                        <span className={`${isCompactZoom ? 'text-[6px] px-0.5' : 'text-[8px] px-1'} font-extrabold uppercase py-0.2 bg-blue-500 text-white rounded-xs leading-none mt-0.5`}>
+                          Hari Ini
+                        </span>
+                      )}
+                      {isNational && (
+                        <span className={`${isCompactZoom ? 'text-[6px] px-0.5' : 'text-[8px] px-1'} font-extrabold uppercase py-0.2 bg-rose-600 text-white rounded-xs leading-none mt-0.5`}>
+                          Libur
+                        </span>
+                      )}
+                      {isCuti && (
+                        <span className={`${isCompactZoom ? 'text-[6px] px-0.5' : 'text-[8px] px-1'} font-extrabold uppercase py-0.2 bg-amber-600 text-white rounded-xs leading-none mt-0.5`}>
+                          Cuti
+                        </span>
+                      )}
+                    </div>
+                  );
+                })}
               {Array.from({ length: 31 - daysInMonth }).map((_, i) => (
                 <div key={`empty-${i}`} className="bg-slate-900/60 border-r border-slate-800" />
               ))}
@@ -1650,7 +1960,10 @@ export const ProductionScheduleView: React.FC = () => {
                       className="grid relative hover:bg-slate-50/30 transition-colors"
                     >
                       {/* Fixed Sticky Left Line Produksi Column */}
-                      <div className="sticky left-0 z-20 p-3 border-r border-slate-200 bg-white/95 backdrop-blur-xs flex flex-col justify-center shadow-[3px_0_6px_-1px_rgba(0,0,0,0.06)]">
+                      <div
+                        data-gantt-sticky-line={group.lineLabel}
+                        className="sticky left-0 z-20 p-3 border-r border-slate-200 bg-white/95 backdrop-blur-xs flex flex-col justify-center shadow-[3px_0_6px_-1px_rgba(0,0,0,0.06)]"
+                      >
                         <div className="font-bold text-xs text-slate-900 flex items-center gap-1.5">
                           <Layers
                             className={`w-3.5 h-3.5 shrink-0 ${
@@ -1821,7 +2134,7 @@ export const ProductionScheduleView: React.FC = () => {
         </div>
 
         {/* Board Legend */}
-        <div className="p-3.5 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-4 text-xs text-slate-600">
+        <div className="p-3.5 bg-slate-50 border-t border-slate-200 flex flex-wrap items-center justify-between gap-4 text-xs text-slate-600 shrink-0">
           <div className="flex flex-wrap items-center gap-x-5 gap-y-2">
             <span className="font-bold text-slate-800 flex items-center gap-1.5">
               <Info className="w-4 h-4 text-blue-600" />
@@ -1849,11 +2162,11 @@ export const ProductionScheduleView: React.FC = () => {
             * Kolom informasi jadwal tetap terkunci di sisi kiri saat kalender digeser secara horizontal.
           </div>
         </div>
-      </div>
+        </div>
 
       {/* Line Conflict Diagnostic Modal */}
       {activeLineConflictAudit && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
           <div className="bg-white rounded-xl shadow-2xl border border-slate-200 w-full max-w-4xl max-h-[90vh] overflow-y-auto animate-in fade-in zoom-in-95 duration-150">
             <div className="p-4 bg-slate-900 text-white flex items-center justify-between sticky top-0 z-20">
               <div className="flex items-center gap-2">
@@ -1956,7 +2269,7 @@ export const ProductionScheduleView: React.FC = () => {
 
       {/* Schedule Detail Modal */}
       {activeDetailSchedule && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
           <div
             className={`bg-white rounded-xl shadow-2xl border border-slate-200 w-full ${
               activeDetailSchedule.worksheets && activeDetailSchedule.worksheets.length > 0
@@ -2359,7 +2672,7 @@ export const ProductionScheduleView: React.FC = () => {
 
       {/* Add / Edit Schedule Form Modal */}
       {isModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
+        <div className="fixed inset-0 z-[80] flex items-center justify-center bg-slate-900/60 backdrop-blur-xs p-4">
           <div
             className={`bg-white rounded-xl shadow-2xl border border-slate-200 w-full ${
               uploadedExcels.length > 0 ? 'max-w-5xl' : 'max-w-xl'
@@ -3050,6 +3363,7 @@ export const ProductionScheduleView: React.FC = () => {
           </div>
         </div>
       )}
+      </div>
     </div>
   );
 };
