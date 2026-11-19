@@ -20,6 +20,7 @@ import {
   isFinishBeforeStart,
   layoutGanttLineSchedules,
   parseCalendarDateParts,
+  resolveGanttBarDisplayMeta,
   resolveGanttEscAction,
   UNASSIGNED_PRODUCTION_LINE_LABEL,
 } from '../src/utils/ganttScheduleUtils';
@@ -836,4 +837,102 @@ test('Today Scroll & Esc Priority: computeScrollLeftForDay centers target day wi
     'noop'
   );
 });
+
+test('Gantt Bar Display Meta: extracts exact No. OR, No. WH (never from OR), Style, decimal Target + unit, and responsive density', () => {
+  const fullSchedule: ProductionSchedule = {
+    id: 'bar-1',
+    orNumber: '1036',
+    style: 'JACKET WINDBREAKER WATERPROOF NAVY EDITION LONG STYLE NAME',
+    productionLine: 'Line 1',
+    productionDate: '2026-11-01',
+    finishDate: '2026-11-07',
+    target: 1250.75,
+    targetUnit: 'Pcs',
+    worksheets: [
+      {
+        id: 'ws-1',
+        fileName: 'mrp.xls',
+        orNumber: '1036',
+        worksheetNo: 'WH/MO/22743',
+        style: 'JACKET WINDBREAKER WATERPROOF NAVY EDITION LONG STYLE NAME',
+        target: 1250.75,
+        targetUnit: 'Pcs',
+        materials: [],
+      },
+    ],
+  };
+
+  // Wide bar (7 days @ 48px = 336px)
+  const wideMeta = resolveGanttBarDisplayMeta({
+    schedule: fullSchedule,
+    durationDays: 7,
+    dayColWidthPx: 48,
+    lineLabel: 'Line 1',
+  });
+  assert.equal(wideMeta.orNumber, '1036');
+  assert.equal(wideMeta.orDisplay, 'OR 1036');
+  assert.equal(wideMeta.whNumber, 'WH/MO/22743');
+  assert.equal(wideMeta.style, 'JACKET WINDBREAKER WATERPROOF NAVY EDITION LONG STYLE NAME');
+  assert.equal(wideMeta.targetDisplay, '1.250,75 Pcs');
+  assert.equal(wideMeta.density, 'wide');
+  assert.match(wideMeta.tooltipText, /No\. OR: 1036/);
+  assert.match(wideMeta.tooltipText, /No\. WH: WH\/MO\/22743/);
+  assert.match(wideMeta.tooltipText, /Style: JACKET WINDBREAKER WATERPROOF NAVY EDITION LONG STYLE NAME/);
+  assert.match(wideMeta.tooltipText, /Target: 1\.250,75 Pcs/);
+
+  // Standard bar (3 days @ 48px = 144px)
+  const stdMeta = resolveGanttBarDisplayMeta({
+    schedule: fullSchedule,
+    durationDays: 3,
+    dayColWidthPx: 48,
+    lineLabel: 'Line 1',
+  });
+  assert.equal(stdMeta.barWidthPx, 144);
+  assert.equal(stdMeta.density, 'standard');
+
+  // Compact bar (2 days @ 24px zoom 50% = 48px)
+  const compactMeta = resolveGanttBarDisplayMeta({
+    schedule: fullSchedule,
+    durationDays: 2,
+    dayColWidthPx: 24,
+    lineLabel: 'Line 1',
+  });
+  assert.equal(compactMeta.barWidthPx, 48);
+  assert.equal(compactMeta.density, 'compact');
+
+  // Schedule without worksheetNo MUST NOT fabricate No. WH from No. OR, and preserves decimal + custom unit / fallback 'unit'
+  const noWhSchedule: ProductionSchedule = {
+    id: 'bar-2',
+    orNumber: 'OR-2026-001',
+    style: 'Bomber Jacket',
+    productionLine: 'Line 3',
+    productionDate: '2026-11-10',
+    finishDate: '2026-11-11',
+    target: 29.5,
+    targetUnit: 'Set',
+  };
+  const noWhMeta = resolveGanttBarDisplayMeta({
+    schedule: noWhSchedule,
+    durationDays: 2,
+    dayColWidthPx: 72, // zoom 150% -> 144px
+    lineLabel: 'Line 3',
+    hasConflict: true,
+  });
+  assert.equal(noWhMeta.orDisplay, 'OR-2026-001'); // Avoids redundant "OR OR-2026-001"
+  assert.equal(noWhMeta.whNumber, '-'); // Never copied from OR-2026-001
+  assert.equal(noWhMeta.targetDisplay, '29,5 Set');
+  assert.equal(noWhMeta.density, 'standard');
+  assert.match(noWhMeta.tooltipText, /No\. WH: -/);
+  assert.match(noWhMeta.tooltipText, /Status: Bentrok/);
+
+  // Default unit fallback when targetUnit is omitted
+  const defaultUnitMeta = resolveGanttBarDisplayMeta({
+    schedule: { ...noWhSchedule, target: 1000, targetUnit: undefined },
+    durationDays: 5,
+    dayColWidthPx: 48,
+    lineLabel: 'Line 3',
+  });
+  assert.equal(defaultUnitMeta.targetDisplay, '1.000 unit');
+});
+
 

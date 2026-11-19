@@ -1,4 +1,5 @@
 import { ProductionSchedule } from '../types/ppic';
+import { formatPpicNumber } from './excelMaterialParser';
 
 export interface CalendarDateParts {
   year: number;
@@ -520,3 +521,90 @@ export function groupSchedulesForGanttBoard<
 
   return groups;
 }
+
+export type GanttBarDensity = 'compact' | 'standard' | 'wide';
+
+export interface GanttBarDisplayMeta {
+  orNumber: string;
+  orDisplay: string;
+  whNumber: string;
+  style: string;
+  targetFormatted: string;
+  targetUnit: string;
+  targetDisplay: string;
+  barWidthPx: number;
+  density: GanttBarDensity;
+  tooltipText: string;
+}
+
+/**
+ * Resolves the 4 exact display fields for a Gantt schedule bar without modifying
+ * or fabricating stored data:
+ * - No. OR strictly from schedule.orNumber
+ * - No. WH strictly from stored worksheetNo (WH/MO/...), never derived from orNumber
+ * - Style strictly from schedule.style
+ * - Target + unit strictly from schedule.target (preserving decimals) and stored targetUnit (fallback 'unit')
+ */
+export function resolveGanttBarDisplayMeta(params: {
+  schedule: Pick<ProductionSchedule, 'orNumber' | 'style' | 'target' | 'targetUnit' | 'productionDate' | 'finishDate' | 'worksheets'>;
+  durationDays: number;
+  dayColWidthPx: number;
+  lineLabel: string;
+  hasConflict?: boolean;
+}): GanttBarDisplayMeta {
+  const { schedule, durationDays, dayColWidthPx, lineLabel, hasConflict } = params;
+
+  const orNumber = String(schedule.orNumber || '').trim() || '-';
+  const orDisplay =
+    orNumber === '-'
+      ? 'OR -'
+      : /^OR\b/i.test(orNumber)
+        ? orNumber
+        : `OR ${orNumber}`;
+
+  const rawWh = schedule.worksheets
+    ?.find((w) => typeof w.worksheetNo === 'string' && w.worksheetNo.trim().length > 0)
+    ?.worksheetNo?.trim();
+  const whNumber = rawWh || '-';
+
+  const style = String(schedule.style || '').trim() || '-';
+
+  const targetFormatted = formatPpicNumber(schedule.target);
+  const storedUnit =
+    String(schedule.targetUnit || '').trim() ||
+    schedule.worksheets
+      ?.find((w) => typeof w.targetUnit === 'string' && w.targetUnit.trim().length > 0)
+      ?.targetUnit?.trim() ||
+    '';
+  const targetUnit = storedUnit || 'unit';
+  const targetDisplay = `${targetFormatted} ${targetUnit}`;
+
+  const barWidthPx = Math.max(0, Math.round(durationDays * dayColWidthPx));
+  const density: GanttBarDensity =
+    barWidthPx >= 210 ? 'wide' : barWidthPx >= 110 ? 'standard' : 'compact';
+
+  const tooltipLines = [
+    `No. OR: ${orNumber}`,
+    `No. WH: ${whNumber}`,
+    `Style: ${style}`,
+    `Target: ${targetDisplay}`,
+    `Line: ${lineLabel} | ${schedule.productionDate} s/d ${schedule.finishDate}`,
+  ];
+  if (hasConflict) {
+    tooltipLines.push('Status: Bentrok jadwal pada Line yang sama');
+  }
+
+  return {
+    orNumber,
+    orDisplay,
+    whNumber,
+    style,
+    targetFormatted,
+    targetUnit,
+    targetDisplay,
+    barWidthPx,
+    density,
+    tooltipText: tooltipLines.join('\n'),
+  };
+}
+

@@ -58,6 +58,7 @@ import {
   GANTT_ROW_PADDING_Y_PX,
   GANTT_STICKY_LINE_COL_WIDTH_PX,
   GANTT_ZOOM_LEVELS,
+  GanttBarDisplayMeta,
   GanttZoomLevel,
   getDisplayProductionLineLabel,
   getGanttBoardWidthPx,
@@ -66,6 +67,7 @@ import {
   groupSchedulesForGanttBoard,
   isFinishBeforeStart,
   normalizeAssignedProductionLine,
+  resolveGanttBarDisplayMeta,
   resolveGanttEscAction,
 } from '../../utils/ganttScheduleUtils';
 import {
@@ -166,6 +168,14 @@ export const ProductionScheduleView: React.FC = () => {
     scrollTop: 0,
   });
   const lastEscClosedModalAtRef = useRef<number>(0);
+  const [hoveredBarTooltip, setHoveredBarTooltip] = useState<{
+    meta: GanttBarDisplayMeta;
+    lineLabel: string;
+    productionDate: string;
+    finishDate: string;
+    hasConflict: boolean;
+    anchorRect: { left: number; top: number; bottom: number; width: number };
+  } | null>(null);
 
   const dayColWidthPx = getGanttDayColumnWidthPx(ganttZoom);
   const ganttBoardWidthPx = getGanttBoardWidthPx(ganttZoom);
@@ -1832,6 +1842,9 @@ export const ProductionScheduleView: React.FC = () => {
                 scrollLeft: e.currentTarget.scrollLeft,
                 scrollTop: e.currentTarget.scrollTop,
               };
+              if (hoveredBarTooltip) {
+                setHoveredBarTooltip(null);
+              }
             }}
             className={isGanttFullscreen ? 'flex-1 min-h-0 overflow-auto relative' : 'overflow-x-auto relative'}
             data-gantt-scroll-container
@@ -2052,19 +2065,76 @@ export const ProductionScheduleView: React.FC = () => {
                         {/* Horizontal Gantt Schedule Blocks packed into non-overlapping lanes within this Line */}
                         <div className="absolute inset-0 pointer-events-none">
                           {group.layout.items.map(({ schedule: sch, barSpan, laneIndex }) => {
-                            const { startDay, endDay, leftPct, widthPct } = barSpan;
+                            const { startDay, endDay, durationDays, leftPct, widthPct } = barSpan;
                             const topPx =
                               GANTT_ROW_PADDING_Y_PX +
                               laneIndex * (GANTT_LANE_HEIGHT_PX + GANTT_LANE_GAP_PX);
                             const colors = getBlockColor(sch);
-                            const prodNo = sch.worksheets?.[0]?.worksheetNo;
                             const conflictInfo = scheduleConflicts.get(sch.id);
+                            const barMeta = resolveGanttBarDisplayMeta({
+                              schedule: sch,
+                              durationDays,
+                              dayColWidthPx,
+                              lineLabel: group.lineLabel,
+                              hasConflict: Boolean(conflictInfo),
+                            });
+
+                            const paddingClass =
+                              barMeta.density === 'wide'
+                                ? 'px-2 py-[3px]'
+                                : barMeta.density === 'standard'
+                                  ? 'px-1.5 py-[3px]'
+                                  : 'px-1 py-[2px]';
+                            const orTextClass =
+                              barMeta.density === 'wide'
+                                ? 'text-[11px]'
+                                : barMeta.density === 'standard'
+                                  ? 'text-[10px]'
+                                  : 'text-[9px]';
+                            const targetBadgeClass =
+                              barMeta.density === 'wide'
+                                ? 'text-[10px] px-1.5 py-[1px]'
+                                : barMeta.density === 'standard'
+                                  ? 'text-[9px] px-1 py-[1px]'
+                                  : 'text-[8px] px-0.5 py-0';
+                            const whTextClass =
+                              barMeta.density === 'wide'
+                                ? 'text-[9.5px] px-1 py-[1px] bg-black/20 rounded-[2px]'
+                                : barMeta.density === 'standard'
+                                  ? 'text-[9px]'
+                                  : 'text-[8px]';
+                            const styleTextClass =
+                              barMeta.density === 'wide'
+                                ? 'text-[10px]'
+                                : barMeta.density === 'standard'
+                                  ? 'text-[9px]'
+                                  : 'text-[8px]';
+
+                            const showTooltipForElement = (el: HTMLElement) => {
+                              const r = el.getBoundingClientRect();
+                              setHoveredBarTooltip({
+                                meta: barMeta,
+                                lineLabel: group.lineLabel,
+                                productionDate: sch.productionDate,
+                                finishDate: sch.finishDate,
+                                hasConflict: Boolean(conflictInfo),
+                                anchorRect: {
+                                  left: r.left,
+                                  top: r.top,
+                                  bottom: r.bottom,
+                                  width: r.width,
+                                },
+                              });
+                            };
 
                             return (
                               <button
                                 type="button"
                                 key={sch.id}
                                 data-or-number={sch.orNumber}
+                                data-wh-number={barMeta.whNumber}
+                                data-target-display={barMeta.targetDisplay}
+                                data-bar-density={barMeta.density}
                                 data-line-label={group.lineLabel}
                                 data-start-day={startDay}
                                 data-end-day={endDay}
@@ -2072,9 +2142,14 @@ export const ProductionScheduleView: React.FC = () => {
                                 data-production-date={sch.productionDate}
                                 data-finish-date={sch.finishDate}
                                 data-has-conflict={conflictInfo ? 'true' : 'false'}
-                                aria-label={`Detail jadwal ${sch.orNumber} ${sch.style}`}
+                                aria-label={`Detail jadwal ${barMeta.orDisplay}, ${barMeta.whNumber}, ${barMeta.style}, Target ${barMeta.targetDisplay}`}
+                                onMouseEnter={(e) => showTooltipForElement(e.currentTarget)}
+                                onMouseLeave={() => setHoveredBarTooltip(null)}
+                                onFocus={(e) => showTooltipForElement(e.currentTarget)}
+                                onBlur={() => setHoveredBarTooltip(null)}
                                 onClick={(e) => {
                                   e.stopPropagation();
+                                  setHoveredBarTooltip(null);
                                   setDetailSelectedWsId(null);
                                   setRefreshFeedback(null);
                                   setDetailActionError(null);
@@ -2087,37 +2162,53 @@ export const ProductionScheduleView: React.FC = () => {
                                   width: `${widthPct}%`,
                                   height: `${GANTT_LANE_HEIGHT_PX}px`,
                                 }}
-                                className={`absolute pointer-events-auto rounded-md shadow-xs p-1.5 cursor-pointer transition-colors duration-150 flex items-center justify-between text-left text-xs font-semibold overflow-hidden group ${colors.bg} ${colors.border} ${colors.text} ${
+                                className={`absolute pointer-events-auto rounded-md shadow-xs ${paddingClass} cursor-pointer transition-colors duration-150 flex flex-col justify-between text-left overflow-hidden group ${colors.bg} ${colors.border} ${colors.text} ${
                                   conflictInfo ? 'ring-2 ring-amber-400/90' : ''
                                 }`}
-                                title={`[${group.lineLabel}] OR ${sch.orNumber}${prodNo ? ` (${prodNo})` : ''} - ${sch.style} | Target: ${formatPpicNumber(sch.target)} | ${sch.productionDate} s/d ${sch.finishDate}${conflictInfo ? ' (Bentrok jadwal pada Line yang sama)' : ''}`}
+                                title={barMeta.tooltipText}
                               >
-                                <div className="flex items-center gap-1.5 truncate">
-                                  <span className="font-mono font-bold truncate">
-                                    OR {sch.orNumber}
+                                {/* Baris 1: No. OR (kiri) & Target Produksi + satuan (kanan) */}
+                                <div className="flex items-center justify-between gap-1 w-full min-w-0 leading-none">
+                                  <span
+                                    data-bar-field="or"
+                                    className={`${orTextClass} font-mono font-bold truncate min-w-0 leading-none`}
+                                  >
+                                    {barMeta.orDisplay}
                                   </span>
-                                  {prodNo && (
-                                    <span className="opacity-85 text-[10px] font-mono truncate hidden lg:inline">
-                                      [{prodNo}]
+
+                                  <div className="flex items-center gap-1 shrink-0 min-w-0 max-w-[65%]">
+                                    {barMeta.density === 'wide' && sch.worksheets && sch.worksheets.length > 0 && (
+                                      <span
+                                        className="text-[9px] bg-white/25 px-1 py-[1px] rounded flex items-center gap-0.5 font-bold shrink-0 leading-none"
+                                        title={`${sch.worksheets.length} file Excel terlampir`}
+                                      >
+                                        <Paperclip className="w-2.5 h-2.5" />
+                                        <span>{sch.worksheets.length}</span>
+                                      </span>
+                                    )}
+                                    <span
+                                      data-bar-field="target"
+                                      className={`${targetBadgeClass} font-mono rounded font-bold whitespace-nowrap truncate leading-none ${colors.badge}`}
+                                    >
+                                      {barMeta.targetDisplay}
                                     </span>
-                                  )}
-                                  <span className="opacity-80 text-[11px] truncate hidden md:inline">
-                                    · {sch.style}
-                                  </span>
+                                  </div>
                                 </div>
 
-                                <div className="flex items-center gap-1 shrink-0 ml-1">
-                                  {sch.worksheets && sch.worksheets.length > 0 && (
-                                    <span
-                                      className="text-[10px] bg-white/25 px-1 py-0.2 rounded flex items-center gap-0.5 font-bold"
-                                      title={`${sch.worksheets.length} file Excel terlampir`}
-                                    >
-                                      <Paperclip className="w-2.5 h-2.5" />
-                                      <span>{sch.worksheets.length}</span>
-                                    </span>
-                                  )}
-                                  <span className={`text-[10px] font-mono px-1 py-0.2 rounded font-bold ${colors.badge}`}>
-                                    {formatPpicNumber(sch.target)}
+                                {/* Baris 2: No. WH & Style lengkap */}
+                                <div className="flex items-center gap-1 w-full min-w-0 leading-none">
+                                  <span
+                                    data-bar-field="wh"
+                                    className={`${whTextClass} font-mono font-semibold shrink-0 whitespace-nowrap truncate max-w-[56%] leading-none opacity-95`}
+                                  >
+                                    {barMeta.whNumber}
+                                  </span>
+                                  <span className="text-[9px] opacity-60 shrink-0 leading-none">·</span>
+                                  <span
+                                    data-bar-field="style"
+                                    className={`${styleTextClass} font-medium opacity-95 truncate min-w-0 flex-1 leading-none`}
+                                  >
+                                    {barMeta.style}
                                   </span>
                                 </div>
                               </button>
@@ -2163,6 +2254,59 @@ export const ProductionScheduleView: React.FC = () => {
           </div>
         </div>
         </div>
+
+      {/* Floating Unclipped Hover Tooltip for Gantt Schedule Bars */}
+      {hoveredBarTooltip && (
+        <div
+          role="tooltip"
+          data-testid="gantt-bar-hover-tooltip"
+          style={{
+            left: `${Math.min(
+              Math.max(12, hoveredBarTooltip.anchorRect.left),
+              typeof window !== 'undefined' ? Math.max(12, window.innerWidth - 332) : 600
+            )}px`,
+            top:
+              hoveredBarTooltip.anchorRect.bottom + 140 <=
+              (typeof window !== 'undefined' ? window.innerHeight : 800)
+                ? `${hoveredBarTooltip.anchorRect.bottom + 6}px`
+                : `${Math.max(8, hoveredBarTooltip.anchorRect.top - 122)}px`,
+          }}
+          className="fixed z-[90] w-80 max-w-[calc(100vw-24px)] pointer-events-none bg-slate-900/95 text-white border border-slate-700 rounded-lg shadow-xl p-2.5 text-[11px] space-y-1"
+        >
+          <div className="flex items-center justify-between gap-2 border-b border-slate-700/80 pb-1">
+            <span className="font-mono font-bold text-blue-300">
+              {hoveredBarTooltip.meta.orDisplay}
+            </span>
+            <span className="font-mono font-bold bg-blue-600/30 border border-blue-400/40 text-blue-100 px-1.5 py-0.5 rounded text-[10px]">
+              {hoveredBarTooltip.meta.targetDisplay}
+            </span>
+          </div>
+          <div className="flex items-center gap-1.5 text-[10px]">
+            <span className="text-slate-400 shrink-0">No. WH:</span>
+            <span className="font-mono font-semibold text-slate-100">
+              {hoveredBarTooltip.meta.whNumber}
+            </span>
+          </div>
+          <div className="text-[11px] leading-snug">
+            <span className="text-slate-400 mr-1">Style:</span>
+            <span className="font-medium text-white break-words">
+              {hoveredBarTooltip.meta.style}
+            </span>
+          </div>
+          <div className="flex items-center justify-between gap-2 pt-1 border-t border-slate-800 text-[10px] text-slate-300">
+            <span>{hoveredBarTooltip.lineLabel}</span>
+            <span className="font-mono">
+              {hoveredBarTooltip.productionDate} s/d {hoveredBarTooltip.finishDate}
+            </span>
+          </div>
+          {hoveredBarTooltip.hasConflict && (
+            <div className="text-[10px] text-amber-300 font-semibold flex items-center gap-1">
+              <AlertTriangle className="w-3 h-3 shrink-0" />
+              <span>Bentrok jadwal pada Line yang sama</span>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Line Conflict Diagnostic Modal */}
       {activeLineConflictAudit && (

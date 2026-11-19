@@ -59,6 +59,7 @@ export interface WorksheetPdfItem {
   worksheetNo?: string; // Nomor Produksi (Reference Excel) atau No. Worksheet legacy
   style: string;
   target: number;
+  targetUnit?: string;
   materials: WorksheetMaterialItem[];
   error?: string;
   uploadedAt?: string;
@@ -78,6 +79,7 @@ export interface ProductionSchedule {
   productionLine: string; // Line 1, Line 2, Line 3, etc.
   style: string;
   target: number; // Positif
+  targetUnit?: string;
   status?: 'Terjadwal' | 'Sedang Berjalan' | 'Selesai' | 'Tertunda';
   notes?: string;
   worksheets?: WorksheetPdfItem[]; // Multiple PDF Worksheets attached to this schedule
