@@ -2165,7 +2165,6 @@ export const ProductionScheduleView: React.FC = () => {
                                 className={`absolute pointer-events-auto rounded-md shadow-xs ${paddingClass} cursor-pointer transition-colors duration-150 flex flex-col justify-between text-left overflow-hidden group ${colors.bg} ${colors.border} ${colors.text} ${
                                   conflictInfo ? 'ring-2 ring-amber-400/90' : ''
                                 }`}
-                                title={barMeta.tooltipText}
                               >
                                 {/* Baris 1: No. OR (kiri) & Target Produksi + satuan (kanan) */}
                                 <div className="flex items-center justify-between gap-1 w-full min-w-0 leading-none">
@@ -2180,7 +2179,7 @@ export const ProductionScheduleView: React.FC = () => {
                                     {barMeta.density === 'wide' && sch.worksheets && sch.worksheets.length > 0 && (
                                       <span
                                         className="text-[9px] bg-white/25 px-1 py-[1px] rounded flex items-center gap-0.5 font-bold shrink-0 leading-none"
-                                        title={`${sch.worksheets.length} file Excel terlampir`}
+                                        aria-label={`${sch.worksheets.length} file Excel terlampir`}
                                       >
                                         <Paperclip className="w-2.5 h-2.5" />
                                         <span>{sch.worksheets.length}</span>
