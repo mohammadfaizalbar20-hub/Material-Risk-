@@ -39,7 +39,7 @@ import {
   savePendingUploadRows,
   validateFileMatchWithCheckpoint,
 } from '../../utils/uploadOfflineStorage';
-import { generateDeterministicRowUuid } from '../../lib/supabase';
+import { generateDeterministicRowUuid, UploadProgressCallbackInfo } from '../../lib/supabase';
 import { ScheduleAutoSyncSummary } from '../../utils/masterDataScheduleSync';
 
 export const UploadExcelView: React.FC = () => {
@@ -83,16 +83,9 @@ export const UploadExcelView: React.FC = () => {
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [scheduleSyncBanner, setScheduleSyncBanner] = useState<ScheduleAutoSyncSummary | null>(null);
 
-  // Real-time animated batch upload progress (Supports 20,000+ rows daily)
-  const [batchProgress, setBatchProgress] = useState<{
-    currentBatch: number;
-    totalBatches: number;
-    rowsInserted: number;
-    totalRows: number;
-    percent: number;
-    currentChunkRows: number;
-    statusText: string;
-  } | null>(null);
+  // Real-time animated batch upload & schedule sync progress (Supports 20,000+ rows daily)
+  const [batchProgress, setBatchProgress] = useState<UploadProgressCallbackInfo | null>(null);
+  const [retrySyncProgress, setRetrySyncProgress] = useState<UploadProgressCallbackInfo | null>(null);
   const [batchErrorDetails, setBatchErrorDetails] = useState<{
     failedBatch?: number;
     failingRange?: string;
@@ -769,11 +762,30 @@ export const UploadExcelView: React.FC = () => {
                   key={rec.targetOr}
                   className="p-3 rounded-lg bg-white border border-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
                 >
-                  <div className="space-y-0.5">
+                  <div className="space-y-1 flex-1 min-w-0">
                     <div className="font-bold text-slate-900">
                       OR {rec.targetOr} · {rec.syncedCount}/{rec.totalTargetSchedules} jadwal berhasil, {rec.failedDetails.length || 'sebagian'} gagal
                     </div>
                     <div className="text-[11px] text-rose-700">{rec.lastError}</div>
+                    {isRetrying && retrySyncProgress && (
+                      <div className="mt-2 pt-2 border-t border-amber-100 space-y-1">
+                        <div className="flex items-center justify-between text-[11px] font-semibold text-slate-700">
+                          <span>{retrySyncProgress.statusText}</span>
+                          <span className="font-mono text-amber-800">{retrySyncProgress.percent}%</span>
+                        </div>
+                        <div className="w-full bg-amber-100 rounded-full h-1.5 overflow-hidden">
+                          <div
+                            className="bg-amber-600 h-full transition-all duration-200 rounded-full"
+                            style={{ width: `${retrySyncProgress.percent}%` }}
+                          />
+                        </div>
+                        {retrySyncProgress.totalSchedules !== undefined && (
+                          <div className="text-[10px] text-slate-600 font-mono">
+                            Target: {retrySyncProgress.totalSchedules} jadwal · Berhasil: {retrySyncProgress.syncedSchedules ?? 0} · Gagal: {retrySyncProgress.failedSchedules ?? 0}
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </div>
                   <div className="flex items-center gap-2 shrink-0">
                     <button
@@ -781,7 +793,11 @@ export const UploadExcelView: React.FC = () => {
                       disabled={isRetrying}
                       onClick={async () => {
                         setErrorMessage(null);
-                        const retryRes = await retryPendingScheduleSync(rec.targetOr);
+                        setRetrySyncProgress(null);
+                        const retryRes = await retryPendingScheduleSync(rec.targetOr, (info) =>
+                          setRetrySyncProgress(info)
+                        );
+                        setRetrySyncProgress(null);
                         if (retryRes.status === 'success' || retryRes.status === 'no_schedules') {
                           setScheduleSyncBanner(null);
                           setStatusMessage(
@@ -1444,23 +1460,44 @@ export const UploadExcelView: React.FC = () => {
         </div>
       </div>
 
-      {/* REAL-TIME BATCH UPLOAD PROGRESS MODAL (Scale: 20,000+ daily rows) */}
-      {(batchProgress || (isProcessing && previewData)) && (
+      {/* REAL-TIME BATCH UPLOAD & SCHEDULE SYNC PROGRESS MODAL (Scale: 20,000+ daily rows) */}
+      {(batchProgress || (isProcessing && previewData)) && (() => {
+        const isFullyCompleted =
+          batchProgress?.phase === 'completed' &&
+          batchProgress.percent === 100 &&
+          (batchProgress.failedSchedules ?? 0) === 0;
+        const isSchedulePhase =
+          batchProgress?.phase === 'schedule_sync' ||
+          batchProgress?.phase === 'completed' ||
+          batchProgress?.phase === 'partial_failure' ||
+          batchProgress?.phase === 'failed';
+        const isSyncFailedPhase =
+          batchProgress?.phase === 'partial_failure' || batchProgress?.phase === 'failed';
+
+        return (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
           <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-lg w-full p-6 space-y-5 animate-in fade-in zoom-in-95 duration-200">
             <div className="flex items-start justify-between">
               <div>
                 <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded text-[11px] font-bold bg-blue-50 text-blue-700 border border-blue-200 mb-1">
-                  <RefreshCw className={`w-3.5 h-3.5 ${batchProgress?.percent !== 100 ? 'animate-spin text-blue-600' : 'text-emerald-600'}`} />
-                  High-Volume Batch Engine (500 baris/batch)
+                  <RefreshCw className={`w-3.5 h-3.5 ${!isFullyCompleted && !isSyncFailedPhase ? 'animate-spin text-blue-600' : isSyncFailedPhase ? 'text-amber-600' : 'text-emerald-600'}`} />
+                  {isSchedulePhase
+                    ? 'Sinkronisasi Otomatis Master Data → Production Schedule'
+                    : 'High-Volume Batch Engine (500 baris/batch)'}
                 </div>
                 <h3 className="text-base font-bold text-slate-900">
-                  {batchProgress?.percent === 100
-                    ? 'Penyimpanan Selesai Sepenuhnya!'
-                    : 'Menyimpan Data Material ke Database...'}
+                  {isFullyCompleted
+                    ? 'Penyimpanan & Sinkronisasi Selesai Sepenuhnya!'
+                    : isSyncFailedPhase
+                      ? 'Sinkronisasi Production Schedule Belum Lengkap'
+                      : isSchedulePhase
+                        ? 'Menyinkronkan Pemeriksaan Material ke Production Schedule...'
+                        : 'Menyimpan Data Material ke Database...'}
                 </h3>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  Setiap batch diverifikasi atomik dengan 3x percobaan ulang otomatis demi integritas data jutaan baris.
+                  {isSchedulePhase
+                    ? 'Memperbarui snapshot kesiapan material seluruh jadwal terkait OR ini secara paralel & atomik.'
+                    : 'Setiap batch diverifikasi atomik dengan 3x percobaan ulang otomatis demi integritas data.'}
                 </p>
               </div>
             </div>
@@ -1489,34 +1526,71 @@ export const UploadExcelView: React.FC = () => {
             <div className="space-y-2">
               <div className="flex items-center justify-between text-xs font-semibold">
                 <span className="text-slate-700">
-                  {batchProgress
-                    ? `Batch ${batchProgress.currentBatch} dari ${batchProgress.totalBatches}`
-                    : 'Mempersiapkan batch...'}
+                  {isSchedulePhase
+                    ? 'Tahap 2: Sinkronisasi Production Schedule'
+                    : batchProgress
+                      ? `Tahap 1: Batch ${batchProgress.currentBatch} dari ${batchProgress.totalBatches}`
+                      : 'Mempersiapkan batch...'}
                 </span>
-                <span className="font-mono text-blue-600 text-sm font-bold">
+                <span className="font-mono text-blue-600 text-sm font-bold" data-testid="upload-sync-percent">
                   {batchProgress ? `${batchProgress.percent}%` : '0%'}
                 </span>
               </div>
               <div className="w-full bg-slate-100 rounded-full h-3 overflow-hidden border border-slate-200">
                 <div
-                  className="bg-gradient-to-r from-blue-600 via-indigo-600 to-emerald-500 h-full transition-all duration-300 rounded-full"
+                  className={`h-full transition-all duration-300 rounded-full ${
+                    isSyncFailedPhase
+                      ? 'bg-amber-500'
+                      : 'bg-gradient-to-r from-blue-600 via-indigo-600 to-emerald-500'
+                  }`}
                   style={{ width: `${batchProgress ? batchProgress.percent : 5}%` }}
                 />
               </div>
               <div className="flex items-center justify-between text-[11px] text-slate-500">
                 <span>
                   {batchProgress
-                    ? `${batchProgress.rowsInserted.toLocaleString('id-ID')} / ${batchProgress.totalRows.toLocaleString('id-ID')} baris tersimpan`
+                    ? `${batchProgress.rowsInserted.toLocaleString('id-ID')} / ${batchProgress.totalRows.toLocaleString('id-ID')} baris Master Data tersimpan`
                     : 'Menginisialisasi koneksi...'}
                 </span>
                 <span className="text-slate-400">Ukuran batch: 500 baris</span>
               </div>
             </div>
 
+            {/* Schedule Sync Detailed Metrics (shown once schedule sync begins) */}
+            {batchProgress && batchProgress.totalSchedules !== undefined && (
+              <div
+                data-testid="schedule-sync-progress-metrics"
+                className="p-3 bg-slate-50 border border-slate-200 rounded-xl grid grid-cols-3 gap-2 text-xs"
+              >
+                <div>
+                  <span className="text-[10px] text-slate-500 block">Jadwal Perlu Diperbarui</span>
+                  <span className="font-mono font-bold text-slate-900">
+                    {batchProgress.totalSchedules} jadwal
+                  </span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-500 block">Berhasil Diperbarui</span>
+                  <span className="font-mono font-bold text-emerald-700">
+                    {batchProgress.syncedSchedules ?? 0} jadwal
+                  </span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-500 block">Gagal Diperbarui</span>
+                  <span
+                    className={`font-mono font-bold ${
+                      (batchProgress.failedSchedules ?? 0) > 0 ? 'text-rose-600' : 'text-slate-700'
+                    }`}
+                  >
+                    {batchProgress.failedSchedules ?? 0} jadwal
+                  </span>
+                </div>
+              </div>
+            )}
+
             {/* Live Status Text */}
             <div className="p-3 bg-blue-50/70 border border-blue-200 rounded-xl text-xs text-blue-900 flex items-center gap-2.5">
-              <RefreshCw className={`w-4 h-4 shrink-0 text-blue-600 ${batchProgress?.percent !== 100 ? 'animate-spin' : ''}`} />
-              <span className="font-medium text-[11px]">
+              <RefreshCw className={`w-4 h-4 shrink-0 text-blue-600 ${!isFullyCompleted && !isSyncFailedPhase ? 'animate-spin' : ''}`} />
+              <span className="font-medium text-[11px]" data-testid="upload-sync-status-text">
                 {batchProgress?.statusText || statusMessage || 'Sedang memproses batch...'}
               </span>
             </div>
@@ -1554,7 +1628,8 @@ export const UploadExcelView: React.FC = () => {
             )}
           </div>
         </div>
-      )}
+        );
+      })()}
     </div>
   );
 };

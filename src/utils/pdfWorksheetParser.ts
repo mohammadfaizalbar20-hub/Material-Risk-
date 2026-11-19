@@ -307,6 +307,28 @@ export function areOrNumbersMatching(orA?: string | null, orB?: string | null): 
 }
 
 /**
+ * Extracts sanitized search tokens for server-side OR filtering (PostgREST ilike).
+ * Preserves compatibility across formats such as '1036', '01036', 'OR-1036', and 'OR/2026/09/1036'.
+ */
+export function extractOrSearchTokens(orNumber?: string | null): string[] {
+  const raw = String(orNumber || '').trim().toUpperCase();
+  if (!raw || raw === '-') return [];
+
+  const sanitize = (tok: string): string =>
+    tok.replace(/[,()%*"'\\]/g, '').trim();
+
+  const candidates = [
+    normalizeOrForMatching(raw),
+    extractOrNumberFromIdentifier(raw),
+    raw,
+  ]
+    .map(sanitize)
+    .filter((t) => t.length > 0 && t !== '-');
+
+  return Array.from(new Set(candidates));
+}
+
+/**
  * Detects whether a document primarily uses Indonesian/European formatting ('.' thousands, ',' decimal)
  * or US/English formatting (',' thousands, '.' decimal).
  */
@@ -2038,55 +2060,86 @@ function getMasterCandidateReadiness(mr: MaterialItemRequirement): {
   };
 }
 
+export interface PreparedMasterOrMatchingContext {
+  orNumber: string;
+  latestUpload: UploadHistoryItem | null;
+  latestOrRecords: MaterialItemRequirement[];
+  candidatesByCode: Map<string, MaterialItemRequirement[]>;
+  matchedUploadId: string | null;
+  matchedUploadDate: string | null;
+  matchedUploadTime: string | null;
+  matchedUploadCreatedAt: string | null;
+}
+
 /**
- * Matches extracted Schedule materials against ONLY the latest Excel upload for the schedule's No. OR.
- * Rules:
- * - Match strictly on same No. OR + Kode Material from the single latest Master Data Excel upload for that OR
- * - Do NOT fall back to older uploads for the same OR
- * - Do NOT take data from other ORs
- * - NEVER arbitrarily sum/merge multiple Master Data rows sharing the same material code
- * - Preserves order and keeps duplicate Schedule material rows separate
- * - When Master Data contains multiple rows for the same material code, pairs Schedule rows 1-to-1
- *   against distinct Master Data rows (scoring exact Kebutuhan, Nama Material, Unit) without double-counting
- *   a consumed row; leaves excess unmatched Schedule rows as null ('-')
+ * Pre-resolves the latest Excel upload for `orNumber` and pre-indexes its rows by materialCode
+ * ONCE so syncing multiple schedules/worksheets for the same OR performs O(1) lookup per code
+ * without re-scanning Master Data or merging duplicate material rows.
  */
-export function matchMaterialsWithMasterData(
-  materials: ExtractedWorksheetMaterial[],
+export function prepareMasterOrMatchingContext(
   orNumber: string,
   masterRequirements: MaterialItemRequirement[],
-  uploadHistory: UploadHistoryItem[] = [],
-  matchedAtIso?: string
-): WorksheetMaterialMatched[] {
+  uploadHistory: UploadHistoryItem[] = []
+): PreparedMasterOrMatchingContext {
   const { latestUpload, rows: latestOrRecords } = findLatestUploadForOr(
     orNumber,
     masterRequirements,
     uploadHistory
   );
 
-  const matchedAt = matchedAtIso || new Date().toISOString();
-  const matchedUploadId = latestUpload?.id || null;
-  const matchedUploadDate = latestUpload?.updateDate || latestOrRecords[0]?.updateDate || null;
-  const matchedUploadTime = latestUpload?.uploadTime || null;
-  const matchedUploadCreatedAt = latestUpload?.createdAt || null;
-
-  // Group rows from ONLY the latest upload for this OR by material code without summing/merging
   const candidatesByCode = new Map<string, MaterialItemRequirement[]>();
   for (const mr of latestOrRecords) {
     const key = mr.materialCode.trim().toUpperCase();
     if (!key) continue;
-    const list = candidatesByCode.get(key) || [];
+    let list = candidatesByCode.get(key);
+    if (!list) {
+      list = [];
+      candidatesByCode.set(key, list);
+    }
     list.push(mr);
-    candidatesByCode.set(key, list);
   }
+
+  return {
+    orNumber,
+    latestUpload,
+    latestOrRecords,
+    candidatesByCode,
+    matchedUploadId: latestUpload?.id || null,
+    matchedUploadDate: latestUpload?.updateDate || latestOrRecords[0]?.updateDate || null,
+    matchedUploadTime: latestUpload?.uploadTime || null,
+    matchedUploadCreatedAt: latestUpload?.createdAt || null,
+  };
+}
+
+/**
+ * Matches extracted Schedule materials against a pre-indexed PreparedMasterOrMatchingContext.
+ * Preserves 1-to-1 pairing for duplicate material rows without summing/merging.
+ */
+export function matchMaterialsWithPreparedContext(
+  materials: ExtractedWorksheetMaterial[],
+  context: PreparedMasterOrMatchingContext,
+  matchedAtIso?: string
+): WorksheetMaterialMatched[] {
+  const matchedAt = matchedAtIso || new Date().toISOString();
+  const {
+    candidatesByCode,
+    matchedUploadId,
+    matchedUploadDate,
+    matchedUploadTime,
+    matchedUploadCreatedAt,
+  } = context;
 
   // Group schedule row indices by material code so multi-candidate codes can be paired 1-to-1
   const schedIndicesByCode = new Map<string, number[]>();
   materials.forEach((item, idx) => {
     const key = item.materialCode.trim().toUpperCase();
     if (!key) return;
-    const list = schedIndicesByCode.get(key) || [];
+    let list = schedIndicesByCode.get(key);
+    if (!list) {
+      list = [];
+      schedIndicesByCode.set(key, list);
+    }
     list.push(idx);
-    schedIndicesByCode.set(key, list);
   });
 
   const assignedMasterBySchedIdx = new Map<number, MaterialItemRequirement>();
@@ -2198,6 +2251,29 @@ export function matchMaterialsWithMasterData(
 }
 
 /**
+ * Matches extracted Schedule materials against ONLY the latest Excel upload for the schedule's No. OR.
+ * Rules:
+ * - Match strictly on same No. OR + Kode Material from the single latest Master Data Excel upload for that OR
+ * - Do NOT fall back to older uploads for the same OR
+ * - Do NOT take data from other ORs
+ * - NEVER arbitrarily sum/merge multiple Master Data rows sharing the same material code
+ * - Preserves order and keeps duplicate Schedule material rows separate
+ * - When Master Data contains multiple rows for the same material code, pairs Schedule rows 1-to-1
+ *   against distinct Master Data rows (scoring exact Kebutuhan, Nama Material, Unit) without double-counting
+ *   a consumed row; leaves excess unmatched Schedule rows as null ('-')
+ */
+export function matchMaterialsWithMasterData(
+  materials: ExtractedWorksheetMaterial[],
+  orNumber: string,
+  masterRequirements: MaterialItemRequirement[],
+  uploadHistory: UploadHistoryItem[] = [],
+  matchedAtIso?: string
+): WorksheetMaterialMatched[] {
+  const context = prepareMasterOrMatchingContext(orNumber, masterRequirements, uploadHistory);
+  return matchMaterialsWithPreparedContext(materials, context, matchedAtIso);
+}
+
+/**
  * Freezes a complete material snapshot onto a WorksheetPdfItem using the latest Excel upload per OR.
  * Preserves all original PDF fields verbatim.
  */
@@ -2205,20 +2281,18 @@ export function buildWorksheetSnapshot(
   worksheet: WorksheetPdfItem,
   masterRequirements: MaterialItemRequirement[],
   uploadHistory: UploadHistoryItem[] = [],
-  syncTimestampIso?: string
+  syncTimestampIso?: string,
+  preparedContext?: PreparedMasterOrMatchingContext
 ): WorksheetPdfItem {
   const timestamp = syncTimestampIso || new Date().toISOString();
-  const { latestUpload } = findLatestUploadForOr(
-    worksheet.orNumber,
-    masterRequirements,
-    uploadHistory
-  );
+  const context =
+    preparedContext ||
+    prepareMasterOrMatchingContext(worksheet.orNumber, masterRequirements, uploadHistory);
+  const { latestUpload } = context;
 
-  const matchedMaterials = matchMaterialsWithMasterData(
+  const matchedMaterials = matchMaterialsWithPreparedContext(
     worksheet.materials,
-    worksheet.orNumber,
-    masterRequirements,
-    uploadHistory,
+    context,
     timestamp
   );
 

@@ -816,6 +816,10 @@ export interface UploadProgressCallbackInfo {
   percent: number;
   currentChunkRows: number;
   statusText: string;
+  phase?: 'master_data' | 'schedule_sync' | 'completed' | 'partial_failure' | 'failed';
+  totalSchedules?: number;
+  syncedSchedules?: number;
+  failedSchedules?: number;
 }
 
 /**
@@ -1776,6 +1780,66 @@ export async function fetchSchedulesFromSupabase(): Promise<{
 }
 
 /**
+ * Fetches ONLY Production Schedules that may match `targetOr` from Supabase (filtered server-side
+ * by OR tokens across `or_number` and embedded worksheet `notes`), avoiding full-table downloads
+ * of unrelated schedules while preserving full worksheet & user-note payloads.
+ */
+export async function fetchSchedulesMatchingOrFromSupabase(
+  targetOr: string
+): Promise<{
+  connected: boolean;
+  schedules: ProductionSchedule[];
+  error?: string;
+}> {
+  const supabase = getSupabaseClient();
+  if (!supabase) {
+    return {
+      connected: false,
+      schedules: [],
+      error: 'Koneksi Supabase belum terkonfigurasi.',
+    };
+  }
+
+  try {
+    const { extractOrSearchTokens } = await import('../utils/pdfWorksheetParser');
+    const tokens = extractOrSearchTokens(targetOr);
+    if (tokens.length === 0) {
+      return fetchSchedulesFromSupabase();
+    }
+
+    const orClauses = tokens
+      .slice(0, 4)
+      .flatMap((tok) => [`or_number.ilike.%${tok}%`, `notes.ilike.%${tok}%`])
+      .join(',');
+
+    const { data, error } = await supabase
+      .from('production_schedules')
+      .select('*')
+      .or(orClauses)
+      .order('production_date', { ascending: true });
+
+    if (error) {
+      return {
+        connected: false,
+        schedules: [],
+        error: error.message || 'Gagal membaca jadwal produksi terkait OR dari Supabase.',
+      };
+    }
+
+    return {
+      connected: true,
+      schedules: (data || []).map(mapDbScheduleToModel),
+    };
+  } catch (err: any) {
+    return {
+      connected: false,
+      schedules: [],
+      error: err?.message || 'Gagal membaca jadwal produksi terkait OR dari Supabase.',
+    };
+  }
+}
+
+/**
  * Updates ONLY the 4-layer material snapshot for a schedule in Supabase via the existing
  * atomic RPC `sync_production_schedule_snapshots`. Never modifies schedule metadata
  * (`or_number`, `style`, `production_line`, `production_date`, `finish_date`, `target`, `status`).
@@ -1824,14 +1888,31 @@ export async function fetchLatestUploadMaterialsForOrs(
       return { connected: true, uploadHistory: [], materialRequirements: [] };
     }
 
-    const { data: histRows, error: histErr } = await supabase
+    const { findLatestUploadForOr, extractOrSearchTokens } = await import(
+      '../utils/pdfWorksheetParser'
+    );
+
+    let histQuery = supabase
       .from('upload_history')
       .select('*')
-      .neq('status', 'Gagal')
+      .neq('status', 'Gagal');
+
+    if (cleanOrs.length <= 10) {
+      const allTokens = Array.from(
+        new Set(cleanOrs.flatMap((orNum) => extractOrSearchTokens(orNum)))
+      ).slice(0, 20);
+      if (allTokens.length > 0) {
+        histQuery = histQuery.or(
+          allTokens.map((tok) => `or_number.ilike.%${tok}%`).join(',')
+        );
+      }
+    }
+
+    const { data: histRows, error: histErr } = await histQuery
       .order('created_at', { ascending: false })
       .order('update_date', { ascending: false })
       .order('id', { ascending: false })
-      .limit(2000);
+      .limit(cleanOrs.length <= 10 ? 250 : 2000);
 
     if (histErr) {
       console.warn('Failed to fetch upload_history for latest OR resolution:', histErr.message);
@@ -1839,7 +1920,6 @@ export async function fetchLatestUploadMaterialsForOrs(
     }
 
     const mappedHist = (histRows || []).map(mapDbUploadHistoryToModel);
-    const { findLatestUploadForOr } = await import('../utils/pdfWorksheetParser');
 
     const selectedUploadIds = new Set<string>();
     const selectedHist: UploadHistoryItem[] = [];

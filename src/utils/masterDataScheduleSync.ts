@@ -4,7 +4,22 @@ import {
   UploadHistoryItem,
   WorksheetPdfItem,
 } from '../types/ppic';
-import { areOrNumbersMatching, buildWorksheetSnapshot } from './pdfWorksheetParser';
+import {
+  areOrNumbersMatching,
+  buildWorksheetSnapshot,
+  PreparedMasterOrMatchingContext,
+  prepareMasterOrMatchingContext,
+} from './pdfWorksheetParser';
+
+export interface ScheduleSyncProgressInfo {
+  totalSchedules: number;
+  completedSchedules: number;
+  syncedSchedules: number;
+  failedSchedules: number;
+  percent: number;
+  currentScheduleId?: string;
+  currentScheduleLabel?: string;
+}
 
 export interface ScheduleSyncFailureDetail {
   scheduleId: string;
@@ -99,7 +114,8 @@ export function buildScheduleMaterialSyncUpdate(
   targetOr: string,
   masterRequirements: MaterialItemRequirement[],
   uploadHistory: UploadHistoryItem[] = [],
-  syncTimestampIso?: string
+  syncTimestampIso?: string,
+  preparedContext?: PreparedMasterOrMatchingContext
 ): { hasMatchingWorksheet: boolean; updatedSchedule: ProductionSchedule } {
   const timestamp = syncTimestampIso || new Date().toISOString();
   if (!Array.isArray(schedule.worksheets) || schedule.worksheets.length === 0) {
@@ -114,8 +130,14 @@ export function buildScheduleMaterialSyncUpdate(
     }
 
     hasMatchingWorksheet = true;
-    // Match against `targetOr` when wsOr uses a compatible variant, while preserving ws.orNumber verbatim
-    const snapshot = buildWorksheetSnapshot(ws, masterRequirements, uploadHistory, timestamp);
+    // Match against `targetOr` using pre-indexed context when available, while preserving ws metadata verbatim
+    const snapshot = buildWorksheetSnapshot(
+      ws,
+      masterRequirements,
+      uploadHistory,
+      timestamp,
+      preparedContext
+    );
     return {
       ...snapshot,
       id: ws.id,
@@ -125,6 +147,7 @@ export function buildScheduleMaterialSyncUpdate(
       worksheetNo: ws.worksheetNo,
       style: ws.style,
       target: ws.target,
+      targetUnit: ws.targetUnit,
       uploadedAt: ws.uploadedAt,
       error: ws.error,
     };
@@ -161,6 +184,8 @@ export async function syncSchedulesForMasterDataOr(params: {
   ) => Promise<{ success: boolean; error?: string }>;
   targetScheduleIds?: string[];
   syncTimestampIso?: string;
+  concurrency?: number;
+  onProgress?: (info: ScheduleSyncProgressInfo) => void;
 }): Promise<ScheduleAutoSyncSummary> {
   const syncTimestamp = params.syncTimestampIso || new Date().toISOString();
   const targetFilterSet =
@@ -188,9 +213,17 @@ export async function syncSchedulesForMasterDataOr(params: {
     };
   }
 
-  const syncedScheduleIds: string[] = [];
-  const failedSchedules: ScheduleSyncFailureDetail[] = [];
-  const updatedSchedulesById: Record<string, ProductionSchedule> = {};
+  // Build OR Master Data lookup index ONCE in memory for the entire batch of matching schedules
+  const preparedContext = prepareMasterOrMatchingContext(
+    params.targetOr,
+    params.masterRequirements,
+    params.uploadHistory
+  );
+
+  const preparedTargets: Array<{
+    original: ProductionSchedule;
+    updated: ProductionSchedule;
+  }> = [];
 
   for (const sch of matchingSchedules) {
     const { hasMatchingWorksheet, updatedSchedule } = buildScheduleMaterialSyncUpdate(
@@ -198,37 +231,121 @@ export async function syncSchedulesForMasterDataOr(params: {
       params.targetOr,
       params.masterRequirements,
       params.uploadHistory,
-      syncTimestamp
+      syncTimestamp,
+      preparedContext
     );
+    if (hasMatchingWorksheet) {
+      preparedTargets.push({ original: sch, updated: updatedSchedule });
+    }
+  }
 
-    if (!hasMatchingWorksheet) continue;
+  if (preparedTargets.length === 0) {
+    return {
+      status: 'no_schedules',
+      targetOr: params.targetOr,
+      uploadId: params.uploadId,
+      updateDate: params.updateDate,
+      matchedScheduleCount: 0,
+      syncedScheduleIds: [],
+      failedSchedules: [],
+      updatedSchedulesById: {},
+      syncedAt: syncTimestamp,
+    };
+  }
 
-    try {
-      const persistRes = await params.persistScheduleSnapshot(updatedSchedule);
-      if (persistRes.success) {
-        syncedScheduleIds.push(sch.id);
-        updatedSchedulesById[sch.id] = updatedSchedule;
-      } else {
-        failedSchedules.push({
-          scheduleId: sch.id,
-          orNumber: sch.orNumber,
-          worksheetNo: sch.worksheets?.[0]?.worksheetNo,
-          style: sch.style,
-          productionLine: sch.productionLine,
-          error:
-            persistRes.error ||
-            'Gagal menyimpan pembaruan snapshot material ke database.',
+  const totalToSync = preparedTargets.length;
+  params.onProgress?.({
+    totalSchedules: totalToSync,
+    completedSchedules: 0,
+    syncedSchedules: 0,
+    failedSchedules: 0,
+    percent: 0,
+  });
+
+  type PerScheduleOutcome =
+    | { ok: true; schedule: ProductionSchedule }
+    | { ok: false; failure: ScheduleSyncFailureDetail };
+
+  const outcomes: PerScheduleOutcome[] = new Array(totalToSync);
+  let nextIndex = 0;
+  let completedCount = 0;
+  let syncedCount = 0;
+  let failedCount = 0;
+
+  const workerCount = Math.min(
+    Math.max(1, Math.floor(params.concurrency ?? 5)),
+    totalToSync
+  );
+
+  const runWorker = async () => {
+    while (true) {
+      const currentIdx = nextIndex;
+      if (currentIdx >= totalToSync) return;
+      nextIndex++;
+
+      const { original: sch, updated: updatedSchedule } = preparedTargets[currentIdx];
+      try {
+        const persistRes = await params.persistScheduleSnapshot(updatedSchedule);
+        if (persistRes.success) {
+          outcomes[currentIdx] = { ok: true, schedule: updatedSchedule };
+          syncedCount++;
+        } else {
+          outcomes[currentIdx] = {
+            ok: false,
+            failure: {
+              scheduleId: sch.id,
+              orNumber: sch.orNumber,
+              worksheetNo: sch.worksheets?.[0]?.worksheetNo,
+              style: sch.style,
+              productionLine: sch.productionLine,
+              error:
+                persistRes.error ||
+                'Gagal menyimpan pembaruan snapshot material ke database.',
+            },
+          };
+          failedCount++;
+        }
+      } catch (err: any) {
+        outcomes[currentIdx] = {
+          ok: false,
+          failure: {
+            scheduleId: sch.id,
+            orNumber: sch.orNumber,
+            worksheetNo: sch.worksheets?.[0]?.worksheetNo,
+            style: sch.style,
+            productionLine: sch.productionLine,
+            error: err?.message || String(err) || 'Kesalahan saat menyinkronkan jadwal.',
+          },
+        };
+        failedCount++;
+      } finally {
+        completedCount++;
+        params.onProgress?.({
+          totalSchedules: totalToSync,
+          completedSchedules: completedCount,
+          syncedSchedules: syncedCount,
+          failedSchedules: failedCount,
+          percent: Math.round((completedCount / totalToSync) * 100),
+          currentScheduleId: sch.id,
+          currentScheduleLabel: `${sch.orNumber}${sch.productionLine ? ` · ${sch.productionLine}` : ''}`,
         });
       }
-    } catch (err: any) {
-      failedSchedules.push({
-        scheduleId: sch.id,
-        orNumber: sch.orNumber,
-        worksheetNo: sch.worksheets?.[0]?.worksheetNo,
-        style: sch.style,
-        productionLine: sch.productionLine,
-        error: err?.message || String(err) || 'Kesalahan saat menyinkronkan jadwal.',
-      });
+    }
+  };
+
+  await Promise.all(Array.from({ length: workerCount }, () => runWorker()));
+
+  const syncedScheduleIds: string[] = [];
+  const failedSchedules: ScheduleSyncFailureDetail[] = [];
+  const updatedSchedulesById: Record<string, ProductionSchedule> = {};
+
+  for (const outcome of outcomes) {
+    if (!outcome) continue;
+    if (outcome.ok) {
+      syncedScheduleIds.push(outcome.schedule.id);
+      updatedSchedulesById[outcome.schedule.id] = outcome.schedule;
+    } else {
+      failedSchedules.push(outcome.failure);
     }
   }
 
@@ -237,7 +354,7 @@ export async function syncSchedulesForMasterDataOr(params: {
 
   if (failedSchedules.length > 0) {
     status = syncedScheduleIds.length > 0 ? 'partial_failure' : 'failed';
-    errorSummary = `${failedSchedules.length} dari ${matchingSchedules.length} jadwal gagal disinkronkan: ${failedSchedules[0].error}`;
+    errorSummary = `${failedSchedules.length} dari ${totalToSync} jadwal gagal disinkronkan: ${failedSchedules[0].error}`;
   }
 
   return {
@@ -245,7 +362,7 @@ export async function syncSchedulesForMasterDataOr(params: {
     targetOr: params.targetOr,
     uploadId: params.uploadId,
     updateDate: params.updateDate,
-    matchedScheduleCount: matchingSchedules.length,
+    matchedScheduleCount: totalToSync,
     syncedScheduleIds,
     failedSchedules,
     updatedSchedulesById,

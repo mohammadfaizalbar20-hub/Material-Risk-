@@ -6,6 +6,7 @@ import {
   UploadHistoryItem,
 } from '../src/types/ppic';
 import {
+  ScheduleSyncProgressInfo,
   applySyncedSchedulesToList,
   buildScheduleMaterialSyncUpdate,
   doesScheduleMatchOr,
@@ -13,7 +14,7 @@ import {
   upsertPendingScheduleSyncRecord,
 } from '../src/utils/masterDataScheduleSync';
 import { buildAtomicSnapshotSyncPayload } from '../src/utils/scheduleSnapshotSync';
-import { areOrNumbersMatching } from '../src/utils/pdfWorksheetParser';
+import { areOrNumbersMatching, extractOrSearchTokens } from '../src/utils/pdfWorksheetParser';
 
 function makeSchedule(params: {
   id: string;
@@ -567,3 +568,219 @@ test('4. Worksheet OR lain di dalam satu jadwal (jika campuran) tidak ikut terti
   assert.equal(updatedSchedule.worksheets![1].materials[0].receivedQty, 2);
   assert.equal(updatedSchedule.worksheets![1].materials[0].status, 'BELUM READY');
 });
+
+test('5. extractOrSearchTokens menghasilkan token pencarian aman lintas format OR', () => {
+  assert.deepEqual(extractOrSearchTokens('1036'), ['1036']);
+  assert.deepEqual(extractOrSearchTokens('01036'), ['1036', '01036']);
+  assert.deepEqual(extractOrSearchTokens('OR/2026/09/1036'), ['1036', 'OR/2026/09/1036']);
+  assert.deepEqual(extractOrSearchTokens('OR-2026-001'), ['2026-001', 'OR-2026-001']);
+  assert.deepEqual(extractOrSearchTokens(''), []);
+  // Karakter spesial PostgREST disanitasi
+  const sanitized = extractOrSearchTokens('OR-1036,("test")');
+  assert.ok(sanitized.every((t) => !/[,()%*"'\\]/.test(t)));
+});
+
+test('6. Progress tracking melaporkan total jadwal, berhasil, gagal, & persentase akurat (tidak pernah 100% sebelum selesai)', async () => {
+  const schedules: ProductionSchedule[] = [1, 2, 3, 4].map((n) =>
+    makeSchedule({
+      id: `44444444-4444-4444-8444-44444444440${n}`,
+      orNumber: '1036',
+      worksheetNo: `WH/MO/0040${n}`,
+      style: `STYLE-${n}`,
+      line: `Line ${n}`,
+      start: `2026-12-0${n}`,
+      finish: `2026-12-1${n}`,
+      target: 100,
+      materials: [
+        { id: `m-${n}`, code: 'FAB-001', name: 'KAIN TASLAN', unit: 'yard', total: 29.5, receivedQty: 0, status: 'BELUM READY' },
+      ],
+    })
+  );
+
+  const masterRequirements: MaterialItemRequirement[] = [
+    {
+      id: 'req-prog-1',
+      uploadId: 'up-prog-1',
+      orNumber: '1036',
+      style: 'STYLE-1',
+      materialCode: 'FAB-001',
+      materialName: 'KAIN TASLAN',
+      category: 'Raw Material',
+      unit: 'yard',
+      requiredQty: 29.5,
+      receivedQty: 29.5,
+      unitPrice: 1000,
+      updateDate: '2026-11-18',
+    },
+  ];
+
+  const uploadHistory: UploadHistoryItem[] = [
+    {
+      id: 'up-prog-1',
+      orNumber: '1036',
+      style: 'STYLE-1',
+      fileName: 'up.xlsx',
+      updateDate: '2026-11-18',
+      uploadTime: '12:00:00 WIB',
+      rowCount: 1,
+      status: 'Sukses',
+      createdAt: '2026-11-18T05:00:00.000Z',
+    },
+  ];
+
+  const progressEvents: ScheduleSyncProgressInfo[] = [];
+  const summary = await syncSchedulesForMasterDataOr({
+    targetOr: '1036',
+    uploadId: 'up-prog-1',
+    updateDate: '2026-11-18',
+    schedules,
+    masterRequirements,
+    uploadHistory,
+    concurrency: 2,
+    onProgress: (info) => progressEvents.push({ ...info }),
+    persistScheduleSnapshot: async () => {
+      await new Promise((r) => setTimeout(r, 10));
+      return { success: true };
+    },
+    syncTimestampIso: '2026-11-18T05:01:00.000Z',
+  });
+
+  assert.equal(summary.status, 'success');
+  assert.equal(progressEvents.length, 5); // 1 initial + 4 completions
+  assert.equal(progressEvents[0].percent, 0);
+  assert.equal(progressEvents[0].totalSchedules, 4);
+  assert.equal(progressEvents[0].completedSchedules, 0);
+  // Intermediate events must never report 100% before all 4 finish
+  for (let i = 1; i < progressEvents.length - 1; i++) {
+    assert.ok(progressEvents[i].percent < 100, 'Progres menengah tidak boleh 100%');
+    assert.equal(progressEvents[i].syncedSchedules, i);
+    assert.equal(progressEvents[i].failedSchedules, 0);
+  }
+  const last = progressEvents[progressEvents.length - 1];
+  assert.equal(last.percent, 100);
+  assert.equal(last.completedSchedules, 4);
+  assert.equal(last.syncedSchedules, 4);
+  assert.equal(last.failedSchedules, 0);
+});
+
+test('7. Benchmark & Integritas 239 baris material + 10 jadwal: eksekusi paralel terukur jauh lebih cepat dari serial dengan hasil identik', async () => {
+  // Bangun 239 baris Master Data (termasuk duplikat & angka desimal persis)
+  const masterRequirements: MaterialItemRequirement[] = Array.from({ length: 239 }, (_, i) => {
+    const isDup = i === 1 || i === 2;
+    const code = isDup ? 'UNI-ACC9026' : `MAT-${String(i + 1).padStart(4, '0')}`;
+    const reqQty = i === 2 ? 1000 : i % 3 === 0 ? 29.5 : 11.88;
+    const recQty = i === 2 ? 750 : reqQty;
+    return {
+      id: `req-bench-${i}`,
+      uploadId: 'upload-239',
+      orNumber: '1036',
+      style: 'BENCH-STYLE',
+      materialCode: code,
+      materialName: `Material ${code}`,
+      category: 'Raw Material',
+      unit: i % 2 === 0 ? 'Pcs' : 'yard',
+      requiredQty: reqQty,
+      receivedQty: recQty,
+      unitPrice: 1000,
+      updateDate: '2026-11-18',
+    };
+  });
+
+  const uploadHistory: UploadHistoryItem[] = [
+    {
+      id: 'upload-239',
+      orNumber: '1036',
+      style: 'BENCH-STYLE',
+      fileName: 'mrp_239.xlsx',
+      updateDate: '2026-11-18',
+      uploadTime: '13:00:00 WIB',
+      rowCount: 239,
+      status: 'Sukses',
+      createdAt: '2026-11-18T06:00:00.000Z',
+    },
+  ];
+
+  // Bangun 10 jadwal OR 1036 masing-masing membawa 40 baris material (termasuk duplikat UNI-ACC9026 & desimal)
+  const schedules: ProductionSchedule[] = Array.from({ length: 10 }, (_, sIdx) =>
+    makeSchedule({
+      id: `55555555-5555-4555-8555-5555555555${String(sIdx + 1).padStart(2, '0')}`,
+      orNumber: '1036',
+      worksheetNo: `WH/MO/50${sIdx + 1}`,
+      style: `STYLE-${sIdx + 1}`,
+      line: `Line ${(sIdx % 5) + 1}`,
+      start: '2026-12-01',
+      finish: '2026-12-10',
+      target: 500,
+      materials: Array.from({ length: 40 }, (__, mIdx) => {
+        const isDup1 = mIdx === 1;
+        const isDup2 = mIdx === 2;
+        const code = isDup1 || isDup2 ? 'UNI-ACC9026' : `MAT-${String(mIdx + 1).padStart(4, '0')}`;
+        const total = isDup2 ? 1000 : mIdx % 3 === 0 ? 29.5 : 11.88;
+        return {
+          id: `ws-${sIdx}-m-${mIdx}`,
+          code,
+          name: `Material ${code}`,
+          unit: mIdx % 2 === 0 ? 'Pcs' : 'yard',
+          total,
+          receivedQty: 0,
+          status: 'BELUM READY',
+        };
+      }),
+    })
+  );
+
+  const simulatedRpc = async () => {
+    await new Promise((r) => setTimeout(r, 40));
+    return { success: true };
+  };
+
+  const t0Serial = performance.now();
+  const serialRes = await syncSchedulesForMasterDataOr({
+    targetOr: '1036',
+    uploadId: 'upload-239',
+    updateDate: '2026-11-18',
+    schedules,
+    masterRequirements,
+    uploadHistory,
+    concurrency: 1,
+    persistScheduleSnapshot: simulatedRpc,
+    syncTimestampIso: '2026-11-18T06:05:00.000Z',
+  });
+  const serialMs = performance.now() - t0Serial;
+
+  const t0Concurrent = performance.now();
+  const concurrentRes = await syncSchedulesForMasterDataOr({
+    targetOr: '1036',
+    uploadId: 'upload-239',
+    updateDate: '2026-11-18',
+    schedules,
+    masterRequirements,
+    uploadHistory,
+    concurrency: 5,
+    persistScheduleSnapshot: simulatedRpc,
+    syncTimestampIso: '2026-11-18T06:05:00.000Z',
+  });
+  const concurrentMs = performance.now() - t0Concurrent;
+
+  assert.equal(serialRes.status, 'success');
+  assert.equal(concurrentRes.status, 'success');
+  assert.deepEqual(concurrentRes.syncedScheduleIds, serialRes.syncedScheduleIds);
+  assert.deepEqual(concurrentRes.updatedSchedulesById, serialRes.updatedSchedulesById);
+  assert.ok(
+    concurrentMs < serialMs * 0.5,
+    `Eksekusi paralel (${concurrentMs.toFixed(1)}ms) harus jauh lebih cepat dari serial (${serialMs.toFixed(1)}ms)`
+  );
+
+  // Validasi duplikat & desimal tetap presisi
+  const firstUpdated = concurrentRes.updatedSchedulesById[schedules[0].id];
+  const mats = firstUpdated.worksheets![0].materials;
+  assert.equal(mats[1].materialCode, 'UNI-ACC9026');
+  assert.equal(mats[1].receivedQty, 11.88);
+  assert.equal(mats[1].status, 'READY');
+  assert.equal(mats[2].materialCode, 'UNI-ACC9026');
+  assert.equal(mats[2].receivedQty, 750);
+  assert.equal(mats[2].status, 'BELUM READY');
+  assert.equal(mats[3].receivedQty, 29.5);
+  assert.equal(mats[3].status, 'READY');
+});
+

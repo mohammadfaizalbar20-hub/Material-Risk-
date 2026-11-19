@@ -47,8 +47,9 @@ import {
   deleteScheduleFromSupabase,
   seedLocalDataToSupabase,
   fetchLatestUploadMaterialsForOrs,
-  fetchSchedulesFromSupabase,
+  fetchSchedulesMatchingOrFromSupabase,
   syncScheduleSnapshotOnlyInSupabase,
+  isValidUuid,
 } from '../lib/supabase';
 import {
   ScheduleCrudResult,
@@ -60,6 +61,7 @@ import {
   PendingScheduleSyncRecord,
   ScheduleAutoSyncSummary,
   applySyncedSchedulesToList,
+  doesScheduleMatchOr,
   loadPendingScheduleSyncsFromStorage,
   savePendingScheduleSyncsToStorage,
   syncSchedulesForMasterDataOr,
@@ -195,7 +197,10 @@ interface PpicContextType {
   }>;
   pendingScheduleSyncs: PendingScheduleSyncRecord[];
   retryingScheduleSyncOr: string | null;
-  retryPendingScheduleSync: (targetOr: string) => Promise<ScheduleAutoSyncSummary>;
+  retryPendingScheduleSync: (
+    targetOr: string,
+    onProgress?: (info: UploadProgressCallbackInfo) => void
+  ) => Promise<ScheduleAutoSyncSummary>;
   dismissPendingScheduleSync: (targetOr: string) => void;
 
   // Master Data Deletion Feature
@@ -1679,6 +1684,9 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       ]);
     }
 
+    const totalReqRows = newRequirements.length;
+    const totalMasterBatches = Math.ceil(totalReqRows / 500) || 1;
+
     // Helper: Execute automatic snapshot sync across ALL Production Schedules with matching No. OR
     const runAutomaticScheduleSync = async (
       finalUploadId: string,
@@ -1686,42 +1694,33 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     ): Promise<ScheduleAutoSyncSummary> => {
       const syncTs = new Date().toISOString();
 
+      // Authoritative latest Master Data for this OR is ALREADY in memory from the just-committed upload
+      const inMemoryHistItem: UploadHistoryItem = {
+        ...newHistItem,
+        id: finalUploadId,
+        status: 'Sukses',
+        rowCount: taggedNewReqs.length,
+        createdAt: finalCreatedAt || newHistItem.createdAt,
+      };
+      const inMemoryReqs: MaterialItemRequirement[] = taggedNewReqs.map((r) => ({
+        ...r,
+        uploadId: finalUploadId,
+        createdAt: finalCreatedAt || r.importedAt,
+      }));
+
       if (getSupabaseCredentials().isConfigured) {
-        if (onProgress) {
-          onProgress({
-            currentBatch: 1,
-            totalBatches: 1,
-            rowsInserted: newRequirements.length,
-            totalRows: newRequirements.length,
-            percent: 100,
-            currentChunkRows: 0,
-            statusText: `Menyinkronkan pemeriksaan material ke seluruh Production Schedule (${primaryOr})...`,
-          });
-        }
+        onProgress?.({
+          currentBatch: totalMasterBatches,
+          totalBatches: totalMasterBatches,
+          rowsInserted: totalReqRows,
+          totalRows: totalReqRows,
+          percent: 72,
+          currentChunkRows: 0,
+          phase: 'schedule_sync',
+          statusText: `Mencari seluruh Production Schedule terkait OR ${primaryOr}...`,
+        });
 
-        const [remoteLatest, remoteSchedules] = await Promise.all([
-          fetchLatestUploadMaterialsForOrs([primaryOr]),
-          fetchSchedulesFromSupabase(),
-        ]);
-
-        if (!remoteLatest || !remoteLatest.connected) {
-          const errMsg =
-            'Master Data tersimpan, namun gagal mengambil Master Data terbaru dari Supabase untuk sinkronisasi otomatis Production Schedule.';
-          const failSummary: ScheduleAutoSyncSummary = {
-            status: 'failed',
-            targetOr: primaryOr,
-            uploadId: finalUploadId,
-            updateDate: effectiveUpdateDate,
-            matchedScheduleCount: 0,
-            syncedScheduleIds: [],
-            failedSchedules: [],
-            updatedSchedulesById: {},
-            error: errMsg,
-            syncedAt: syncTs,
-          };
-          setPendingScheduleSyncs((prev) => upsertPendingScheduleSyncRecord(prev, failSummary));
-          return failSummary;
-        }
+        const remoteSchedules = await fetchSchedulesMatchingOrFromSupabase(primaryOr);
 
         if (!remoteSchedules.connected) {
           const errMsg =
@@ -1739,19 +1738,71 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
             error: errMsg,
             syncedAt: syncTs,
           };
+          onProgress?.({
+            currentBatch: totalMasterBatches,
+            totalBatches: totalMasterBatches,
+            rowsInserted: totalReqRows,
+            totalRows: totalReqRows,
+            percent: 74,
+            currentChunkRows: 0,
+            phase: 'failed',
+            totalSchedules: 0,
+            syncedSchedules: 0,
+            failedSchedules: 0,
+            statusText: errMsg,
+          });
           setPendingScheduleSyncs((prev) => upsertPendingScheduleSyncRecord(prev, failSummary));
           return failSummary;
         }
+
+        // Merge any matching UUID schedule already loaded in state (safeguard if notes were absent)
+        const remoteById = new Map<string, ProductionSchedule>(
+          remoteSchedules.schedules.map((s) => [s.id, s])
+        );
+        for (const localSch of productionSchedulesRef.current) {
+          if (
+            isValidUuid(localSch.id) &&
+            !remoteById.has(localSch.id) &&
+            doesScheduleMatchOr(localSch, primaryOr)
+          ) {
+            remoteById.set(localSch.id, localSch);
+          }
+        }
+        const candidateSchedules = Array.from(remoteById.values());
 
         const summary = await syncSchedulesForMasterDataOr({
           targetOr: primaryOr,
           uploadId: finalUploadId,
           updateDate: effectiveUpdateDate,
-          schedules: remoteSchedules.schedules,
-          masterRequirements: remoteLatest.materialRequirements,
-          uploadHistory: remoteLatest.uploadHistory,
+          schedules: candidateSchedules,
+          masterRequirements: inMemoryReqs,
+          uploadHistory: [inMemoryHistItem],
           persistScheduleSnapshot: syncScheduleSnapshotOnlyInSupabase,
           syncTimestampIso: syncTs,
+          concurrency: 5,
+          onProgress: (syncProg) => {
+            if (!onProgress) return;
+            const mappedPercent =
+              syncProg.totalSchedules === 0
+                ? 99
+                : Math.min(99, 75 + Math.round((syncProg.completedSchedules / syncProg.totalSchedules) * 24));
+            onProgress({
+              currentBatch: totalMasterBatches,
+              totalBatches: totalMasterBatches,
+              rowsInserted: totalReqRows,
+              totalRows: totalReqRows,
+              percent: mappedPercent,
+              currentChunkRows: 0,
+              phase: 'schedule_sync',
+              totalSchedules: syncProg.totalSchedules,
+              syncedSchedules: syncProg.syncedSchedules,
+              failedSchedules: syncProg.failedSchedules,
+              statusText:
+                syncProg.completedSchedules === 0
+                  ? `Menyinkronkan ${syncProg.totalSchedules} Production Schedule terkait OR ${primaryOr}...`
+                  : `Menyinkronkan Production Schedule (${syncProg.completedSchedules}/${syncProg.totalSchedules}): ${syncProg.syncedSchedules} berhasil${syncProg.failedSchedules > 0 ? `, ${syncProg.failedSchedules} gagal` : ''}...`,
+            });
+          },
         });
 
         if (Object.keys(summary.updatedSchedulesById).length > 0) {
@@ -1761,6 +1812,45 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
         }
 
         setPendingScheduleSyncs((prev) => upsertPendingScheduleSyncRecord(prev, summary));
+
+        if (summary.status === 'success' || summary.status === 'no_schedules') {
+          onProgress?.({
+            currentBatch: totalMasterBatches,
+            totalBatches: totalMasterBatches,
+            rowsInserted: totalReqRows,
+            totalRows: totalReqRows,
+            percent: 100,
+            currentChunkRows: 0,
+            phase: 'completed',
+            totalSchedules: summary.matchedScheduleCount,
+            syncedSchedules: summary.syncedScheduleIds.length,
+            failedSchedules: 0,
+            statusText:
+              summary.matchedScheduleCount > 0
+                ? `Selesai! ${totalReqRows.toLocaleString('id-ID')} baris Master Data & ${summary.syncedScheduleIds.length}/${summary.matchedScheduleCount} jadwal produksi (${primaryOr}) berhasil disinkronkan.`
+                : `Selesai! ${totalReqRows.toLocaleString('id-ID')} baris Master Data tersimpan (belum ada jadwal produksi untuk OR ${primaryOr}).`,
+          });
+        } else {
+          const partialPercent = Math.min(
+            99,
+            75 + Math.round((summary.syncedScheduleIds.length / Math.max(1, summary.matchedScheduleCount)) * 24)
+          );
+          onProgress?.({
+            currentBatch: totalMasterBatches,
+            totalBatches: totalMasterBatches,
+            rowsInserted: totalReqRows,
+            totalRows: totalReqRows,
+            percent: partialPercent,
+            currentChunkRows: 0,
+            phase: summary.status,
+            totalSchedules: summary.matchedScheduleCount,
+            syncedSchedules: summary.syncedScheduleIds.length,
+            failedSchedules: summary.failedSchedules.length,
+            statusText:
+              summary.error ||
+              `Sinkronisasi jadwal OR ${primaryOr} belum lengkap (${summary.syncedScheduleIds.length} berhasil, ${summary.failedSchedules.length} gagal).`,
+          });
+        }
 
         if (summary.status === 'success' && summary.syncedScheduleIds.length > 0) {
           setNotifications((prev) => [
@@ -1791,36 +1881,32 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
         return summary;
       }
 
-      // Offline / LocalStorage persistence path
-      const offlineHistItem: UploadHistoryItem = {
-        ...newHistItem,
-        id: finalUploadId,
-        status: 'Sukses',
-        createdAt: finalCreatedAt || newHistItem.createdAt,
-      };
-      const offlineNewReqs = taggedNewReqs.map((r) => ({
-        ...r,
-        uploadId: finalUploadId,
-        createdAt: finalCreatedAt || r.importedAt,
-      }));
-      const offlineReqsSource = [
-        ...offlineNewReqs,
-        ...materialRequirements.map((r) => ({ ...r, isRecentlyImported: false })),
-      ];
-      const offlineHistSource = [
-        offlineHistItem,
-        ...uploadHistory.filter((h) => h.id !== uploadId && h.id !== finalUploadId),
-      ];
-
+      // Offline / LocalStorage persistence path (uses in-memory latest upload directly)
       const summary = await syncSchedulesForMasterDataOr({
         targetOr: primaryOr,
         uploadId: finalUploadId,
         updateDate: effectiveUpdateDate,
         schedules: productionSchedulesRef.current,
-        masterRequirements: offlineReqsSource,
-        uploadHistory: offlineHistSource,
+        masterRequirements: inMemoryReqs,
+        uploadHistory: [inMemoryHistItem],
         persistScheduleSnapshot: async () => ({ success: true }),
         syncTimestampIso: syncTs,
+        concurrency: 5,
+        onProgress: (syncProg) => {
+          onProgress?.({
+            currentBatch: 1,
+            totalBatches: 1,
+            rowsInserted: totalReqRows,
+            totalRows: totalReqRows,
+            percent: Math.min(99, 75 + Math.round((syncProg.completedSchedules / Math.max(1, syncProg.totalSchedules)) * 24)),
+            currentChunkRows: 0,
+            phase: 'schedule_sync',
+            totalSchedules: syncProg.totalSchedules,
+            syncedSchedules: syncProg.syncedSchedules,
+            failedSchedules: syncProg.failedSchedules,
+            statusText: `Menyinkronkan jadwal lokal (${syncProg.completedSchedules}/${syncProg.totalSchedules})...`,
+          });
+        },
       });
 
       if (Object.keys(summary.updatedSchedulesById).length > 0) {
@@ -1830,6 +1916,25 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
 
       setPendingScheduleSyncs((prev) => upsertPendingScheduleSyncRecord(prev, summary));
+
+      if (summary.status === 'success' || summary.status === 'no_schedules') {
+        onProgress?.({
+          currentBatch: 1,
+          totalBatches: 1,
+          rowsInserted: totalReqRows,
+          totalRows: totalReqRows,
+          percent: 100,
+          currentChunkRows: 0,
+          phase: 'completed',
+          totalSchedules: summary.matchedScheduleCount,
+          syncedSchedules: summary.syncedScheduleIds.length,
+          failedSchedules: 0,
+          statusText:
+            summary.matchedScheduleCount > 0
+              ? `Data tersimpan lokal & ${summary.syncedScheduleIds.length}/${summary.matchedScheduleCount} jadwal produksi disinkronkan.`
+              : 'Data tersimpan di penyimpanan lokal offline.',
+        });
+      }
 
       if (summary.status === 'success' && summary.syncedScheduleIds.length > 0) {
         setNotifications((prev) => [
@@ -1851,6 +1956,21 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     // 7. Sync to Centralized Supabase Database if configured (High-Volume 500-row batching with 3x retry & resume support)
     if (getSupabaseCredentials().isConfigured) {
       try {
+        const masterDataProgressHandler = onProgress
+          ? (info: UploadProgressCallbackInfo) => {
+              const mappedPercent = Math.min(70, Math.round(info.percent * 0.7));
+              onProgress({
+                ...info,
+                percent: mappedPercent,
+                phase: 'master_data',
+                statusText:
+                  info.percent >= 100
+                    ? `Master Data (${info.rowsInserted.toLocaleString('id-ID')}/${info.totalRows.toLocaleString('id-ID')} baris) tersimpan. Menyiapkan sinkronisasi jadwal...`
+                    : info.statusText,
+              });
+            }
+          : undefined;
+
         const syncRes = await syncBatchExcelToSupabaseWithProgress(
           {
             uploadHistoryItem: newHistItem,
@@ -1870,7 +1990,7 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
             masterMaterials: newMasterMaterials,
             resumeCheckpoint,
           },
-          onProgress
+          masterDataProgressHandler
         );
 
         if (syncRes.success) {
@@ -1953,21 +2073,7 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
       }
     } else {
       const scheduleSyncResult = await runAutomaticScheduleSync(uploadId, importIso);
-      if (onProgress) {
-        onProgress({
-          currentBatch: 1,
-          totalBatches: 1,
-          rowsInserted: newRequirements.length,
-          totalRows: newRequirements.length,
-          percent: 100,
-          currentChunkRows: 0,
-          statusText:
-            scheduleSyncResult.matchedScheduleCount > 0
-              ? `Data tersimpan lokal & ${scheduleSyncResult.syncedScheduleIds.length} jadwal produksi disinkronkan.`
-              : 'Data tersimpan di penyimpanan lokal offline.',
-        });
-      }
-      if (!skipMenuRedirect) {
+      if (!skipMenuRedirect && (scheduleSyncResult.status === 'success' || scheduleSyncResult.status === 'no_schedules')) {
         setActiveMenu('Rekap Material');
       }
       return {
@@ -1979,7 +2085,10 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     }
   };
 
-  const retryPendingScheduleSync = async (targetOr: string): Promise<ScheduleAutoSyncSummary> => {
+  const retryPendingScheduleSync = async (
+    targetOr: string,
+    onProgress?: (info: UploadProgressCallbackInfo) => void
+  ): Promise<ScheduleAutoSyncSummary> => {
     const cleanTargetOr = (targetOr || '').trim();
     const pendingRecord = pendingScheduleSyncs.find((p) =>
       areOrNumbersMatching(p.targetOr, cleanTargetOr)
@@ -2002,9 +2111,23 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
     setRetryingScheduleSyncOr(cleanTargetOr);
     try {
       if (getSupabaseCredentials().isConfigured) {
+        onProgress?.({
+          currentBatch: 1,
+          totalBatches: 1,
+          rowsInserted: 0,
+          totalRows: 0,
+          percent: 10,
+          currentChunkRows: 0,
+          phase: 'schedule_sync',
+          totalSchedules: pendingRecord?.failedScheduleIds?.length || pendingRecord?.totalTargetSchedules || 0,
+          syncedSchedules: 0,
+          failedSchedules: 0,
+          statusText: `Mengambil Master Data terbaru & daftar jadwal OR ${cleanTargetOr}...`,
+        });
+
         const [remoteLatest, remoteSchedules] = await Promise.all([
           fetchLatestUploadMaterialsForOrs([cleanTargetOr]),
-          fetchSchedulesFromSupabase(),
+          fetchSchedulesMatchingOrFromSupabase(cleanTargetOr),
         ]);
 
         if (!remoteLatest || !remoteLatest.connected) {
@@ -2056,12 +2179,44 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
               ? pendingRecord.failedScheduleIds
               : undefined,
           syncTimestampIso: syncTs,
+          concurrency: 5,
+          onProgress: (syncProg) => {
+            onProgress?.({
+              currentBatch: 1,
+              totalBatches: 1,
+              rowsInserted: remoteLatest.materialRequirements.length,
+              totalRows: remoteLatest.materialRequirements.length,
+              percent: Math.min(99, 15 + Math.round((syncProg.completedSchedules / Math.max(1, syncProg.totalSchedules)) * 84)),
+              currentChunkRows: 0,
+              phase: 'schedule_sync',
+              totalSchedules: syncProg.totalSchedules,
+              syncedSchedules: syncProg.syncedSchedules,
+              failedSchedules: syncProg.failedSchedules,
+              statusText: `Menyinkronkan ulang jadwal OR ${cleanTargetOr} (${syncProg.completedSchedules}/${syncProg.totalSchedules}): ${syncProg.syncedSchedules} berhasil${syncProg.failedSchedules > 0 ? `, ${syncProg.failedSchedules} gagal` : ''}...`,
+            });
+          },
         });
 
         if (Object.keys(summary.updatedSchedulesById).length > 0) {
           commitProductionSchedules((prev) =>
             applySyncedSchedulesToList(prev, summary.updatedSchedulesById)
           );
+        }
+
+        if (summary.status === 'success' || summary.status === 'no_schedules') {
+          onProgress?.({
+            currentBatch: 1,
+            totalBatches: 1,
+            rowsInserted: remoteLatest.materialRequirements.length,
+            totalRows: remoteLatest.materialRequirements.length,
+            percent: 100,
+            currentChunkRows: 0,
+            phase: 'completed',
+            totalSchedules: summary.matchedScheduleCount,
+            syncedSchedules: summary.syncedScheduleIds.length,
+            failedSchedules: 0,
+            statusText: `Sinkronisasi ulang selesai: ${summary.syncedScheduleIds.length}/${summary.matchedScheduleCount} jadwal diperbarui.`,
+          });
         }
 
         setPendingScheduleSyncs((prev) => upsertPendingScheduleSyncRecord(prev, summary));
@@ -2082,6 +2237,22 @@ export const PpicProvider: React.FC<{ children: React.ReactNode }> = ({ children
             ? pendingRecord.failedScheduleIds
             : undefined,
         syncTimestampIso: syncTs,
+        concurrency: 5,
+        onProgress: (syncProg) => {
+          onProgress?.({
+            currentBatch: 1,
+            totalBatches: 1,
+            rowsInserted: 0,
+            totalRows: 0,
+            percent: Math.min(99, Math.round((syncProg.completedSchedules / Math.max(1, syncProg.totalSchedules)) * 99)),
+            currentChunkRows: 0,
+            phase: 'schedule_sync',
+            totalSchedules: syncProg.totalSchedules,
+            syncedSchedules: syncProg.syncedSchedules,
+            failedSchedules: syncProg.failedSchedules,
+            statusText: `Menyinkronkan ulang jadwal lokal (${syncProg.completedSchedules}/${syncProg.totalSchedules})...`,
+          });
+        },
       });
 
       if (Object.keys(summary.updatedSchedulesById).length > 0) {
