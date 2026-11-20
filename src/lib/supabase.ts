@@ -1780,18 +1780,20 @@ export async function fetchSchedulesFromSupabase(): Promise<{
 }
 
 /**
- * Fetches ONLY Production Schedules that may match `targetOr` from Supabase (filtered server-side
- * by OR tokens across `or_number` and embedded worksheet `notes`), avoiding full-table downloads
- * of unrelated schedules while preserving full worksheet & user-note payloads.
+ * Fetches ONLY Production Schedules that genuinely match `targetOr` from Supabase.
+ * Uses a fast server-side `.ilike` candidate filter across `or_number` and `notes`,
+ * then enforces strict normalized OR matching via `doesFetchedScheduleMatchOr` so
+ * substring collisions (e.g. '1036' vs '11036' or '10360') never return false positives.
  */
 export async function fetchSchedulesMatchingOrFromSupabase(
-  targetOr: string
+  targetOr: string,
+  clientOverride?: any
 ): Promise<{
   connected: boolean;
   schedules: ProductionSchedule[];
   error?: string;
 }> {
-  const supabase = getSupabaseClient();
+  const supabase = clientOverride ?? getSupabaseClient();
   if (!supabase) {
     return {
       connected: false,
@@ -1801,10 +1803,15 @@ export async function fetchSchedulesMatchingOrFromSupabase(
   }
 
   try {
+    const cleanTargetOr = String(targetOr || '').trim();
     const { extractOrSearchTokens } = await import('../utils/pdfWorksheetParser');
-    const tokens = extractOrSearchTokens(targetOr);
+    const { doesFetchedScheduleMatchOr } = await import('../utils/masterDataScheduleSync');
+    const tokens = extractOrSearchTokens(cleanTargetOr);
     if (tokens.length === 0) {
-      return fetchSchedulesFromSupabase();
+      return {
+        connected: true,
+        schedules: [],
+      };
     }
 
     const orClauses = tokens
@@ -1826,15 +1833,81 @@ export async function fetchSchedulesMatchingOrFromSupabase(
       };
     }
 
+    const mapped = (data || []).map(mapDbScheduleToModel);
+    const strictMatched = mapped.filter((sch: ProductionSchedule) =>
+      doesFetchedScheduleMatchOr(sch, cleanTargetOr)
+    );
+
     return {
       connected: true,
-      schedules: (data || []).map(mapDbScheduleToModel),
+      schedules: strictMatched,
     };
   } catch (err: any) {
     return {
       connected: false,
       schedules: [],
       error: err?.message || 'Gagal membaca jadwal produksi terkait OR dari Supabase.',
+    };
+  }
+}
+
+/**
+ * Lightweight discovery query returning distinct `or_number` values that have valid
+ * Master Data uploads in Supabase (`upload_history` where status != 'Gagal').
+ */
+export async function fetchDistinctMasterDataOrsFromSupabase(
+  clientOverride?: any
+): Promise<{
+  connected: boolean;
+  orNumbers: string[];
+  error?: string;
+}> {
+  const supabase = clientOverride ?? getSupabaseClient();
+  if (!supabase) {
+    return {
+      connected: false,
+      orNumbers: [],
+      error: 'Koneksi Supabase belum terkonfigurasi.',
+    };
+  }
+
+  try {
+    const { data, error } = await supabase
+      .from('upload_history')
+      .select('or_number')
+      .neq('status', 'Gagal')
+      .order('created_at', { ascending: false })
+      .limit(5000);
+
+    if (error) {
+      return {
+        connected: false,
+        orNumbers: [],
+        error: error.message || 'Gagal mengambil daftar OR Master Data dari Supabase.',
+      };
+    }
+
+    const seen = new Set<string>();
+    const orNumbers: string[] = [];
+    for (const row of data || []) {
+      const clean = String(row?.or_number || '').trim();
+      if (!clean || clean === '-') continue;
+      const upper = clean.toUpperCase();
+      if (!seen.has(upper)) {
+        seen.add(upper);
+        orNumbers.push(clean);
+      }
+    }
+
+    return {
+      connected: true,
+      orNumbers,
+    };
+  } catch (err: any) {
+    return {
+      connected: false,
+      orNumbers: [],
+      error: err?.message || 'Gagal mengambil daftar OR Master Data dari Supabase.',
     };
   }
 }
@@ -1871,13 +1944,14 @@ export async function syncScheduleSnapshotOnlyInSupabase(
  * independently for each requested No. OR from Supabase.
  */
 export async function fetchLatestUploadMaterialsForOrs(
-  orNumbers: string[]
+  orNumbers: string[],
+  clientOverride?: any
 ): Promise<{
   connected: boolean;
   uploadHistory: UploadHistoryItem[];
   materialRequirements: MaterialItemRequirement[];
 } | null> {
-  const supabase = getSupabaseClient();
+  const supabase = clientOverride ?? getSupabaseClient();
   if (!supabase) return null;
 
   try {
@@ -1938,33 +2012,38 @@ export async function fetchLatestUploadMaterialsForOrs(
     const uploadIds = Array.from(selectedUploadIds);
 
     if (uploadIds.length > 0) {
-      // Paginated fetch strictly scoped to selected latest upload_ids
-      let offset = 0;
+      // Chunk uploadIds by 50 to prevent overly long PostgREST query URLs when refreshing many ORs
+      const UPLOAD_ID_CHUNK_SIZE = 50;
       const chunkSize = 1000;
-      let hasMore = true;
 
-      while (hasMore) {
-        const { data: reqRows, error: reqErr } = await supabase
-          .from('material_requirements')
-          .select('*')
-          .in('upload_id', uploadIds)
-          .order('id', { ascending: true })
-          .range(offset, offset + chunkSize - 1);
+      for (let uIdx = 0; uIdx < uploadIds.length; uIdx += UPLOAD_ID_CHUNK_SIZE) {
+        const uploadIdBatch = uploadIds.slice(uIdx, uIdx + UPLOAD_ID_CHUNK_SIZE);
+        let offset = 0;
+        let hasMore = true;
 
-        if (reqErr) {
-          console.warn('Failed to fetch latest upload material_requirements:', reqErr.message);
-          return null;
-        }
+        while (hasMore) {
+          const { data: reqRows, error: reqErr } = await supabase
+            .from('material_requirements')
+            .select('*')
+            .in('upload_id', uploadIdBatch)
+            .order('id', { ascending: true })
+            .range(offset, offset + chunkSize - 1);
 
-        const chunk = reqRows || [];
-        for (const r of chunk) {
-          allReqs.push(mapDbRequirementToModel(r));
-        }
+          if (reqErr) {
+            console.warn('Failed to fetch latest upload material_requirements:', reqErr.message);
+            return null;
+          }
 
-        if (chunk.length < chunkSize) {
-          hasMore = false;
-        } else {
-          offset += chunk.length;
+          const chunk = reqRows || [];
+          for (const r of chunk) {
+            allReqs.push(mapDbRequirementToModel(r));
+          }
+
+          if (chunk.length < chunkSize) {
+            hasMore = false;
+          } else {
+            offset += chunk.length;
+          }
         }
       }
     }

@@ -40,7 +40,6 @@ import {
   validateFileMatchWithCheckpoint,
 } from '../../utils/uploadOfflineStorage';
 import { generateDeterministicRowUuid, UploadProgressCallbackInfo } from '../../lib/supabase';
-import { ScheduleAutoSyncSummary } from '../../utils/masterDataScheduleSync';
 
 export const UploadExcelView: React.FC = () => {
   const {
@@ -53,10 +52,6 @@ export const UploadExcelView: React.FC = () => {
     getStyleForOr,
     getOrsForStyle,
     autoSaveExcelMaterials,
-    pendingScheduleSyncs,
-    retryingScheduleSyncOr,
-    retryPendingScheduleSync,
-    dismissPendingScheduleSync,
     setActiveMenu,
     lastImportedInfo,
   } = usePpic();
@@ -81,11 +76,9 @@ export const UploadExcelView: React.FC = () => {
   const [isProcessing, setIsProcessing] = useState<boolean>(false);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const [scheduleSyncBanner, setScheduleSyncBanner] = useState<ScheduleAutoSyncSummary | null>(null);
 
-  // Real-time animated batch upload & schedule sync progress (Supports 20,000+ rows daily)
+  // Real-time animated batch upload progress (Supports 20,000+ rows daily)
   const [batchProgress, setBatchProgress] = useState<UploadProgressCallbackInfo | null>(null);
-  const [retrySyncProgress, setRetrySyncProgress] = useState<UploadProgressCallbackInfo | null>(null);
   const [batchErrorDetails, setBatchErrorDetails] = useState<{
     failedBatch?: number;
     failingRange?: string;
@@ -453,28 +446,9 @@ export const UploadExcelView: React.FC = () => {
         const savedCount = previewData.rows.length;
         const savedOr = previewData.orNumber;
         const savedDate = previewData.updateDate;
-        const syncRes = res.scheduleSyncResult;
-
-        if (syncRes && (syncRes.status === 'partial_failure' || syncRes.status === 'failed')) {
-          setScheduleSyncBanner(syncRes);
-          setPreviewData(null);
-          setBatchProgress(null);
-          setIsProcessing(false);
-          setStatusMessage(null);
-          setErrorMessage(
-            `Master Data (${savedCount.toLocaleString('id-ID')} baris untuk ${savedOr}) berhasil disimpan, tetapi sinkronisasi otomatis ke Production Schedule gagal / belum lengkap (${syncRes.syncedScheduleIds.length} berhasil, ${syncRes.failedSchedules.length} gagal). ${syncRes.error || ''}`
-          );
-          return;
-        }
-
-        setScheduleSyncBanner(null);
-        const scheduleNote =
-          syncRes && syncRes.matchedScheduleCount > 0
-            ? ` & ${syncRes.syncedScheduleIds.length} Production Schedule (${savedOr}) otomatis disinkronkan`
-            : ` (belum ada Production Schedule untuk ${savedOr})`;
 
         setStatusMessage(
-          `Sukses! Seluruh ${savedCount.toLocaleString('id-ID')} baris material untuk ${savedOr} berhasil disimpan (Tanggal Update: ${savedDate})${scheduleNote}.`
+          `Sukses! Seluruh ${savedCount.toLocaleString('id-ID')} baris material untuk ${savedOr} berhasil disimpan ke Master Data (Tanggal Update: ${savedDate}).`
         );
 
         // Smooth transition to Rekap Material
@@ -483,7 +457,7 @@ export const UploadExcelView: React.FC = () => {
           setBatchProgress(null);
           setIsProcessing(false);
           setActiveMenu('Rekap Material');
-        }, 1400);
+        }, 1200);
       } else {
         setIsProcessing(false);
         setBatchErrorDetails({
@@ -717,126 +691,6 @@ export const UploadExcelView: React.FC = () => {
         <div className="p-3.5 rounded-lg bg-red-50 border border-red-300 text-red-900 text-xs flex items-center gap-2">
           <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
           <span className="font-semibold">{errorMessage}</span>
-        </div>
-      )}
-
-      {/* Pending / Failed Automatic Schedule Sync Recovery Banner (No Master Data Re-Upload Needed) */}
-      {(pendingScheduleSyncs.length > 0 || scheduleSyncBanner) && (
-        <div
-          role="alert"
-          className="p-4 rounded-xl bg-amber-50 border border-amber-300 text-amber-950 shadow-xs space-y-2.5"
-        >
-          <div className="flex items-start justify-between gap-3">
-            <div className="flex items-start gap-2.5">
-              <AlertCircle className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
-              <div className="space-y-1 text-xs">
-                <div className="font-bold text-amber-950">
-                  Pemulihan Sinkronisasi Production Schedule (Tanpa Upload Ulang Master Data)
-                </div>
-                <p className="text-amber-900">
-                  Data Master Data sudah tersimpan di database. Jadwal berikut belum tersinkronkan otomatis dan dapat dipulihkan langsung:
-                </p>
-              </div>
-            </div>
-          </div>
-          <div className="space-y-2">
-            {(pendingScheduleSyncs.length > 0
-              ? pendingScheduleSyncs
-              : scheduleSyncBanner
-                ? [
-                    {
-                      targetOr: scheduleSyncBanner.targetOr,
-                      totalTargetSchedules: scheduleSyncBanner.matchedScheduleCount,
-                      syncedCount: scheduleSyncBanner.syncedScheduleIds.length,
-                      failedScheduleIds: scheduleSyncBanner.failedSchedules.map((f) => f.scheduleId),
-                      failedDetails: scheduleSyncBanner.failedSchedules,
-                      lastError: scheduleSyncBanner.error || '',
-                      occurredAt: scheduleSyncBanner.syncedAt,
-                    },
-                  ]
-                : []
-            ).map((rec) => {
-              const isRetrying = retryingScheduleSyncOr === rec.targetOr;
-              return (
-                <div
-                  key={rec.targetOr}
-                  className="p-3 rounded-lg bg-white border border-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
-                >
-                  <div className="space-y-1 flex-1 min-w-0">
-                    <div className="font-bold text-slate-900">
-                      OR {rec.targetOr} · {rec.syncedCount}/{rec.totalTargetSchedules} jadwal berhasil, {rec.failedDetails.length || 'sebagian'} gagal
-                    </div>
-                    <div className="text-[11px] text-rose-700">{rec.lastError}</div>
-                    {isRetrying && retrySyncProgress && (
-                      <div className="mt-2 pt-2 border-t border-amber-100 space-y-1">
-                        <div className="flex items-center justify-between text-[11px] font-semibold text-slate-700">
-                          <span>{retrySyncProgress.statusText}</span>
-                          <span className="font-mono text-amber-800">{retrySyncProgress.percent}%</span>
-                        </div>
-                        <div className="w-full bg-amber-100 rounded-full h-1.5 overflow-hidden">
-                          <div
-                            className="bg-amber-600 h-full transition-all duration-200 rounded-full"
-                            style={{ width: `${retrySyncProgress.percent}%` }}
-                          />
-                        </div>
-                        {retrySyncProgress.totalSchedules !== undefined && (
-                          <div className="text-[10px] text-slate-600 font-mono">
-                            Target: {retrySyncProgress.totalSchedules} jadwal · Berhasil: {retrySyncProgress.syncedSchedules ?? 0} · Gagal: {retrySyncProgress.failedSchedules ?? 0}
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                  <div className="flex items-center gap-2 shrink-0">
-                    <button
-                      type="button"
-                      disabled={isRetrying}
-                      onClick={async () => {
-                        setErrorMessage(null);
-                        setRetrySyncProgress(null);
-                        const retryRes = await retryPendingScheduleSync(rec.targetOr, (info) =>
-                          setRetrySyncProgress(info)
-                        );
-                        setRetrySyncProgress(null);
-                        if (retryRes.status === 'success' || retryRes.status === 'no_schedules') {
-                          setScheduleSyncBanner(null);
-                          setStatusMessage(
-                            `Pemulihan berhasil! ${retryRes.syncedScheduleIds.length} jadwal produksi untuk OR ${rec.targetOr} kini sudah disinkronkan dengan Master Data terbaru.`
-                          );
-                        } else {
-                          setErrorMessage(retryRes.error || `Sinkronisasi ulang untuk OR ${rec.targetOr} masih gagal.`);
-                        }
-                      }}
-                      className="px-3 py-1.5 text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 disabled:opacity-60 rounded-md flex items-center gap-1.5 cursor-pointer"
-                    >
-                      <RefreshCw className={`w-3.5 h-3.5 ${isRetrying ? 'animate-spin' : ''}`} />
-                      {isRetrying ? 'Menyinkronkan...' : 'Sinkronkan Ulang Jadwal'}
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => setActiveMenu('Penjadwalan Produksi')}
-                      className="px-3 py-1.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md cursor-pointer"
-                    >
-                      Buka Jadwal
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        dismissPendingScheduleSync(rec.targetOr);
-                        if (scheduleSyncBanner?.targetOr === rec.targetOr) {
-                          setScheduleSyncBanner(null);
-                        }
-                      }}
-                      className="p-1.5 text-slate-400 hover:text-slate-600 cursor-pointer"
-                      aria-label={`Tutup peringatan sinkronisasi ${rec.targetOr}`}
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                </div>
-              );
-            })}
-          </div>
         </div>
       )}
 
@@ -1460,19 +1314,10 @@ export const UploadExcelView: React.FC = () => {
         </div>
       </div>
 
-      {/* REAL-TIME BATCH UPLOAD & SCHEDULE SYNC PROGRESS MODAL (Scale: 20,000+ daily rows) */}
+      {/* REAL-TIME BATCH UPLOAD PROGRESS MODAL (Scale: 20,000+ daily rows) */}
       {(batchProgress || (isProcessing && previewData)) && (() => {
         const isFullyCompleted =
-          batchProgress?.phase === 'completed' &&
-          batchProgress.percent === 100 &&
-          (batchProgress.failedSchedules ?? 0) === 0;
-        const isSchedulePhase =
-          batchProgress?.phase === 'schedule_sync' ||
-          batchProgress?.phase === 'completed' ||
-          batchProgress?.phase === 'partial_failure' ||
-          batchProgress?.phase === 'failed';
-        const isSyncFailedPhase =
-          batchProgress?.phase === 'partial_failure' || batchProgress?.phase === 'failed';
+          batchProgress?.phase === 'completed' && batchProgress.percent === 100;
 
         return (
         <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
@@ -1480,24 +1325,16 @@ export const UploadExcelView: React.FC = () => {
             <div className="flex items-start justify-between">
               <div>
                 <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded text-[11px] font-bold bg-blue-50 text-blue-700 border border-blue-200 mb-1">
-                  <RefreshCw className={`w-3.5 h-3.5 ${!isFullyCompleted && !isSyncFailedPhase ? 'animate-spin text-blue-600' : isSyncFailedPhase ? 'text-amber-600' : 'text-emerald-600'}`} />
-                  {isSchedulePhase
-                    ? 'Sinkronisasi Otomatis Master Data → Production Schedule'
-                    : 'High-Volume Batch Engine (500 baris/batch)'}
+                  <RefreshCw className={`w-3.5 h-3.5 ${!isFullyCompleted ? 'animate-spin text-blue-600' : 'text-emerald-600'}`} />
+                  High-Volume Batch Engine (500 baris/batch)
                 </div>
                 <h3 className="text-base font-bold text-slate-900">
                   {isFullyCompleted
-                    ? 'Penyimpanan & Sinkronisasi Selesai Sepenuhnya!'
-                    : isSyncFailedPhase
-                      ? 'Sinkronisasi Production Schedule Belum Lengkap'
-                      : isSchedulePhase
-                        ? 'Menyinkronkan Pemeriksaan Material ke Production Schedule...'
-                        : 'Menyimpan Data Material ke Database...'}
+                    ? 'Penyimpanan Master Data Selesai!'
+                    : 'Menyimpan Data Material ke Database...'}
                 </h3>
                 <p className="text-xs text-slate-500 mt-0.5">
-                  {isSchedulePhase
-                    ? 'Memperbarui snapshot kesiapan material seluruh jadwal terkait OR ini secara paralel & atomik.'
-                    : 'Setiap batch diverifikasi atomik dengan 3x percobaan ulang otomatis demi integritas data.'}
+                  Setiap batch diverifikasi atomik dengan 3x percobaan ulang otomatis demi integritas data.
                 </p>
               </div>
             </div>
@@ -1526,11 +1363,9 @@ export const UploadExcelView: React.FC = () => {
             <div className="space-y-2">
               <div className="flex items-center justify-between text-xs font-semibold">
                 <span className="text-slate-700">
-                  {isSchedulePhase
-                    ? 'Tahap 2: Sinkronisasi Production Schedule'
-                    : batchProgress
-                      ? `Tahap 1: Batch ${batchProgress.currentBatch} dari ${batchProgress.totalBatches}`
-                      : 'Mempersiapkan batch...'}
+                  {batchProgress
+                    ? `Batch ${batchProgress.currentBatch} dari ${batchProgress.totalBatches}`
+                    : 'Mempersiapkan batch...'}
                 </span>
                 <span className="font-mono text-blue-600 text-sm font-bold" data-testid="upload-sync-percent">
                   {batchProgress ? `${batchProgress.percent}%` : '0%'}
@@ -1538,11 +1373,7 @@ export const UploadExcelView: React.FC = () => {
               </div>
               <div className="w-full bg-slate-100 rounded-full h-3 overflow-hidden border border-slate-200">
                 <div
-                  className={`h-full transition-all duration-300 rounded-full ${
-                    isSyncFailedPhase
-                      ? 'bg-amber-500'
-                      : 'bg-gradient-to-r from-blue-600 via-indigo-600 to-emerald-500'
-                  }`}
+                  className="h-full transition-all duration-300 rounded-full bg-gradient-to-r from-blue-600 via-indigo-600 to-emerald-500"
                   style={{ width: `${batchProgress ? batchProgress.percent : 5}%` }}
                 />
               </div>
@@ -1556,40 +1387,9 @@ export const UploadExcelView: React.FC = () => {
               </div>
             </div>
 
-            {/* Schedule Sync Detailed Metrics (shown once schedule sync begins) */}
-            {batchProgress && batchProgress.totalSchedules !== undefined && (
-              <div
-                data-testid="schedule-sync-progress-metrics"
-                className="p-3 bg-slate-50 border border-slate-200 rounded-xl grid grid-cols-3 gap-2 text-xs"
-              >
-                <div>
-                  <span className="text-[10px] text-slate-500 block">Jadwal Perlu Diperbarui</span>
-                  <span className="font-mono font-bold text-slate-900">
-                    {batchProgress.totalSchedules} jadwal
-                  </span>
-                </div>
-                <div>
-                  <span className="text-[10px] text-slate-500 block">Berhasil Diperbarui</span>
-                  <span className="font-mono font-bold text-emerald-700">
-                    {batchProgress.syncedSchedules ?? 0} jadwal
-                  </span>
-                </div>
-                <div>
-                  <span className="text-[10px] text-slate-500 block">Gagal Diperbarui</span>
-                  <span
-                    className={`font-mono font-bold ${
-                      (batchProgress.failedSchedules ?? 0) > 0 ? 'text-rose-600' : 'text-slate-700'
-                    }`}
-                  >
-                    {batchProgress.failedSchedules ?? 0} jadwal
-                  </span>
-                </div>
-              </div>
-            )}
-
             {/* Live Status Text */}
             <div className="p-3 bg-blue-50/70 border border-blue-200 rounded-xl text-xs text-blue-900 flex items-center gap-2.5">
-              <RefreshCw className={`w-4 h-4 shrink-0 text-blue-600 ${!isFullyCompleted && !isSyncFailedPhase ? 'animate-spin' : ''}`} />
+              <RefreshCw className={`w-4 h-4 shrink-0 text-blue-600 ${!isFullyCompleted ? 'animate-spin' : ''}`} />
               <span className="font-medium text-[11px]" data-testid="upload-sync-status-text">
                 {batchProgress?.statusText || statusMessage || 'Sedang memproses batch...'}
               </span>

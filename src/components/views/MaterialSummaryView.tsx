@@ -2,7 +2,8 @@ import React, { useState, useMemo, useEffect } from 'react';
 import { usePpic } from '../../context/PpicContext';
 import { MaterialItemRequirement, MaterialCategory, MaterialUnit } from '../../types/ppic';
 import * as XLSX from 'xlsx';
-import { fetchPaginatedRequirementsFromSupabase } from '../../lib/supabase';
+import { fetchPaginatedRequirementsFromSupabase, UploadProgressCallbackInfo } from '../../lib/supabase';
+import { GlobalScheduleSyncProgressInfo, GlobalScheduleSyncSummary } from '../../utils/masterDataScheduleSync';
 import { cleanFloatPrecision, formatPpicNumber } from '../../utils/excelMaterialParser';
 import {
   Boxes,
@@ -61,6 +62,12 @@ export const MaterialSummaryView: React.FC = () => {
     getOrHistoryDetails,
     supabaseConnected,
     lastSyncTimestamp,
+    isRefreshingAllSchedules,
+    refreshAllSchedulesWithMasterData,
+    pendingScheduleSyncs,
+    retryingScheduleSyncOr,
+    retryPendingScheduleSync,
+    dismissPendingScheduleSync,
   } = usePpic();
 
   // Active view tab:
@@ -118,6 +125,56 @@ export const MaterialSummaryView: React.FC = () => {
 
   // Status message notice
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  // Global Schedule Refresh State ("Refresh Jadwal Produksi")
+  const [globalSyncModalOpen, setGlobalSyncModalOpen] = useState<boolean>(false);
+  const [globalSyncProgress, setGlobalSyncProgress] = useState<GlobalScheduleSyncProgressInfo | null>(null);
+  const [globalSyncResult, setGlobalSyncResult] = useState<GlobalScheduleSyncSummary | null>(null);
+  const [retrySyncProgress, setRetrySyncProgress] = useState<UploadProgressCallbackInfo | null>(null);
+
+  const handleRefreshAllSchedules = async () => {
+    if (isRefreshingAllSchedules) return;
+    setNotice(null);
+    setGlobalSyncResult(null);
+    setGlobalSyncProgress({
+      phase: 'discovering',
+      totalOrs: 0,
+      processedOrs: 0,
+      succeededOrs: 0,
+      failedOrs: 0,
+      totalSchedules: 0,
+      completedSchedules: 0,
+      syncedSchedules: 0,
+      failedSchedules: 0,
+      percent: 0,
+      statusText: 'Memulai sinkronisasi seluruh Production Schedule dengan Master Data terbaru...',
+    });
+    setGlobalSyncModalOpen(true);
+
+    const summary = await refreshAllSchedulesWithMasterData((prog) => {
+      setGlobalSyncProgress(prog);
+    });
+    setGlobalSyncResult(summary);
+
+    if (summary.status === 'success') {
+      setNotice({
+        type: 'success',
+        message: `Refresh Jadwal Produksi selesai: ${summary.syncedScheduleIds.length}/${summary.totalSchedules} jadwal (${summary.succeededOrs} OR) berhasil diperbarui menggunakan Master Data terbaru.`,
+      });
+    } else if (summary.status === 'no_schedules') {
+      setNotice({
+        type: 'success',
+        message: 'Tidak ada jadwal produksi terkait yang perlu diperbarui.',
+      });
+    } else {
+      setNotice({
+        type: 'error',
+        message:
+          summary.error ||
+          `Sinkronisasi jadwal belum lengkap (${summary.syncedScheduleIds.length} berhasil, ${summary.failedSchedules.length} gagal).`,
+      });
+    }
+  };
 
   // Form data for Add / Edit Requirement Modal
   const [reqFormData, setReqFormData] = useState<{
@@ -770,6 +827,17 @@ export const MaterialSummaryView: React.FC = () => {
             Unggah File Excel
           </button>
           <button
+            type="button"
+            data-testid="refresh-all-schedules-btn"
+            disabled={isRefreshingAllSchedules}
+            onClick={handleRefreshAllSchedules}
+            className="px-3.5 py-2 text-xs font-bold bg-emerald-600 hover:bg-emerald-700 disabled:opacity-60 disabled:cursor-not-allowed text-white rounded-md shadow-xs transition-colors flex items-center gap-1.5 cursor-pointer"
+            title="Sinkronkan seluruh Production Schedule dengan Master Data terbaru dari masing-masing OR"
+          >
+            <RefreshCw className={`w-4 h-4 ${isRefreshingAllSchedules ? 'animate-spin' : ''}`} />
+            {isRefreshingAllSchedules ? 'Menyegarkan Jadwal...' : 'Refresh Jadwal Produksi'}
+          </button>
+          <button
             onClick={handleExportMasterDataExcel}
             className="px-3 py-2 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md transition-colors flex items-center gap-1.5 cursor-pointer"
           >
@@ -865,6 +933,120 @@ export const MaterialSummaryView: React.FC = () => {
           >
             <X className="w-4 h-4" />
           </button>
+        </div>
+      )}
+
+      {/* Pending / Failed Schedule Sync Recovery Banner (No Master Data Re-Upload Required) */}
+      {pendingScheduleSyncs.length > 0 && (
+        <div
+          role="alert"
+          data-testid="master-pending-schedule-sync-banner"
+          className="p-4 rounded-xl bg-amber-50 border border-amber-300 text-amber-950 shadow-xs space-y-2.5"
+        >
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="w-5 h-5 text-amber-700 shrink-0 mt-0.5" />
+            <div className="space-y-1 text-xs">
+              <div className="font-bold text-amber-950">
+                Pemulihan Sinkronisasi Jadwal Produksi (Tanpa Upload Ulang Master Data)
+              </div>
+              <p className="text-amber-900">
+                Data Master Data sudah tersimpan. Sebagian jadwal berikut gagal disinkronkan dan dapat dicoba kembali langsung:
+              </p>
+            </div>
+          </div>
+          <div className="space-y-2">
+            {pendingScheduleSyncs.map((rec) => {
+              const isRetrying = retryingScheduleSyncOr === rec.targetOr;
+              return (
+                <div
+                  key={rec.targetOr}
+                  className="p-3 rounded-lg bg-white border border-amber-200 flex flex-col sm:flex-row sm:items-center justify-between gap-3 text-xs"
+                >
+                  <div className="space-y-1 flex-1 min-w-0">
+                    <div className="font-bold text-slate-900">
+                      OR {rec.targetOr} · {rec.syncedCount}/{rec.totalTargetSchedules} jadwal berhasil, {rec.failedDetails.length || 'sebagian'} gagal
+                    </div>
+                    {rec.failedDetails.length > 0 && (
+                      <ul className="text-[11px] text-slate-700 list-disc pl-4 space-y-0.5">
+                        {rec.failedDetails.slice(0, 5).map((f) => (
+                          <li key={f.scheduleId}>
+                            <span className="font-mono font-semibold">{f.worksheetNo || f.scheduleId}</span>
+                            {f.productionLine ? ` (${f.productionLine})` : ''}: {f.error}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {rec.lastError && rec.failedDetails.length === 0 && (
+                      <div className="text-[11px] text-rose-700">{rec.lastError}</div>
+                    )}
+                    {isRetrying && retrySyncProgress && (
+                      <div className="mt-2 pt-2 border-t border-amber-100 space-y-1">
+                        <div className="flex items-center justify-between text-[11px] font-semibold text-slate-700">
+                          <span>{retrySyncProgress.statusText}</span>
+                          <span className="font-mono text-amber-800">{retrySyncProgress.percent}%</span>
+                        </div>
+                        <div className="w-full bg-amber-100 rounded-full h-1.5 overflow-hidden">
+                          <div
+                            className="bg-amber-600 h-full transition-all duration-200 rounded-full"
+                            style={{ width: `${retrySyncProgress.percent}%` }}
+                          />
+                        </div>
+                        {retrySyncProgress.totalSchedules !== undefined && (
+                          <div className="text-[10px] text-slate-600 font-mono">
+                            Target: {retrySyncProgress.totalSchedules} jadwal · Berhasil: {retrySyncProgress.syncedSchedules ?? 0} · Gagal: {retrySyncProgress.failedSchedules ?? 0}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  <div className="flex items-center gap-2 shrink-0">
+                    <button
+                      type="button"
+                      disabled={isRetrying || isRefreshingAllSchedules}
+                      onClick={async () => {
+                        setNotice(null);
+                        setRetrySyncProgress(null);
+                        const retryRes = await retryPendingScheduleSync(rec.targetOr, (info) =>
+                          setRetrySyncProgress(info)
+                        );
+                        setRetrySyncProgress(null);
+                        if (retryRes.status === 'success' || retryRes.status === 'no_schedules') {
+                          setNotice({
+                            type: 'success',
+                            message: `Sinkronisasi ulang berhasil! ${retryRes.syncedScheduleIds.length} jadwal OR ${rec.targetOr} telah diperbarui dengan Master Data terbaru.`,
+                          });
+                        } else {
+                          setNotice({
+                            type: 'error',
+                            message: retryRes.error || `Sinkronisasi ulang untuk OR ${rec.targetOr} belum berhasil.`,
+                          });
+                        }
+                      }}
+                      className="px-3 py-1.5 text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 disabled:opacity-60 rounded-md flex items-center gap-1.5 cursor-pointer"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${isRetrying ? 'animate-spin' : ''}`} />
+                      {isRetrying ? 'Menyinkronkan...' : 'Sinkronkan Ulang'}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setActiveMenu('Penjadwalan Produksi')}
+                      className="px-3 py-1.5 text-xs font-semibold text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-md cursor-pointer"
+                    >
+                      Buka Jadwal
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => dismissPendingScheduleSync(rec.targetOr)}
+                      className="p-1.5 text-slate-400 hover:text-slate-600 cursor-pointer"
+                      aria-label={`Tutup peringatan sinkronisasi ${rec.targetOr}`}
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
 
@@ -2602,6 +2784,209 @@ export const MaterialSummaryView: React.FC = () => {
           </div>
         </div>
       )}
+
+      {/* GLOBAL REFRESH PRODUCTION SCHEDULE PROGRESS & REPORT MODAL */}
+      {globalSyncModalOpen && (() => {
+        const isRunning = isRefreshingAllSchedules || (
+          globalSyncProgress?.phase === 'discovering' || globalSyncProgress?.phase === 'syncing'
+        );
+        const isCompletedSuccess =
+          !isRunning &&
+          (globalSyncResult?.status === 'success' ||
+            globalSyncResult?.status === 'no_schedules' ||
+            (globalSyncProgress?.phase === 'completed' && globalSyncProgress.percent === 100));
+        const isFailedState =
+          !isRunning &&
+          (globalSyncResult?.status === 'partial_failure' ||
+            globalSyncResult?.status === 'failed' ||
+            globalSyncProgress?.phase === 'partial_failure' ||
+            globalSyncProgress?.phase === 'failed');
+
+        const totalOrs = globalSyncResult?.totalOrs ?? globalSyncProgress?.totalOrs ?? 0;
+        const succeededOrs = globalSyncResult?.succeededOrs ?? globalSyncProgress?.succeededOrs ?? 0;
+        const totalSchedules = globalSyncResult?.totalSchedules ?? globalSyncProgress?.totalSchedules ?? 0;
+        const syncedSchedules = globalSyncResult?.syncedScheduleIds.length ?? globalSyncProgress?.syncedSchedules ?? 0;
+        const failedSchedules = globalSyncResult?.failedSchedules.length ?? globalSyncProgress?.failedSchedules ?? 0;
+        const percent = globalSyncProgress?.percent ?? (isCompletedSuccess ? 100 : 0);
+
+        return (
+          <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-4">
+            <div
+              role="dialog"
+              aria-modal="true"
+              aria-labelledby="global-refresh-modal-title"
+              className="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-xl w-full p-6 space-y-5 animate-in fade-in zoom-in-95 duration-200"
+            >
+              <div className="flex items-start justify-between gap-3">
+                <div>
+                  <div className="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded text-[11px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200 mb-1">
+                    <RefreshCw
+                      className={`w-3.5 h-3.5 ${
+                        isRunning
+                          ? 'animate-spin text-blue-600'
+                          : isFailedState
+                            ? 'text-amber-600'
+                            : 'text-emerald-600'
+                      }`}
+                    />
+                    Sinkronisasi Global Master Data → Production Schedule
+                  </div>
+                  <h3 id="global-refresh-modal-title" className="text-base font-bold text-slate-900">
+                    {isRunning
+                      ? 'Menyegarkan Seluruh Jadwal Produksi...'
+                      : isFailedState
+                        ? 'Refresh Jadwal Produksi Belum Lengkap'
+                        : globalSyncResult?.status === 'no_schedules'
+                          ? 'Tidak Ada Jadwal Produksi Terkait'
+                          : 'Refresh Jadwal Produksi Selesai!'}
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Setiap OR disinkronkan secara terpisah menggunakan Master Data terbarunya masing-masing.
+                  </p>
+                </div>
+                {!isRunning && (
+                  <button
+                    type="button"
+                    onClick={() => setGlobalSyncModalOpen(false)}
+                    className="p-1.5 text-slate-400 hover:text-slate-600 rounded-md cursor-pointer"
+                    aria-label="Tutup dialog refresh jadwal"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                )}
+              </div>
+
+              {/* Progress Bar */}
+              <div className="space-y-2">
+                <div className="flex items-center justify-between text-xs font-semibold">
+                  <span className="text-slate-700">
+                    {globalSyncProgress?.currentOr
+                      ? `Memproses OR: ${globalSyncProgress.currentOr}`
+                      : isRunning
+                        ? 'Mempersiapkan sinkronisasi...'
+                        : 'Laporan Akhir Sinkronisasi'}
+                  </span>
+                  <span
+                    data-testid="global-refresh-percent"
+                    className={`font-mono text-sm font-bold ${
+                      isFailedState ? 'text-amber-600' : 'text-emerald-600'
+                    }`}
+                  >
+                    {percent}%
+                  </span>
+                </div>
+                <div className="w-full bg-slate-100 rounded-full h-3 overflow-hidden border border-slate-200">
+                  <div
+                    className={`h-full transition-all duration-300 rounded-full ${
+                      isFailedState
+                        ? 'bg-amber-500'
+                        : 'bg-gradient-to-r from-blue-600 via-indigo-600 to-emerald-500'
+                    }`}
+                    style={{ width: `${Math.max(4, percent)}%` }}
+                  />
+                </div>
+              </div>
+
+              {/* OR & Schedule Metrics Grid */}
+              <div
+                data-testid="global-refresh-metrics"
+                className="grid grid-cols-2 sm:grid-cols-5 gap-2 text-xs p-3.5 bg-slate-50 border border-slate-200 rounded-xl"
+              >
+                <div>
+                  <span className="text-[10px] text-slate-500 block">OR Diproses</span>
+                  <span className="font-mono font-bold text-slate-900">{totalOrs} OR</span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-500 block">OR Berhasil</span>
+                  <span className="font-mono font-bold text-emerald-700">{succeededOrs} OR</span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-500 block">Target Jadwal</span>
+                  <span className="font-mono font-bold text-slate-900">{totalSchedules} jadwal</span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-500 block">Jadwal Berhasil</span>
+                  <span className="font-mono font-bold text-emerald-700">{syncedSchedules} jadwal</span>
+                </div>
+                <div>
+                  <span className="text-[10px] text-slate-500 block">Jadwal Gagal</span>
+                  <span
+                    className={`font-mono font-bold ${
+                      failedSchedules > 0 ? 'text-rose-600' : 'text-slate-700'
+                    }`}
+                  >
+                    {failedSchedules} jadwal
+                  </span>
+                </div>
+              </div>
+
+              {/* Status Text */}
+              <div
+                className={`p-3 rounded-xl text-xs flex items-center gap-2.5 border ${
+                  isFailedState
+                    ? 'bg-amber-50 border-amber-200 text-amber-950'
+                    : 'bg-blue-50/70 border-blue-200 text-blue-900'
+                }`}
+              >
+                <RefreshCw className={`w-4 h-4 shrink-0 ${isRunning ? 'animate-spin text-blue-600' : ''}`} />
+                <span className="font-medium text-[11px]" data-testid="global-refresh-status-text">
+                  {globalSyncProgress?.statusText || 'Menjalankan sinkronisasi...'}
+                </span>
+              </div>
+
+              {/* Failed Schedules Details (if partial failure / failed) */}
+              {globalSyncResult && globalSyncResult.failedSchedules.length > 0 && (
+                <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-xl space-y-2 text-xs max-h-40 overflow-y-auto">
+                  <div className="font-bold text-rose-900">
+                    Daftar OR & Jadwal yang Gagal Disinkronkan:
+                  </div>
+                  <ul className="space-y-1 text-[11px] text-rose-800 list-disc pl-4">
+                    {globalSyncResult.failedSchedules.map((f) => (
+                      <li key={`${f.orNumber}-${f.scheduleId}`}>
+                        <strong>OR {f.orNumber}</strong> ·{' '}
+                        <span className="font-mono">{f.worksheetNo || f.scheduleId}</span>
+                        {f.productionLine ? ` (${f.productionLine})` : ''} — {f.error}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+
+              {/* Footer Actions */}
+              {!isRunning && (
+                <div className="pt-2 flex flex-wrap items-center justify-end gap-2 border-t border-slate-100">
+                  {isFailedState && pendingScheduleSyncs.length > 0 && (
+                    <button
+                      type="button"
+                      onClick={() => setGlobalSyncModalOpen(false)}
+                      className="px-3.5 py-2 text-xs font-bold text-white bg-amber-600 hover:bg-amber-700 rounded-md cursor-pointer"
+                    >
+                      Lihat Panel Sinkronkan Ulang
+                    </button>
+                  )}
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setGlobalSyncModalOpen(false);
+                      setActiveMenu('Penjadwalan Produksi');
+                    }}
+                    className="px-3.5 py-2 text-xs font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 border border-blue-200 rounded-md cursor-pointer"
+                  >
+                    Buka Penjadwalan Produksi
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setGlobalSyncModalOpen(false)}
+                    className="px-4 py-2 text-xs font-bold text-white bg-slate-900 hover:bg-slate-800 rounded-md cursor-pointer"
+                  >
+                    Tutup
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };

@@ -6,13 +6,22 @@ import {
   UploadHistoryItem,
 } from '../src/types/ppic';
 import {
+  GlobalScheduleSyncProgressInfo,
   ScheduleSyncProgressInfo,
   applySyncedSchedulesToList,
   buildScheduleMaterialSyncUpdate,
+  deduplicateCanonicalOrs,
+  doesFetchedScheduleMatchOr,
   doesScheduleMatchOr,
+  syncAllOrSchedulesWithMasterData,
   syncSchedulesForMasterDataOr,
   upsertPendingScheduleSyncRecord,
 } from '../src/utils/masterDataScheduleSync';
+import {
+  fetchDistinctMasterDataOrsFromSupabase,
+  fetchSchedulesMatchingOrFromSupabase,
+  mapModelToDbSchedule,
+} from '../src/lib/supabase';
 import { buildAtomicSnapshotSyncPayload } from '../src/utils/scheduleSnapshotSync';
 import { areOrNumbersMatching, extractOrSearchTokens } from '../src/utils/pdfWorksheetParser';
 
@@ -783,4 +792,692 @@ test('7. Benchmark & Integritas 239 baris material + 10 jadwal: eksekusi paralel
   assert.equal(mats[3].receivedQty, 29.5);
   assert.equal(mats[3].status, 'READY');
 });
+
+test('8. fetchSchedulesMatchingOrFromSupabase bebas false positive substring (1036 vs 11036/10360/notes) & konsisten 01036/OR-path', async () => {
+  const rawModels: ProductionSchedule[] = [
+    makeSchedule({
+      id: '88888888-8888-4888-8888-888888888801',
+      orNumber: '1036',
+      worksheetNo: 'WH/MO/1036-A',
+      style: 'STYLE-1036',
+      line: 'Line 1',
+      start: '2026-12-01',
+      finish: '2026-12-03',
+      target: 100,
+      materials: [
+        { id: 'm1', code: 'FAB-001', name: 'KAIN', unit: 'yard', total: 10, receivedQty: 0, status: 'BELUM READY' },
+      ],
+    }),
+    makeSchedule({
+      id: '88888888-8888-4888-8888-888888888802',
+      orNumber: '01036',
+      worksheetNo: 'WH/MO/01036-B',
+      style: 'STYLE-01036',
+      line: 'Line 2',
+      start: '2026-12-02',
+      finish: '2026-12-04',
+      target: 120,
+      materials: [
+        { id: 'm2', code: 'FAB-001', name: 'KAIN', unit: 'yard', total: 10, receivedQty: 0, status: 'BELUM READY' },
+      ],
+    }),
+    makeSchedule({
+      id: '88888888-8888-4888-8888-888888888803',
+      orNumber: 'OR/2026/09/1036',
+      style: 'STYLE-PATH-1036',
+      worksheetNo: 'WH/MO/1036-C',
+      line: 'Line 3',
+      start: '2026-12-03',
+      finish: '2026-12-05',
+      target: 150,
+      materials: [
+        { id: 'm3', code: 'FAB-001', name: 'KAIN', unit: 'yard', total: 10, receivedQty: 0, status: 'BELUM READY' },
+      ],
+    }),
+    // False positive substring: 11036
+    makeSchedule({
+      id: '88888888-8888-4888-8888-888888888804',
+      orNumber: '11036',
+      worksheetNo: 'WH/MO/11036',
+      style: 'STYLE-11036',
+      line: 'Line 4',
+      start: '2026-12-04',
+      finish: '2026-12-06',
+      target: 200,
+      materials: [
+        { id: 'm4', code: 'FAB-001', name: 'KAIN', unit: 'yard', total: 10, receivedQty: 0, status: 'BELUM READY' },
+      ],
+    }),
+    // False positive substring: 10360
+    makeSchedule({
+      id: '88888888-8888-4888-8888-888888888805',
+      orNumber: '10360',
+      worksheetNo: 'WH/MO/10360',
+      style: 'STYLE-10360',
+      line: 'Line 5',
+      start: '2026-12-05',
+      finish: '2026-12-07',
+      target: 220,
+      materials: [
+        { id: 'm5', code: 'FAB-001', name: 'KAIN', unit: 'yard', total: 10, receivedQty: 0, status: 'BELUM READY' },
+      ],
+    }),
+    // False positive via notes: OR 814 yang kebetulan menyebut "1036" di catatan
+    {
+      ...makeSchedule({
+        id: '88888888-8888-4888-8888-888888888806',
+        orNumber: '814',
+        worksheetNo: 'WH/MO/814',
+        style: 'STYLE-814',
+        line: 'Line 6',
+        start: '2026-12-06',
+        finish: '2026-12-08',
+        target: 300,
+        materials: [
+          { id: 'm6', code: 'FAB-001', name: 'KAIN', unit: 'yard', total: 10, receivedQty: 0, status: 'BELUM READY' },
+        ],
+      }),
+      notes: 'Catatan menyebutkan pengiriman bersama OR 1036',
+    },
+  ];
+  const dbRows = rawModels.map(mapModelToDbSchedule);
+
+  // Simulasikan query .or('or_number.ilike.%1036%,notes.ilike.%1036%') di PostgREST yang mengembalikan semua substring match
+  let capturedOrClause = '';
+  const mockSupabaseClient = {
+    from: (table: string) => {
+      assert.equal(table, 'production_schedules');
+      return {
+        select: () => ({
+          or: (clause: string) => {
+            capturedOrClause = clause;
+            return {
+              order: async () => {
+                // Simulasikan SQL .ilike '%1036%' (mengembalikan 1036, 01036, OR/2026/09/1036, 11036, 10360, & OR 814 yg notesnya ada 1036)
+                const sqlMatched = dbRows.filter(
+                  (r) => r.or_number.includes('1036') || (r.notes || '').includes('1036')
+                );
+                return { data: sqlMatched, error: null };
+              },
+            };
+          },
+        }),
+      };
+    },
+  };
+
+  const res = await fetchSchedulesMatchingOrFromSupabase('1036', mockSupabaseClient);
+  assert.equal(res.connected, true);
+  assert.ok(capturedOrClause.includes('or_number.ilike.%1036%'));
+
+  // Hanya 1036, 01036, dan OR/2026/09/1036 yang terambil
+  const returnedOrs = res.schedules.map((s) => s.orNumber);
+  assert.deepEqual(returnedOrs, ['1036', '01036', 'OR/2026/09/1036']);
+
+  // Pastikan 11036, 10360, dan 814 TIDAK terambil
+  assert.equal(returnedOrs.includes('11036'), false);
+  assert.equal(returnedOrs.includes('10360'), false);
+  assert.equal(returnedOrs.includes('814'), false);
+
+  // Validasi helper murni doesFetchedScheduleMatchOr
+  assert.equal(
+    doesFetchedScheduleMatchOr(
+      {
+        id: 'manual-11036',
+        orNumber: '11036',
+        style: 'S',
+        productionLine: 'Line 1',
+        productionDate: '2026-12-01',
+        finishDate: '2026-12-02',
+        target: 10,
+        status: 'Terjadwal',
+      },
+      '1036'
+    ),
+    false
+  );
+  assert.equal(
+    doesFetchedScheduleMatchOr(
+      {
+        id: 'manual-01036',
+        orNumber: '01036',
+        style: 'S',
+        productionLine: 'Line 1',
+        productionDate: '2026-12-01',
+        finishDate: '2026-12-02',
+        target: 10,
+        status: 'Terjadwal',
+      },
+      '1036'
+    ),
+    true
+  );
+
+  // Sinkronisasi ke hasil fetchSchedulesMatchingOrFromSupabase hanya memperbarui 3 jadwal OR 1036
+  const syncRes = await syncSchedulesForMasterDataOr({
+    targetOr: '1036',
+    schedules: res.schedules,
+    masterRequirements: [
+      {
+        id: 'req-1036',
+        uploadId: 'up-1036',
+        orNumber: '1036',
+        style: 'STYLE-1036',
+        materialCode: 'FAB-001',
+        materialName: 'KAIN',
+        category: 'Raw Material',
+        unit: 'yard',
+        requiredQty: 10,
+        receivedQty: 10,
+        unitPrice: 1000,
+        updateDate: '2026-11-19',
+      },
+    ],
+    uploadHistory: [
+      {
+        id: 'up-1036',
+        orNumber: '1036',
+        style: 'STYLE-1036',
+        fileName: 'or1036.xlsx',
+        updateDate: '2026-11-19',
+        uploadTime: '09:00:00 WIB',
+        rowCount: 1,
+        status: 'Sukses',
+        createdAt: '2026-11-19T02:00:00.000Z',
+      },
+    ],
+    persistScheduleSnapshot: async () => ({ success: true }),
+    syncTimestampIso: '2026-11-19T02:05:00.000Z',
+  });
+
+  assert.equal(syncRes.status, 'success');
+  assert.equal(syncRes.matchedScheduleCount, 3);
+  assert.deepEqual(syncRes.syncedScheduleIds, [
+    '88888888-8888-4888-8888-888888888801',
+    '88888888-8888-4888-8888-888888888802',
+    '88888888-8888-4888-8888-888888888803',
+  ]);
+});
+
+test('9. syncAllOrSchedulesWithMasterData menyinkronkan multi-OR global secara terisolasi & akurat', async () => {
+  // Upload History untuk 4 OR (termasuk upload lama OR 1036 & OR 814 yg harus diabaikan)
+  const uploadHistory: UploadHistoryItem[] = [
+    {
+      id: 'up-814-old',
+      orNumber: '814',
+      style: 'S814',
+      fileName: '814_old.xlsx',
+      updateDate: '2026-11-10',
+      uploadTime: '08:00:00 WIB',
+      rowCount: 1,
+      status: 'Sukses',
+      createdAt: '2026-11-10T01:00:00.000Z',
+    },
+    {
+      id: 'up-814-new',
+      orNumber: '814',
+      style: 'S814',
+      fileName: '814_new.xlsx',
+      updateDate: '2026-11-19',
+      uploadTime: '08:00:00 WIB',
+      rowCount: 1,
+      status: 'Sukses',
+      createdAt: '2026-11-19T01:00:00.000Z',
+    },
+    {
+      id: 'up-979-new',
+      orNumber: '979',
+      style: 'S979',
+      fileName: '979.xlsx',
+      updateDate: '2026-11-19',
+      uploadTime: '08:05:00 WIB',
+      rowCount: 1,
+      status: 'Sukses',
+      createdAt: '2026-11-19T01:05:00.000Z',
+    },
+    {
+      id: 'up-1036-new',
+      orNumber: 'OR/2026/09/1036',
+      style: 'S1036',
+      fileName: '1036.xlsx',
+      updateDate: '2026-11-19',
+      uploadTime: '08:10:00 WIB',
+      rowCount: 2,
+      status: 'Sukses',
+      createdAt: '2026-11-19T01:10:00.000Z',
+    },
+    {
+      id: 'up-1097-new',
+      orNumber: '1097',
+      style: 'S1097',
+      fileName: '1097.xlsx',
+      updateDate: '2026-11-19',
+      uploadTime: '08:15:00 WIB',
+      rowCount: 1,
+      status: 'Sukses',
+      createdAt: '2026-11-19T01:15:00.000Z',
+    },
+  ];
+
+  const masterRequirements: MaterialItemRequirement[] = [
+    // Upload lama 814 (receivedQty = 1 -> harus diabaikan)
+    {
+      id: 'r-814-old',
+      uploadId: 'up-814-old',
+      orNumber: '814',
+      style: 'S814',
+      materialCode: 'SHARED-MAT',
+      materialName: 'Kain Shared',
+      category: 'Raw Material',
+      unit: 'yard',
+      requiredQty: 50,
+      receivedQty: 1,
+      unitPrice: 1000,
+      updateDate: '2026-11-10',
+    },
+    // Upload terbaru 814 (receivedQty = 50 -> READY)
+    {
+      id: 'r-814-new',
+      uploadId: 'up-814-new',
+      orNumber: '814',
+      style: 'S814',
+      materialCode: 'SHARED-MAT',
+      materialName: 'Kain Shared',
+      category: 'Raw Material',
+      unit: 'yard',
+      requiredQty: 50,
+      receivedQty: 50,
+      unitPrice: 1000,
+      updateDate: '2026-11-19',
+    },
+    // Upload terbaru 979 (receivedQty = 12.5 dari 20 -> BELUM READY; jangan pernah bercampur ke OR lain!)
+    {
+      id: 'r-979-new',
+      uploadId: 'up-979-new',
+      orNumber: '979',
+      style: 'S979',
+      materialCode: 'SHARED-MAT',
+      materialName: 'Kain Shared',
+      category: 'Raw Material',
+      unit: 'yard',
+      requiredQty: 20,
+      receivedQty: 12.5,
+      unitPrice: 1000,
+      updateDate: '2026-11-19',
+    },
+    // Upload terbaru 1036 dengan kode duplikat UNI-ACC9026 1-to-1 + angka desimal persis
+    {
+      id: 'r-1036-dup1',
+      uploadId: 'up-1036-new',
+      orNumber: 'OR/2026/09/1036',
+      style: 'S1036',
+      materialCode: 'UNI-ACC9026',
+      materialName: 'SNAP',
+      category: 'Auxiliary',
+      unit: 'Pcs',
+      requiredQty: 100,
+      receivedQty: 100,
+      unitPrice: 500,
+      updateDate: '2026-11-19',
+    },
+    {
+      id: 'r-1036-dup2',
+      uploadId: 'up-1036-new',
+      orNumber: 'OR/2026/09/1036',
+      style: 'S1036',
+      materialCode: 'UNI-ACC9026',
+      materialName: 'SNAP',
+      category: 'Auxiliary',
+      unit: 'Pcs',
+      requiredQty: 200,
+      receivedQty: 150,
+      unitPrice: 500,
+      updateDate: '2026-11-19',
+    },
+    // Upload terbaru 1097
+    {
+      id: 'r-1097-new',
+      uploadId: 'up-1097-new',
+      orNumber: '1097',
+      style: 'S1097',
+      materialCode: 'SHARED-MAT',
+      materialName: 'Kain Shared',
+      category: 'Raw Material',
+      unit: 'yard',
+      requiredQty: 29.5,
+      receivedQty: 29.5,
+      unitPrice: 1000,
+      updateDate: '2026-11-19',
+    },
+  ];
+
+  const allSchedules: ProductionSchedule[] = [
+    makeSchedule({
+      id: '99999999-9999-4999-8999-999999999901',
+      orNumber: '814',
+      worksheetNo: 'WH/MO/814',
+      style: 'S814',
+      line: 'Line 1',
+      start: '2026-12-01',
+      finish: '2026-12-02',
+      target: 100,
+      materials: [
+        { id: 'm814', code: 'SHARED-MAT', name: 'Kain Shared', unit: 'yard', total: 50, receivedQty: 0, status: 'BELUM READY' },
+      ],
+    }),
+    makeSchedule({
+      id: '99999999-9999-4999-8999-999999999902',
+      orNumber: '979',
+      worksheetNo: 'WH/MO/979',
+      style: 'S979',
+      line: 'Line 2',
+      start: '2026-12-01',
+      finish: '2026-12-02',
+      target: 100,
+      materials: [
+        { id: 'm979', code: 'SHARED-MAT', name: 'Kain Shared', unit: 'yard', total: 20, receivedQty: 0, status: 'BELUM READY' },
+      ],
+    }),
+    makeSchedule({
+      id: '99999999-9999-4999-8999-999999999903',
+      orNumber: '1036',
+      worksheetNo: 'WH/MO/1036',
+      style: 'S1036',
+      line: 'Line 3',
+      start: '2026-12-01',
+      finish: '2026-12-02',
+      target: 100,
+      materials: [
+        { id: 'm1036-1', code: 'UNI-ACC9026', name: 'SNAP', unit: 'Pcs', total: 100, receivedQty: 0, status: 'BELUM READY' },
+        { id: 'm1036-2', code: 'UNI-ACC9026', name: 'SNAP', unit: 'Pcs', total: 200, receivedQty: 0, status: 'BELUM READY' },
+      ],
+    }),
+    makeSchedule({
+      id: '99999999-9999-4999-8999-999999999904',
+      orNumber: '1097',
+      worksheetNo: 'WH/MO/1097',
+      style: 'S1097',
+      line: 'Line 4',
+      start: '2026-12-01',
+      finish: '2026-12-02',
+      target: 100,
+      materials: [
+        { id: 'm1097', code: 'SHARED-MAT', name: 'Kain Shared', unit: 'yard', total: 29.5, receivedQty: 0, status: 'BELUM READY' },
+      ],
+    }),
+    // Jadwal dengan OR yg BELUM PUNYA Master Data -> tidak boleh meminjam data OR lain!
+    makeSchedule({
+      id: '99999999-9999-4999-8999-999999999905',
+      orNumber: '555',
+      worksheetNo: 'WH/MO/555',
+      style: 'S555',
+      line: 'Line 5',
+      start: '2026-12-01',
+      finish: '2026-12-02',
+      target: 100,
+      materials: [
+        { id: 'm555', code: 'SHARED-MAT', name: 'Kain Shared', unit: 'yard', total: 10, receivedQty: 3, status: 'BELUM READY' },
+      ],
+    }),
+    // Jadwal substring neighbor OR 11036 yg punya SHARED-MAT namun bukan target Master Data
+    makeSchedule({
+      id: '99999999-9999-4999-8999-999999999906',
+      orNumber: '11036',
+      worksheetNo: 'WH/MO/11036',
+      style: 'S11036',
+      line: 'Line 6',
+      start: '2026-12-01',
+      finish: '2026-12-02',
+      target: 100,
+      materials: [
+        { id: 'm11036', code: 'UNI-ACC9026', name: 'SNAP', unit: 'Pcs', total: 100, receivedQty: 0, status: 'BELUM READY' },
+      ],
+    }),
+  ];
+
+  // Deduplikasi kanonis harus mengelompokkan 1036 + 01036 + OR/2026/09/1036 menjadi satu, dan tetap memisah 11036
+  const canonical = deduplicateCanonicalOrs(['814', '979', '1036', '01036', 'OR/2026/09/1036', '1097', '555']);
+  assert.deepEqual(canonical, ['814', '979', '1036', '1097', '555']);
+
+  const progressHistory: GlobalScheduleSyncProgressInfo[] = [];
+  const persistedIds: string[] = [];
+
+  const summary = await syncAllOrSchedulesWithMasterData({
+    targetOrs: ['814', '979', '1036', '01036', '1097', '555'],
+    concurrency: 5,
+    syncTimestampIso: '2026-11-19T03:00:00.000Z',
+    onProgress: (info) => progressHistory.push({ ...info }),
+    fetchMasterDataForOrs: async () => ({
+      connected: true,
+      uploadHistory,
+      materialRequirements: masterRequirements,
+    }),
+    fetchSchedulesForOr: async (targetOr) => ({
+      connected: true,
+      // Sengaja sertakan semua schedules agar validasi strict filter OR diuji berlapis
+      schedules: allSchedules,
+    }),
+    persistScheduleSnapshot: async (sch) => {
+      persistedIds.push(sch.id);
+      return { success: true };
+    },
+  });
+
+  assert.equal(summary.status, 'success');
+  assert.equal(summary.totalOrs, 4); // Hanya 814, 979, 1036, 1097 (555 tidak punya Master Data!)
+  assert.equal(summary.succeededOrs, 4);
+  assert.equal(summary.failedOrs, 0);
+  assert.equal(summary.totalSchedules, 4);
+  assert.equal(summary.syncedScheduleIds.length, 4);
+  assert.equal(summary.failedSchedules.length, 0);
+  assert.deepEqual(persistedIds.sort(), [
+    '99999999-9999-4999-8999-999999999901',
+    '99999999-9999-4999-8999-999999999902',
+    '99999999-9999-4999-8999-999999999903',
+    '99999999-9999-4999-8999-999999999904',
+  ]);
+
+  // Isolasi per OR: masing-masing pakai nilai Master Data terbarunya sendiri
+  const merged = applySyncedSchedulesToList(allSchedules, summary.updatedSchedulesById);
+  assert.equal(merged[0].worksheets![0].materials[0].receivedQty, 50);
+  assert.equal(merged[0].worksheets![0].materials[0].status, 'READY');
+  assert.equal(merged[1].worksheets![0].materials[0].receivedQty, 12.5);
+  assert.equal(merged[1].worksheets![0].materials[0].status, 'BELUM READY');
+
+  // Duplikat 1-to-1 OR 1036 terjaga (baris 1 READY, baris 2 BELUM READY)
+  assert.equal(merged[2].worksheets![0].materials[0].receivedQty, 100);
+  assert.equal(merged[2].worksheets![0].materials[0].status, 'READY');
+  assert.equal(merged[2].worksheets![0].materials[1].receivedQty, 150);
+  assert.equal(merged[2].worksheets![0].materials[1].status, 'BELUM READY');
+
+  // Desimal OR 1097 terjaga
+  assert.equal(merged[3].worksheets![0].materials[0].receivedQty, 29.5);
+  assert.equal(merged[3].worksheets![0].materials[0].status, 'READY');
+
+  // OR 555 (tanpa Master Data) & OR 11036 (substring) tetap utuh tak tersentuh
+  assert.equal(merged[4].worksheets![0].materials[0].receivedQty, 3);
+  assert.equal(merged[5].worksheets![0].materials[0].receivedQty, 0);
+
+  // Progress tidak pernah 100% sebelum selesai penuh
+  assert.ok(progressHistory.length >= 3);
+  for (let i = 0; i < progressHistory.length - 1; i++) {
+    assert.ok(progressHistory[i].percent < 100, `Event ke-${i} tidak boleh 100%`);
+  }
+  const finalProg = progressHistory[progressHistory.length - 1];
+  assert.equal(finalProg.phase, 'completed');
+  assert.equal(finalProg.percent, 100);
+  assert.equal(finalProg.syncedSchedules, 4);
+  assert.equal(finalProg.failedSchedules, 0);
+  assert.equal(finalProg.succeededOrs, 4);
+});
+
+test('10. syncAllOrSchedulesWithMasterData menangani 0 jadwal, error Supabase, partial_failure (<100%) & discovery OR', async () => {
+  // 10A. Kasus 0 jadwal terkait -> no_schedules bersih
+  const noSchRes = await syncAllOrSchedulesWithMasterData({
+    targetOrs: ['814'],
+    fetchMasterDataForOrs: async () => ({
+      connected: true,
+      uploadHistory: [
+        {
+          id: 'u1',
+          orNumber: '814',
+          style: 'S',
+          fileName: 'f.xlsx',
+          updateDate: '2026-11-19',
+          uploadTime: '09:00:00 WIB',
+          rowCount: 1,
+          status: 'Sukses',
+        },
+      ],
+      materialRequirements: [
+        {
+          id: 'r1',
+          uploadId: 'u1',
+          orNumber: '814',
+          style: 'S',
+          materialCode: 'M1',
+          materialName: 'Mat 1',
+          category: 'Raw Material',
+          unit: 'Pcs',
+          requiredQty: 10,
+          receivedQty: 10,
+          unitPrice: 100,
+        },
+      ],
+    }),
+    fetchSchedulesForOr: async () => ({ connected: true, schedules: [] }),
+    persistScheduleSnapshot: async () => ({ success: true }),
+  });
+  assert.equal(noSchRes.status, 'no_schedules');
+  assert.equal(noSchRes.totalSchedules, 0);
+
+  // 10B. Kasus kegagalan parsial RPC -> status partial_failure, percent < 100, & pending queue mencatat detail OR gagal
+  const progressEvents: GlobalScheduleSyncProgressInfo[] = [];
+  const partialRes = await syncAllOrSchedulesWithMasterData({
+    targetOrs: ['814', '979'],
+    syncTimestampIso: '2026-11-19T04:00:00.000Z',
+    onProgress: (info) => progressEvents.push({ ...info }),
+    fetchMasterDataForOrs: async () => ({
+      connected: true,
+      uploadHistory: [
+        {
+          id: 'u814',
+          orNumber: '814',
+          style: 'S814',
+          fileName: '814.xlsx',
+          updateDate: '2026-11-19',
+          uploadTime: '09:00:00 WIB',
+          rowCount: 1,
+          status: 'Sukses',
+        },
+        {
+          id: 'u979',
+          orNumber: '979',
+          style: 'S979',
+          fileName: '979.xlsx',
+          updateDate: '2026-11-19',
+          uploadTime: '09:05:00 WIB',
+          rowCount: 1,
+          status: 'Sukses',
+        },
+      ],
+      materialRequirements: [
+        {
+          id: 'r814',
+          uploadId: 'u814',
+          orNumber: '814',
+          style: 'S814',
+          materialCode: 'M1',
+          materialName: 'M1',
+          category: 'Raw Material',
+          unit: 'Pcs',
+          requiredQty: 10,
+          receivedQty: 10,
+          unitPrice: 100,
+        },
+        {
+          id: 'r979',
+          uploadId: 'u979',
+          orNumber: '979',
+          style: 'S979',
+          materialCode: 'M1',
+          materialName: 'M1',
+          category: 'Raw Material',
+          unit: 'Pcs',
+          requiredQty: 10,
+          receivedQty: 5,
+          unitPrice: 100,
+        },
+      ],
+    }),
+    fetchSchedulesForOr: async (targetOr) => ({
+      connected: true,
+      schedules: [
+        makeSchedule({
+          id: targetOr === '814' ? 'aaaa1111-1111-4111-8111-111111111111' : 'bbbb2222-2222-4222-8222-222222222222',
+          orNumber: targetOr,
+          worksheetNo: `WH/${targetOr}`,
+          style: `S${targetOr}`,
+          line: 'Line 1',
+          start: '2026-12-01',
+          finish: '2026-12-02',
+          target: 100,
+          materials: [
+            { id: `mat-${targetOr}`, code: 'M1', name: 'M1', unit: 'Pcs', total: 10, receivedQty: 0, status: 'BELUM READY' },
+          ],
+        }),
+      ],
+    }),
+    persistScheduleSnapshot: async (sch) => {
+      if (sch.orNumber === '979') {
+        return { success: false, error: 'Koneksi database terputus saat menyimpan OR 979' };
+      }
+      return { success: true };
+    },
+  });
+
+  assert.equal(partialRes.status, 'partial_failure');
+  assert.equal(partialRes.succeededOrs, 1);
+  assert.equal(partialRes.failedOrs, 1);
+  assert.equal(partialRes.syncedScheduleIds.length, 1);
+  assert.equal(partialRes.failedSchedules.length, 1);
+  assert.equal(partialRes.failedSchedules[0].orNumber, '979');
+  const finalPartialProg = progressEvents[progressEvents.length - 1];
+  assert.equal(finalPartialProg.phase, 'partial_failure');
+  assert.ok(finalPartialProg.percent < 100, 'Partial failure tidak boleh melapor 100%');
+
+  // Pending queue mencatat OR 979 saja, tidak mengikutkan OR 814 yg sudah sukses
+  let pending: ReturnType<typeof upsertPendingScheduleSyncRecord> = [];
+  for (const orSum of partialRes.orSummaries) {
+    pending = upsertPendingScheduleSyncRecord(pending, orSum);
+  }
+  assert.equal(pending.length, 1);
+  assert.equal(pending[0].targetOr, '979');
+
+  // 10C. Discovery OR dari upload_history Supabase memfilter status Gagal dan menduplikasi dengan aman
+  const mockDiscoveryClient = {
+    from: () => ({
+      select: () => ({
+        neq: () => ({
+          order: () => ({
+            limit: async () => ({
+              data: [
+                { or_number: '814' },
+                { or_number: '979' },
+                { or_number: '814' },
+                { or_number: '1036' },
+                { or_number: '-' },
+              ],
+              error: null,
+            }),
+          }),
+        }),
+      }),
+    }),
+  };
+  const discRes = await fetchDistinctMasterDataOrsFromSupabase(mockDiscoveryClient);
+  assert.equal(discRes.connected, true);
+  assert.deepEqual(discRes.orNumbers, ['814', '979', '1036']);
+});
+
 
